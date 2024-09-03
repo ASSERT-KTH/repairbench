@@ -1,0 +1,352 @@
+You are an automatic program repair tool. Your task is to fix the provided buggy code.
+
+The following code contains a buggy function:
+```java
+    @Override
+    public JsonToken nextToken() throws IOException
+    {
+        // 23-May-2017, tatu: To be honest, code here is rather hairy and I don't like all
+        //    conditionals; and it seems odd to return `null` but NOT considering input
+        //    as closed... would love a rewrite to simplify/clear up logic here.
+        
+        // Check for _allowMultipleMatches - false and at least there is one token - which is _currToken
+        // check for no buffered context _exposedContext - null
+        // If all the conditions matches then check for scalar / non-scalar property
+        if (!_allowMultipleMatches && (_currToken != null) && (_exposedContext == null)) {
+            //if not scalar and ended successfully, and !includePath, then return null
+                if (_currToken.isStructEnd()) {
+                    if (_headContext.isStartHandled()) {
+                        return (_currToken = null);
+                    }
+                } else if (_currToken.isScalarValue()) {
+                    //else if scalar, and scalar not present in obj/array and !includePath and INCLUDE_ALL matched once
+                    // then return null 
+                    if (!_headContext.isStartHandled() && (_itemFilter == TokenFilter.INCLUDE_ALL)) {
+                        return (_currToken = null);
+                    }
+            }
+        }
+        // Anything buffered?
+        TokenFilterContext ctxt = _exposedContext;
+
+        if (ctxt != null) {
+            while (true) {
+                JsonToken t = ctxt.nextTokenToRead();
+                if (t != null) {
+                    _currToken = t;
+                    return t;
+                }
+                // all done with buffered stuff?
+                if (ctxt == _headContext) {
+                    _exposedContext = null;
+                    if (ctxt.inArray()) {
+                        t = delegate.getCurrentToken();
+// Is this guaranteed to work without further checks?
+//                        if (t != JsonToken.START_ARRAY) {
+                        _currToken = t;
+                        return t;
+                    }
+
+                    // Almost! Most likely still have the current token;
+                    // with the sole exception of 
+                    /*
+                    t = delegate.getCurrentToken();
+                    if (t != JsonToken.FIELD_NAME) {
+                        _currToken = t;
+                        return t;
+                    }
+                    */
+                    break;
+                }
+                // If not, traverse down the context chain
+                ctxt = _headContext.findChildOf(ctxt);
+                _exposedContext = ctxt;
+                if (ctxt == null) { // should never occur
+                    throw _constructError("Unexpected problem: chain of filtered context broken");
+                }
+            }
+        }
+
+        // If not, need to read more. If we got any:
+        JsonToken t = delegate.nextToken();
+        if (t == null) {
+            // no strict need to close, since we have no state here
+            _currToken = t;
+            return t;
+        }
+
+        // otherwise... to include or not?
+        TokenFilter f;
+        
+        switch (t.id()) {
+        case ID_START_ARRAY:
+            f = _itemFilter;
+            if (f == TokenFilter.INCLUDE_ALL) {
+                _headContext = _headContext.createChildArrayContext(f, true);
+                return (_currToken = t);
+            }
+            if (f == null) { // does this occur?
+                delegate.skipChildren();
+                break;
+            }
+            // Otherwise still iffy, need to check
+            f = _headContext.checkValue(f);
+            if (f == null) {
+                delegate.skipChildren();
+                break;
+            }
+            if (f != TokenFilter.INCLUDE_ALL) {
+                f = f.filterStartArray();
+            }
+            _itemFilter = f;
+            if (f == TokenFilter.INCLUDE_ALL) {
+                _headContext = _headContext.createChildArrayContext(f, true);
+                return (_currToken = t);
+            }
+            _headContext = _headContext.createChildArrayContext(f, false);
+            
+            // Also: only need buffering if parent path to be included
+            if (_includePath) {
+                t = _nextTokenWithBuffering(_headContext);
+                if (t != null) {
+                    _currToken = t;
+                    return t;
+                }
+            }
+            break;
+
+        case ID_START_OBJECT:
+            f = _itemFilter;
+            if (f == TokenFilter.INCLUDE_ALL) {
+                _headContext = _headContext.createChildObjectContext(f, true);
+                return (_currToken = t);
+            }
+            if (f == null) { // does this occur?
+                delegate.skipChildren();
+                break;
+            }
+            // Otherwise still iffy, need to check
+            f = _headContext.checkValue(f);
+            if (f == null) {
+                delegate.skipChildren();
+                break;
+            }
+            if (f != TokenFilter.INCLUDE_ALL) {
+                f = f.filterStartObject();
+            }
+            _itemFilter = f;
+            if (f == TokenFilter.INCLUDE_ALL) {
+                _headContext = _headContext.createChildObjectContext(f, true);
+                return (_currToken = t);
+            }
+            _headContext = _headContext.createChildObjectContext(f, false);
+            // Also: only need buffering if parent path to be included
+            if (_includePath) {
+                t = _nextTokenWithBuffering(_headContext);
+                if (t != null) {
+                    _currToken = t;
+                    return t;
+                }
+            }
+            // note: inclusion of surrounding Object handled separately via
+            // FIELD_NAME
+            break;
+
+        case ID_END_ARRAY:
+        case ID_END_OBJECT:
+            {
+                boolean returnEnd = _headContext.isStartHandled();
+                f = _headContext.getFilter();
+                if ((f != null) && (f != TokenFilter.INCLUDE_ALL)) {
+                    f.filterFinishArray();
+                }
+                _headContext = _headContext.getParent();
+                _itemFilter = _headContext.getFilter();
+                if (returnEnd) {
+                    return (_currToken = t);
+                }
+            }
+            break;
+
+        case ID_FIELD_NAME:
+            {
+                final String name = delegate.getCurrentName();
+                // note: this will also set 'needToHandleName'
+                f = _headContext.setFieldName(name);
+                if (f == TokenFilter.INCLUDE_ALL) {
+                    _itemFilter = f;
+                    if (!_includePath) {
+                        // Minor twist here: if parent NOT included, may need to induce output of
+                        // surrounding START_OBJECT/END_OBJECT
+                        if (_includeImmediateParent && !_headContext.isStartHandled()) {
+                            t = _headContext.nextTokenToRead(); // returns START_OBJECT but also marks it handled
+                            _exposedContext = _headContext;
+                        }
+                    }
+                    return (_currToken = t);
+                }
+                if (f == null) {
+                    delegate.nextToken();
+                    delegate.skipChildren();
+                    break;
+                }
+                f = f.includeProperty(name);
+                if (f == null) {
+                    delegate.nextToken();
+                    delegate.skipChildren();
+                    break;
+                }
+                _itemFilter = f;
+                if (f == TokenFilter.INCLUDE_ALL) {
+                    if (_includePath) {
+                        return (_currToken = t);
+                    }
+                }
+                if (_includePath) {
+                    t = _nextTokenWithBuffering(_headContext);
+                    if (t != null) {
+                        _currToken = t;
+                        return t;
+                    }
+                }
+                break;
+            }
+
+        default: // scalar value
+            f = _itemFilter;
+            if (f == TokenFilter.INCLUDE_ALL) {
+                return (_currToken = t);
+            }
+            if (f != null) {
+                f = _headContext.checkValue(f);
+                if ((f == TokenFilter.INCLUDE_ALL)
+                        || ((f != null) && f.includeValue(delegate))) {
+                    return (_currToken = t);
+                }
+            }
+            // Otherwise not included (leaves must be explicitly included)
+            break;
+        }
+
+        // We get here if token was not yet found; offlined handling
+        return _nextToken2();
+    }
+
+```
+
+The code fails the following tests.
+
+Test `com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testTokensSingleMatchWithPath`:
+```java
+    @SuppressWarnings("resource")
+    public void testTokensSingleMatchWithPath() throws Exception
+    {
+        JsonParser p0 = JSON_F.createParser(SIMPLE);
+        JsonParser p = new FilteringParserDelegate(p0,
+               new NameMatchFilter("value"),
+                   true, // includePath
+                   false // multipleMatches
+                );
+
+        assertFalse(p.hasCurrentToken());
+        assertNull(p.getCurrentToken());
+        assertEquals(JsonTokenId.ID_NO_TOKEN, p.getCurrentTokenId());
+        assertFalse(p.isExpectedStartObjectToken());
+        assertFalse(p.isExpectedStartArrayToken());
+        
+// {'a':123,'array':[1,2],'ob':{'value0':2,'value':3,'value2':4},'b':true}
+//      String result = readAndWrite(JSON_F, p);
+//      assertEquals(aposToQuotes("{'ob':{'value':3}}"), result);
+
+        assertToken(JsonToken.START_OBJECT, p.nextToken());
+        assertEquals(JsonToken.START_OBJECT, p.getCurrentToken());
+        assertTrue(p.isExpectedStartObjectToken());
+        assertFalse(p.isExpectedStartArrayToken());
+
+        assertToken(JsonToken.FIELD_NAME, p.nextToken());
+        assertEquals(JsonToken.FIELD_NAME, p.getCurrentToken());
+        assertEquals("ob", p.getCurrentName());
+//        assertEquals("ob", p.getText());
+
+        assertToken(JsonToken.START_OBJECT, p.nextToken());
+        assertEquals("ob", p.getCurrentName());
+
+        assertToken(JsonToken.FIELD_NAME, p.nextToken());
+        assertEquals("value", p.getCurrentName());
+        assertEquals("value", p.getText());
+
+        assertToken(JsonToken.VALUE_NUMBER_INT, p.nextToken());
+        assertEquals(JsonToken.VALUE_NUMBER_INT, p.getCurrentToken());
+        assertEquals(NumberType.INT, p.getNumberType());
+        assertEquals(3, p.getIntValue());
+        assertEquals("value", p.getCurrentName());
+
+        assertToken(JsonToken.END_OBJECT, p.nextToken());
+        assertEquals(JsonToken.END_OBJECT, p.getCurrentToken());
+
+        assertToken(JsonToken.END_OBJECT, p.nextToken());
+        assertEquals(JsonToken.END_OBJECT, p.getCurrentToken());
+
+        p.clearCurrentToken();
+        assertNull(p.getCurrentToken());
+        
+        p.close();
+    }
+
+```
+Test `com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testTokensSingleMatchWithPath` error:
+```
+junit.framework.ComparisonFailure: expected:<{ob:{value:3}[}]> but was:<{ob:{value:3}[]>;com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testSkippingForSingleWithPath
+```
+
+Test `com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testBasicSingleMatchFilteringWithPath`:
+```java
+    @SuppressWarnings("resource")
+    public void testBasicSingleMatchFilteringWithPath() throws Exception
+    {
+        JsonParser p0 = JSON_F.createParser(SIMPLE);
+        JsonParser p = new FilteringParserDelegate(p0,
+               new NameMatchFilter("value"),
+                   true, // includePath
+                   false // multipleMatches
+                );
+
+// {'a':123,'array':[1,2],'ob':{'value0':2,'value':3,'value2':4},'b':true}
+        String result = readAndWrite(JSON_F, p);
+        assertEquals(aposToQuotes("{'ob':{'value':3}}"), result);
+    }
+
+```
+Test `com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testBasicSingleMatchFilteringWithPath` error:
+```
+junit.framework.AssertionFailedError: expected:<END_OBJECT> but was:<null>
+```
+
+Test `com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testSkippingForSingleWithPath`:
+```java
+    @SuppressWarnings("resource")
+    public void testSkippingForSingleWithPath() throws Exception
+    {
+        JsonParser p0 = JSON_F.createParser(SIMPLE);
+        JsonParser p = new FilteringParserDelegate(p0,
+               new NameMatchFilter("value"),
+                   true, // includePath
+                   false // multipleMatches
+                );
+
+//        assertEquals(aposToQuotes("{'ob':{'value':3}}"), result);
+
+        assertToken(JsonToken.START_OBJECT, p.nextToken());
+        p.skipChildren();
+        assertEquals(JsonToken.END_OBJECT, p.getCurrentToken());
+        assertNull(p.nextToken());
+    }
+
+```
+Test `com.fasterxml.jackson.core.filter.TokenVerifyingParserFiltering330Test::testSkippingForSingleWithPath` error:
+```
+junit.framework.AssertionFailedError: expected:<END_OBJECT> but was:<null>
+```
+
+
+Please provide a fixed version of the buggy function, and only that function, inside a code block.
