@@ -1,0 +1,231 @@
+You are an automatic program repair tool. Your task is to fix the provided buggy code.
+
+The following code contains a buggy function:
+```java
+    /**
+     * Counts the number of direct (full) references to an object.
+     * Specifically we check for references of the following type:
+     * <pre>
+     *   x;
+     *   x.fn();
+     * </pre>
+     */
+    private boolean isInlinableObject(List<Reference> refs) {
+      boolean ret = false;
+      for (Reference ref : refs) {
+        Node name = ref.getNode();
+        Node parent = ref.getParent();
+        Node gramps = ref.getGrandparent();
+
+        // Ignore indirect references, like x.y (except x.y(), since
+        // the function referenced by y might reference 'this').
+        //
+        if (parent.isGetProp()) {
+          Preconditions.checkState(parent.getFirstChild() == name);
+          // A call target maybe using the object as a 'this' value.
+          if (gramps.isCall()
+              && gramps.getFirstChild() == parent) {
+            return false;
+          }
+
+          // NOTE(nicksantos): This pass's object-splitting algorithm has
+          // a blind spot. It assumes that if a property isn't defined on an
+          // object, then the value is undefined. This is not true, because
+          // Object.prototype can have arbitrary properties on it.
+          //
+          // We short-circuit this problem by bailing out if we see a reference
+          // to a property that isn't defined on the object literal. This
+          // isn't a perfect algorithm, but it should catch most cases.
+          continue;
+        }
+
+        // Only rewrite VAR declarations or simple assignment statements
+        if (!isVarOrAssignExprLhs(name)) {
+           return false;
+        }
+
+        Node val = ref.getAssignedValue();
+        if (val == null) {
+          // A var with no assignment.
+          continue;
+        }
+
+        // We're looking for object literal assignments only.
+        if (!val.isObjectLit()) {
+          return false;
+        }
+
+        // Make sure that the value is not self-refential. IOW,
+        // disallow things like x = {b: x.a}.
+        //
+        // TODO: Only exclude unorderable self-referential
+        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+        // but x = {a: 1, b: x.a} is.
+        //
+        // Also, ES5 getters/setters aren't handled by this pass.
+        for (Node child = val.getFirstChild(); child != null;
+             child = child.getNext()) {
+          if (child.isGetterDef() ||
+              child.isSetterDef()) {
+            // ES5 get/set not supported.
+            return false;
+          }
+
+
+          Node childVal = child.getFirstChild();
+          // Check if childVal is the parent of any of the passed in
+          // references, as that is how self-referential assignments
+          // will happen.
+          for (Reference t : refs) {
+            Node refNode = t.getParent();
+            while (!NodeUtil.isStatementBlock(refNode)) {
+              if (refNode == childVal) {
+                // There's a self-referential assignment
+                return false;
+              }
+              refNode = refNode.getParent();
+            }
+          }
+        }
+
+
+        // We have found an acceptable object literal assignment. As
+        // long as there are no other assignments that mess things up,
+        // we can inline.
+        ret = true;
+      }
+      return ret;
+    }
+
+```
+
+The code fails the following tests.
+
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject10`:
+```java
+  public void testObject10() {
+    testLocal("var x; var b = f(); x = {a:a, b:b}; if(x.a) g(x.b);",
+         "var JSCompiler_object_inline_a_0;" +
+         "var JSCompiler_object_inline_b_1;" +
+         "var b = f();" +
+         "JSCompiler_object_inline_a_0=a,JSCompiler_object_inline_b_1=b,true;" +
+         "if(JSCompiler_object_inline_a_0) g(JSCompiler_object_inline_b_1)");
+    testLocal("var x = {}; var b = f(); x = {a:a, b:b}; if(x.a) g(x.b) + x.c",
+         "var x = {}; var b = f(); x = {a:a, b:b}; if(x.a) g(x.b) + x.c");
+    testLocal("var x; var b = f(); x = {a:a, b:b}; x.c = c; if(x.a) g(x.b) + x.c",
+         "var JSCompiler_object_inline_a_0;" +
+         "var JSCompiler_object_inline_b_1;" +
+         "var JSCompiler_object_inline_c_2;" +
+         "var b = f();" +
+         "JSCompiler_object_inline_a_0 = a,JSCompiler_object_inline_b_1 = b, " +
+         "  JSCompiler_object_inline_c_2=void 0,true;" +
+         "JSCompiler_object_inline_c_2 = c;" +
+         "if (JSCompiler_object_inline_a_0)" +
+         "  g(JSCompiler_object_inline_b_1) + JSCompiler_object_inline_c_2;");
+    testLocal("var x = {a:a}; if (b) x={b:b}; f(x.a||x.b);",
+         "var JSCompiler_object_inline_a_0 = a;" +
+         "var JSCompiler_object_inline_b_1;" +
+         "if(b) JSCompiler_object_inline_b_1 = b," +
+         "      JSCompiler_object_inline_a_0 = void 0," +
+         "      true;" +
+         "f(JSCompiler_object_inline_a_0 || JSCompiler_object_inline_b_1)");
+    testLocal("var x; var y = 5; x = {a:a, b:b, c:c}; if (b) x={b:b}; f(x.a||x.b);",
+         "var JSCompiler_object_inline_a_0;" +
+         "var JSCompiler_object_inline_b_1;" +
+         "var JSCompiler_object_inline_c_2;" +
+         "var y=5;" +
+         "JSCompiler_object_inline_a_0=a," +
+         "JSCompiler_object_inline_b_1=b," +
+         "JSCompiler_object_inline_c_2=c," +
+         "true;" +
+         "if (b) JSCompiler_object_inline_b_1=b," +
+         "       JSCompiler_object_inline_a_0=void 0," +
+         "       JSCompiler_object_inline_c_2=void 0," +
+         "       true;" +
+         "f(JSCompiler_object_inline_a_0||JSCompiler_object_inline_b_1)");
+  }
+
+```
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject10` error:
+```
+junit.framework.AssertionFailedError: ;com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject22
+```
+
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject12`:
+```java
+  public void testObject12() {
+    testLocal("var a; a = {x:1, y:2}; f(a.x, a.y2);",
+        "var a; a = {x:1, y:2}; f(a.x, a.y2);");
+  }
+
+```
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject12` error:
+```
+junit.framework.AssertionFailedError: ;com.google.javascript.jscomp.InlineObjectLiteralsTest::testIssue724
+```
+
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject22`:
+```java
+  public void testObject22() {
+    testLocal("while(1) { var a = {y:1}; if (b) a.x = 2; f(a.y, a.x);}",
+      "for(;1;){" +
+      " var JSCompiler_object_inline_y_0=1;" +
+      " var JSCompiler_object_inline_x_1;" +
+      " if(b) JSCompiler_object_inline_x_1=2;" +
+      " f(JSCompiler_object_inline_y_0,JSCompiler_object_inline_x_1)" +
+      "}");
+
+    testLocal("var a; while (1) { f(a.x, a.y); a = {x:1, y:1};}",
+        "var a; while (1) { f(a.x, a.y); a = {x:1, y:1};}");
+  }
+
+```
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testObject22` error:
+```
+junit.framework.AssertionFailedError: ;com.google.javascript.jscomp.IntegrationTest::testIssue724
+```
+
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testIssue724`:
+```java
+  public void testIssue724() {
+    testSameLocal(
+        "var getType; getType = {};" +
+        "return functionToCheck && " +
+        "   getType.toString.apply(functionToCheck) === " +
+        "   '[object Function]';");
+  }
+
+```
+Test `com.google.javascript.jscomp.InlineObjectLiteralsTest::testIssue724` error:
+```
+junit.framework.AssertionFailedError:
+```
+
+Test `com.google.javascript.jscomp.IntegrationTest::testIssue724`:
+```java
+  public void testIssue724() {
+    CompilerOptions options = createCompilerOptions();
+    CompilationLevel.ADVANCED_OPTIMIZATIONS
+        .setOptionsForCompilationLevel(options);
+    String code =
+        "isFunction = function(functionToCheck) {" +
+        "  var getType = {};" +
+        "  return functionToCheck && " +
+        "      getType.toString.apply(functionToCheck) === " +
+        "     '[object Function]';" +
+        "};";
+    String result =
+        "isFunction=function(a){var b={};" +
+        "return a&&\"[object Function]\"===b.b.a(a)}";
+
+    test(options, code, result);
+  }
+
+```
+Test `com.google.javascript.jscomp.IntegrationTest::testIssue724` error:
+```
+junit.framework.AssertionFailedError:
+```
+
+
+Please provide a fixed version of the buggy function, and only that function, inside a code block.
