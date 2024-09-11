@@ -2,12 +2,13 @@
 import React, { useState, useEffect } from 'react';
 import { useTable, useSortBy } from 'react-table';
 import ReactCountryFlag from "react-country-flag";
+import CitationBox from './CitationBox'; // Import the new component
 import './LeaderboardTable.css'; // Add some basic CSS styling
 
 // LLM to country code mapping
 const llmCountryMap = {
-  'gemini-1.5-pro': 'US',
-  'gpt-4o-2024-08-06': 'US',
+  'Google': 'US',
+  'OpenAI': 'US',
   // Add more mappings as needed
 };
 
@@ -16,7 +17,10 @@ const LeaderboardTable = () => {
 
   // Function to load data from JSON files
   const loadData = async () => {
-    const llmNames = [['gemini-1.5-pro', "google"], ['gpt-4o-2024-08-06', "openai-chatcompletion"]]; // Add more LLM names as required
+    const llmNames = [
+      ['gemini-1.5-pro', "google", "Google"],
+      ['gpt-4o-2024-08-06', "openai-chatcompletion", "OpenAI"]
+    ]; // Add more LLM names as required
     const benchmarks = ['defects4j', 'gitbugjava']; // Add more benchmarks if available
     const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1'];
 
@@ -24,7 +28,8 @@ const LeaderboardTable = () => {
     for (const llm of llmNames) {
       const llm_name = llm[0];
       const strategy = llm[1];
-      const row = { name: llm_name };
+      const provider = llm[2];
+      const row = { name: llm_name, provider: provider, total_cost: 0 };
 
       for (const benchmark of benchmarks) {
         try {
@@ -33,6 +38,8 @@ const LeaderboardTable = () => {
           metrics.forEach(metric => {
             row[`${benchmark}_${metric}`] = result[metric];
           });
+          // Add the total_cost from each benchmark
+          row.total_cost += result.total_cost || 0;
         } catch (error) {
           console.error(`Failed to load data for ${llm_name} - ${benchmark}:`, error);
         }
@@ -64,6 +71,11 @@ const LeaderboardTable = () => {
     return (value * 100).toFixed(1).replace('.', ',') + '%';
   };
 
+  // Helper function to format currency
+  const formatCurrency = (value) => {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
+  };
+
   useEffect(() => {
     loadData();
   }, []);
@@ -87,8 +99,8 @@ const LeaderboardTable = () => {
 
       return [
         {
-          Header: 'LLM',
-          accessor: 'name',
+          Header: 'Provider',
+          accessor: 'provider',
           Cell: ({ value }) => (
             <div style={{ display: 'flex', alignItems: 'center' }}>
               <ReactCountryFlag
@@ -96,9 +108,13 @@ const LeaderboardTable = () => {
                 svg
                 style={{ marginRight: '10px' }}
               />
-              {value}
+              <span style={{ fontWeight: 'bold' }}>{value}</span>
             </div>
           )
+        },
+        {
+          Header: 'Model',
+          accessor: 'name',
         },
         {
           Header: 'Defects4J',
@@ -116,6 +132,15 @@ const LeaderboardTable = () => {
             createColumn('Plausible @1', 'gitbugjava_plausible@1', 'gitbugjava'),
           ],
         },
+        {
+          Header: 'Total Cost',
+          accessor: 'total_cost',
+          Cell: ({ value }) => (
+            <div style={{ textAlign: 'right' }}>
+              {formatCurrency(value)}
+            </div>
+          )
+        },
       ];
     },
     [data]
@@ -128,35 +153,38 @@ const LeaderboardTable = () => {
   );
 
   return (
-    <div className="leaderboard-table-container">
-      <table {...getTableProps()} className="leaderboard-table">
-        <thead>
-          {headerGroups.map(headerGroup => (
-            <tr {...headerGroup.getHeaderGroupProps()}>
-              {headerGroup.headers.map(column => (
-                <th {...column.getHeaderProps(column.getSortByToggleProps())}>
-                  {column.render('Header')}
-                  <span>
-                    {column.isSorted ? (column.isSortedDesc ? ' 🔽' : ' 🔼') : ''}
-                  </span>
-                </th>
-              ))}
-            </tr>
-          ))}
-        </thead>
-        <tbody {...getTableBodyProps()}>
-          {rows.map(row => {
-            prepareRow(row);
-            return (
-              <tr {...row.getRowProps()}>
-                {row.cells.map(cell => (
-                  <td {...cell.getCellProps()}>{cell.render('Cell')}</td>
+    <div className="leaderboard-container">
+      <div className="leaderboard-table-container">
+        <table {...getTableProps()} className="leaderboard-table">
+          <thead>
+            {headerGroups.map(headerGroup => (
+              <tr {...headerGroup.getHeaderGroupProps()}>
+                {headerGroup.headers.map(column => (
+                  <th {...column.getHeaderProps(column.getSortByToggleProps())}>
+                    {column.render('Header')}
+                    <span>
+                      {column.isSorted ? (column.isSortedDesc ? ' 🔽' : ' 🔼') : ''}
+                    </span>
+                  </th>
                 ))}
               </tr>
-            );
-          })}
-        </tbody>
-      </table>
+            ))}
+          </thead>
+          <tbody {...getTableBodyProps()}>
+            {rows.map(row => {
+              prepareRow(row);
+              return (
+                <tr {...row.getRowProps()}>
+                  {row.cells.map(cell => (
+                    <td {...cell.getCellProps()}>{cell.render('Cell')}</td>
+                  ))}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <CitationBox /> {/* Add the CitationBox component here */}
     </div>
   );
 };
