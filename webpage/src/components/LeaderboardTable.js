@@ -33,13 +33,15 @@ const LeaderboardTable = () => {
 
       for (const benchmark of benchmarks) {
         try {
-          const response = await fetch(`./results/${llm_name}/${benchmark}/statistics_${benchmark}_instruct_${strategy}.json`);
-          const result = await response.json();
+          const stats_response = await fetch(`./results/${llm_name}/${benchmark}/statistics_${benchmark}_instruct_${strategy}.json`);
+          const stats_result = await stats_response.json();
           metrics.forEach(metric => {
-            row[`${benchmark}_${metric}`] = result[metric];
+            row[`${benchmark}_${metric}`] = stats_result[metric];
           });
           // Add the total_cost from each benchmark
-          row.total_cost += result.total_cost || 0;
+          const cost_response = await fetch(`./results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
+          const cost_result = await cost_response.json();
+          row.total_cost += cost_result.total_cost || 0;
         } catch (error) {
           console.error(`Failed to load data for ${llm_name} - ${benchmark}:`, error);
         }
