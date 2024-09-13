@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { useTable, useSortBy } from 'react-table';
 import ReactCountryFlag from "react-country-flag";
 import CitationBox from './CitationBox'; // Import the new component
+import Footer from './Footer'; // Import the Footer component
 import './LeaderboardTable.css'; // Add some basic CSS styling
 
 // LLM to country code mapping
@@ -150,7 +151,15 @@ const LeaderboardTable = () => {
 
   // Create the table instance
   const { getTableProps, getTableBodyProps, headerGroups, rows, prepareRow } = useTable(
-    { columns, data },
+    { 
+      columns, 
+      data,
+      initialState: {
+        sortBy: [
+          { id: 'gitbugjava_ast_match@1', desc: true },
+        ]
+      }
+    },
     useSortBy
   );
 
@@ -187,6 +196,7 @@ const LeaderboardTable = () => {
         </table>
       </div>
       <CitationBox /> {/* Add the CitationBox component here */}
+      <Footer /> {/* Add the Footer component here */}
     </div>
   );
 };

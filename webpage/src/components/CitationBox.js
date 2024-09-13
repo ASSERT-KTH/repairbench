@@ -23,7 +23,7 @@ const CitationBox = () => {
 
   return (
     <div className="citation-container">
-      <p className="citation-message">If you use this work in your research, please consider citing us:</p>
+      <p className="citation-message">If you use this work in your research, please cite:</p>
       <div className="citation-box">
         <button onClick={copyToClipboard} className="copy-button" title="Copy to clipboard">
           {isCopied ? '✓' : '⧉'}

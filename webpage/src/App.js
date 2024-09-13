@@ -6,7 +6,7 @@ import './App.css';
 function App() {
   return (
     <div className="App">
-      <h1>Live Leaderboard of Frontier LLMs for Program Repair</h1>
+      <h1>RepairBench: Live Leaderboard of Frontier LLMs for Program Repair</h1>
       <LeaderboardTable />
     </div>
   );
