@@ -5,6 +5,7 @@ import ReactCountryFlag from "react-country-flag";
 import CitationBox from './CitationBox'; // Import the new component
 import Footer from './Footer'; // Import the Footer component
 import './LeaderboardTable.css'; // Add some basic CSS styling
+import PatchViewer from './PatchViewer'; // Import the new PatchViewer component
 
 // LLM to country code mapping
 const llmCountryMap = {
@@ -15,6 +16,7 @@ const llmCountryMap = {
 
 const LeaderboardTable = () => {
   const [data, setData] = useState([]);
+  const [selectedPatch, setSelectedPatch] = useState(null);
 
   // Function to load data from JSON files
   const loadData = async () => {
@@ -89,11 +91,14 @@ const LeaderboardTable = () => {
     () => {
       const bestScores = getBestScores(data);
 
-      const createColumn = (header, accessor, format = formatPercentage) => ({
+      const createColumn = (header, accessor, format = formatPercentage, benchmark) => ({
         Header: header,
         accessor: accessor,
-        Cell: ({ value }) => (
-          <div style={{ textAlign: 'right' }}>
+        Cell: ({ value, row }) => (
+          <div 
+            style={{ textAlign: 'right', cursor: 'pointer' }} 
+            onClick={() => handleScoreClick(row.original.name, benchmark)}
+          >
             <span style={{ fontWeight: value === bestScores[accessor] ? 'bold' : 'normal' }}>
               {format(value)}
             </span>
@@ -123,15 +128,15 @@ const LeaderboardTable = () => {
         {
           Header: 'Defects4J',
           columns: [
-            createColumn('AST Match @1', 'defects4j_ast_match@1'),
-            createColumn('Plausible @1', 'defects4j_plausible@1'),
+            createColumn('AST Match @1', 'defects4j_ast_match@1', formatPercentage, 'defects4j'),
+            createColumn('Plausible @1', 'defects4j_plausible@1', formatPercentage, 'defects4j'),
           ],
         },
         {
           Header: 'GitBug-Java',
           columns: [
-            createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
-            createColumn('Plausible @1', 'gitbugjava_plausible@1'),
+            createColumn('AST Match @1', 'gitbugjava_ast_match@1', formatPercentage, 'gitbugjava'),
+            createColumn('Plausible @1', 'gitbugjava_plausible@1', formatPercentage, 'gitbugjava'),
           ],
         },
         {
@@ -146,6 +151,10 @@ const LeaderboardTable = () => {
     },
     [data]
   );
+
+  const handleScoreClick = (model, benchmark) => {
+    setSelectedPatch({ model, benchmark });
+  };
 
   // Create the table instance
   const { getTableProps, getTableBodyProps, headerGroups, rows, prepareRow } = useTable(
@@ -193,6 +202,13 @@ const LeaderboardTable = () => {
           </tbody>
         </table>
       </div>
+      {selectedPatch && (
+        <PatchViewer
+          model={selectedPatch.model}
+          benchmark={selectedPatch.benchmark}
+          onClose={() => setSelectedPatch(null)}
+        />
+      )}
       <CitationBox /> {/* Add the CitationBox component here */}
       <Footer /> {/* Add the Footer component here */}
     </div>
