@@ -20,7 +20,8 @@ const LeaderboardTable = () => {
   const loadData = async () => {
     const llmNames = [
       ['gemini-1.5-pro', "google", "Google"],
-      ['gpt-4o-2024-08-06', "openai-chatcompletion", "OpenAI"]
+      ['gpt-4o-2024-08-06', "openai-chatcompletion", "OpenAI"],
+      ['o1-preview-2024-09-12', "openai-chatcompletion", "OpenAI"],
     ]; // Add more LLM names as required
     const benchmarks = ['defects4j', 'gitbugjava']; // Add more benchmarks if available
     const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1'];
@@ -88,13 +89,13 @@ const LeaderboardTable = () => {
     () => {
       const bestScores = getBestScores(data);
 
-      const createColumn = (header, accessor, benchmark) => ({
+      const createColumn = (header, accessor, format = formatPercentage) => ({
         Header: header,
         accessor: accessor,
         Cell: ({ value }) => (
           <div style={{ textAlign: 'right' }}>
             <span style={{ fontWeight: value === bestScores[accessor] ? 'bold' : 'normal' }}>
-              {formatPercentage(value)}
+              {format(value)}
             </span>
           </div>
         )
@@ -122,28 +123,25 @@ const LeaderboardTable = () => {
         {
           Header: 'Defects4J',
           columns: [
-            createColumn('Exact Match @1', 'defects4j_exact_match@1', 'defects4j'),
-            createColumn('AST Match @1', 'defects4j_ast_match@1', 'defects4j'),
-            createColumn('Plausible @1', 'defects4j_plausible@1', 'defects4j'),
+            createColumn('AST Match @1', 'defects4j_ast_match@1'),
+            createColumn('Plausible @1', 'defects4j_plausible@1'),
           ],
         },
         {
           Header: 'GitBug-Java',
           columns: [
-            createColumn('Exact Match @1', 'gitbugjava_exact_match@1', 'gitbugjava'),
-            createColumn('AST Match @1', 'gitbugjava_ast_match@1', 'gitbugjava'),
-            createColumn('Plausible @1', 'gitbugjava_plausible@1', 'gitbugjava'),
+            createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
+            createColumn('Plausible @1', 'gitbugjava_plausible@1'),
           ],
         },
         {
-          Header: 'Total Cost',
-          accessor: 'total_cost',
-          Cell: ({ value }) => (
-            <div style={{ textAlign: 'right' }}>
-              {formatCurrency(value)}
-            </div>
-          )
-        },
+          Header: 'Total',
+          columns: [
+            createColumn('AST Match @1', 'total_ast_match@1'),
+            createColumn('Plausible @1', 'total_plausible@1'),
+            createColumn('Cost', 'total_cost', formatCurrency),
+          ],
+        }
       ];
     },
     [data]
@@ -156,7 +154,7 @@ const LeaderboardTable = () => {
       data,
       initialState: {
         sortBy: [
-          { id: 'gitbugjava_ast_match@1', desc: true },
+          { id: 'total_plausible@1', desc: true },
         ]
       }
     },
