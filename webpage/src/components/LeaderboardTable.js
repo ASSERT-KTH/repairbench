@@ -5,33 +5,29 @@ import ReactCountryFlag from "react-country-flag";
 import CitationBox from './CitationBox'; // Import the new component
 import Footer from './Footer'; // Import the Footer component
 import './LeaderboardTable.css'; // Add some basic CSS styling
-
-// LLM to country code mapping
-const llmCountryMap = {
-  'Google': 'US',
-  'OpenAI': 'US',
-  // Add more mappings as needed
-};
+import { modelList, llmCountryMap } from './modelConfig';
 
 const LeaderboardTable = () => {
   const [data, setData] = useState([]);
 
   // Function to load data from JSON files
   const loadData = async () => {
-    const llmNames = [
-      ['gemini-1.5-pro', "google", "Google"],
-      ['gpt-4o-2024-08-06', "openai-chatcompletion", "OpenAI"],
-      ['o1-preview-2024-09-12', "openai-chatcompletion", "OpenAI"],
-    ]; // Add more LLM names as required
-    const benchmarks = ['defects4j', 'gitbugjava']; // Add more benchmarks if available
+    const benchmarks = ['defects4j', 'gitbugjava'];
     const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1'];
 
     let results = [];
-    for (const llm of llmNames) {
-      const llm_name = llm[0];
-      const strategy = llm[1];
-      const provider = llm[2];
+    for (const [llm_name, strategy, provider] of modelList) {
       const row = { name: llm_name, provider: provider, total_cost: 0 };
+
+      // Load total.json
+      try {
+        const total_response = await fetch(`./results/${llm_name}/total.json`);
+        const total_result = await total_response.json();
+        row['total_ast_match@1'] = total_result['ast_match@1'];
+        row['total_plausible@1'] = total_result['plausible@1'];
+      } catch (error) {
+        console.error(`Failed to load total.json for ${llm_name}:`, error);
+      }
 
       for (const benchmark of benchmarks) {
         try {
@@ -57,7 +53,7 @@ const LeaderboardTable = () => {
   const getBestScores = (data) => {
     const bestScores = {};
     const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1'];
-    const benchmarks = ['defects4j', 'gitbugjava'];
+    const benchmarks = ['defects4j', 'gitbugjava', 'total'];
 
     benchmarks.forEach(benchmark => {
       metrics.forEach(metric => {
@@ -90,11 +86,15 @@ const LeaderboardTable = () => {
       const bestScores = getBestScores(data);
 
       const createColumn = (header, accessor, format = formatPercentage) => ({
-        Header: header,
+        Header: () => (
+          <div className="column-header">
+            <span>{header}</span>
+          </div>
+        ),
         accessor: accessor,
         Cell: ({ value }) => (
-          <div style={{ textAlign: 'right' }}>
-            <span style={{ fontWeight: value === bestScores[accessor] ? 'bold' : 'normal' }}>
+          <div className="cell-content">
+            <span className={value === bestScores[accessor] ? 'bold' : ''}>
               {format(value)}
             </span>
           </div>
@@ -103,22 +103,27 @@ const LeaderboardTable = () => {
 
       return [
         {
-          Header: 'Provider',
+          Header: 'Organization',
           accessor: 'provider',
           Cell: ({ value }) => (
-            <div style={{ display: 'flex', alignItems: 'center' }}>
+            <div className="provider-cell">
               <ReactCountryFlag
                 countryCode={llmCountryMap[value] || 'UN'}
                 svg
-                style={{ marginRight: '10px' }}
+                className="country-flag"
               />
-              <span style={{ fontWeight: 'bold' }}>{value}</span>
+              <span className="provider-name">{value}</span>
             </div>
           )
         },
         {
           Header: 'Model',
           accessor: 'name',
+          Cell: ({ value }) => (
+            <div className="model-name-cell">
+              <div className="model-name-content">{value}</div>
+            </div>
+          )
         },
         {
           Header: 'Defects4J',
@@ -169,11 +174,13 @@ const LeaderboardTable = () => {
             {headerGroups.map(headerGroup => (
               <tr {...headerGroup.getHeaderGroupProps()}>
                 {headerGroup.headers.map(column => (
-                  <th {...column.getHeaderProps(column.getSortByToggleProps())}>
+                  <th {...column.getHeaderProps(column.getSortByToggleProps())} className="table-header">
                     {column.render('Header')}
-                    <span>
-                      {column.isSorted ? (column.isSortedDesc ? ' 🔽' : ' 🔼') : ''}
-                    </span>
+                    {column.isSorted && (
+                      <span className="sort-indicator">
+                        {column.isSortedDesc ? ' 🔽' : ' 🔼'}
+                      </span>
+                    )}
                   </th>
                 ))}
               </tr>
