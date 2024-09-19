@@ -194,7 +194,7 @@ const LeaderboardTable = () => {
           </tbody>
         </table>
       </div>
-      <CitationBox />
+      {/* <CitationBox /> */}
       <Footer />
     </div>
   );

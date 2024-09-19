@@ -10,7 +10,7 @@ const Footer = () => {
       <a href="https://arxiv.org" target="_blank" rel="noopener noreferrer">
         <SiArxiv className="footer-icon" />
       </a>
-      <a href="https://github.com/ASSERT-KTH/frontier-models-apr-leaderboard" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/ASSERT-KTH/repairbench" target="_blank" rel="noopener noreferrer">
         <FaGithub className="footer-icon" />
       </a>
     </div>
