@@ -14,7 +14,12 @@ function App() {
 
   return (
     <div className="App">
-      <h1>RepairBench: Live Leaderboard of Frontier LLMs for Program Repair</h1>
+      <header className="App-header">
+        <div className="App-header-content">
+          <img src="/logo.png" alt="logo" className="App-logo" /> {/* Reference the logo in public directory */}
+          <h1>RepairBench: Live Leaderboard of Frontier LLMs for Program Repair</h1>
+        </div>
+      </header>
       <LeaderboardTable />
     </div>
   );
