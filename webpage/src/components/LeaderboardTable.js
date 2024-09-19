@@ -9,10 +9,13 @@ import './LeaderboardTable.css';
 
 const LeaderboardTable = () => {
   const [data, setData] = useState([]);
+  const [bugCounts, setBugCounts] = useState({});
 
   const loadData = async () => {
     const benchmarks = ['defects4j', 'gitbugjava'];
     const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1'];
+    let newBugCounts = {};
+    let totalBugs = 0;
 
     const results = await Promise.all(modelList.map(async ([llm_name, strategy, provider]) => {
       const row = { name: llm_name, provider, total_cost: 0 };
@@ -33,7 +36,13 @@ const LeaderboardTable = () => {
           metrics.forEach(metric => {
             row[`${benchmark}_${metric}`] = statsResult[metric];
           });
-
+  
+          // Update bug count for each benchmark
+          if (!newBugCounts[benchmark]) {
+            newBugCounts[benchmark] = statsResult.num_bugs_with_prompt;
+            totalBugs += statsResult.num_bugs_with_prompt;
+          }
+  
           const costResponse = await fetch(`./results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
           const costResult = await costResponse.json();
           row.total_cost += costResult.total_cost || 0;
@@ -46,6 +55,7 @@ const LeaderboardTable = () => {
     }));
 
     setData(results);
+    setBugCounts({ ...newBugCounts, total: totalBugs });
   };
 
   useEffect(() => {
@@ -116,21 +126,21 @@ const LeaderboardTable = () => {
         disableSortBy: false
       },
       {
-        Header: 'Defects4J',
+        Header: `Defects4J (${bugCounts.defects4j || 0} bugs)`,
         columns: [
           createColumn('AST Match @1', 'defects4j_ast_match@1'),
           createColumn('Plausible @1', 'defects4j_plausible@1'),
         ],
       },
       {
-        Header: 'GitBug-Java',
+        Header: `GitBug-Java (${bugCounts.gitbugjava || 0} bugs)`,
         columns: [
           createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
           createColumn('Plausible @1', 'gitbugjava_plausible@1'),
         ],
       },
       {
-        Header: 'Total',
+        Header: `Total (${bugCounts.total || 0} bugs)`,
         columns: [
           createColumn('AST Match @1', 'total_ast_match@1'),
           createColumn('Plausible @1', 'total_plausible@1'),
@@ -138,7 +148,7 @@ const LeaderboardTable = () => {
         ],
       }
     ];
-  }, [data]);
+  }, [data, bugCounts]);
 
   const { getTableProps, getTableBodyProps, headerGroups, rows, prepareRow } = useTable(
     { 
