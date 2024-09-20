@@ -1,0 +1,191 @@
+diff --git a/tmp/a6f38eb7-5235-4516-bd8e-cfd2afe5bd65_buggy.java b/tmp/2d1c93f7-1b03-43a7-9c80-e91e1644f900_fixed.java
+index 5481b94..a876a01 100644
+--- a/tmp/a6f38eb7-5235-4516-bd8e-cfd2afe5bd65_buggy.java
++++ b/tmp/2d1c93f7-1b03-43a7-9c80-e91e1644f900_fixed.java
+@@ -1,49 +1,146 @@
+-    public Object handle(Invocation invocation) throws Throwable {
+-        if (invocationContainerImpl.hasAnswersForStubbing()) {
+-            // stubbing voids with stubVoid() or doAnswer() style
+-            InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress
+-                            .getArgumentMatcherStorage(), invocation);
+-            invocationContainerImpl.setMethodForStubbing(invocationMatcher);
+-            return null;
+-        }
+-        VerificationMode verificationMode = mockingProgress.pullVerificationMode();
++  /** {@inheritDoc} */
++  @Override
++  public void integrate(final ExpandableStatefulODE equations, final double t)
++      throws MathIllegalStateException, MathIllegalArgumentException {
+ 
+-        InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(),
+-                        invocation);
++    sanityChecks(equations, t);
++    setEquations(equations);
++    final boolean forward = t > equations.getTime();
+ 
+-        mockingProgress.validateState();
++    // create some internal working arrays
++    final double[] y0  = equations.getCompleteState();
++    final double[] y = y0.clone();
++    final int stages = c.length + 1;
++    final double[][] yDotK = new double[stages][y.length];
++    final double[] yTmp    = y0.clone();
++    final double[] yDotTmp = new double[y.length];
+ 
+-        //if verificationMode is not null then someone is doing verify()        
+-        if (verificationMode != null) {
+-            //We need to check if verification was started on the correct mock 
+-            // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            if (verificationMode instanceof MockAwareVerificationMode && ((MockAwareVerificationMode) verificationMode).getMock() == invocation.getMock()) {
+-                VerificationDataImpl data = new VerificationDataImpl(invocationContainerImpl, invocationMatcher);            
+-                verificationMode.verify(data);
+-                return null;
+-                // this means there is an invocation on a different mock. Re-adding verification mode 
+-                // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            }
+-        }
++    // set up an interpolator sharing the integrator arrays
++    final RungeKuttaStepInterpolator interpolator = (RungeKuttaStepInterpolator) prototype.copy();
++    interpolator.reinitialize(this, yTmp, yDotK, forward,
++                              equations.getPrimaryMapper(), equations.getSecondaryMappers());
++    interpolator.storeTime(equations.getTime());
+ 
+-        invocationContainerImpl.setInvocationForPotentialStubbing(invocationMatcher);
+-        OngoingStubbingImpl<T> ongoingStubbing = new OngoingStubbingImpl<T>(invocationContainerImpl);
+-        mockingProgress.reportOngoingStubbing(ongoingStubbing);
++    // set up integration control objects
++    stepStart         = equations.getTime();
++    double  hNew      = 0;
++    boolean firstTime = true;
++    initIntegration(equations.getTime(), y0, t);
+ 
+-        StubbedInvocationMatcher stubbedInvocation = invocationContainerImpl.findAnswerFor(invocation);
++    // Initialize step size before the main integration loop
++    if (firstTime || !fsal) {
++      // first stage
++      computeDerivatives(stepStart, y, yDotK[0]);
++    }
+ 
+-        if (stubbedInvocation != null) {
+-            stubbedInvocation.captureArgumentsFrom(invocation);
+-            return stubbedInvocation.answer(invocation);
++    if (firstTime) {
++      final double[] scale = new double[mainSetDimension];
++      if (vecAbsoluteTolerance == null) {
++          for (int i = 0; i < scale.length; ++i) {
++            scale[i] = scalAbsoluteTolerance + scalRelativeTolerance * FastMath.abs(y[i]);
++          }
+       } else {
+-            Object ret = mockSettings.getDefaultAnswer().answer(invocation);
++          for (int i = 0; i < scale.length; ++i) {
++            scale[i] = vecAbsoluteTolerance[i] + vecRelativeTolerance[i] * FastMath.abs(y[i]);
++          }
++      }
++      hNew = initializeStep(forward, getOrder(), scale,
++                            stepStart, y, yDotK[0], yTmp, yDotK[1]);
++      firstTime = false;
++    }
++
++    // main integration loop
++    isLastStep = false;
++    do {
++
++      interpolator.shift();
++
++      // iterate over step size, ensuring local normalized error is smaller than 1
++      double error = 10;
++      while (error >= 1.0) {
++
++        if (firstTime || !fsal) {
++          // first stage
++          computeDerivatives(stepStart, y, yDotK[0]);
++        }
++
++        stepSize = hNew;
++
++        // next stages
++        for (int k = 1; k < stages; ++k) {
++
++          for (int j = 0; j < y0.length; ++j) {
++            double sum = a[k-1][0] * yDotK[0][j];
++            for (int l = 1; l < k; ++l) {
++              sum += a[k-1][l] * yDotK[l][j];
++            }
++            yTmp[j] = y[j] + stepSize * sum;
++          }
++
++          computeDerivatives(stepStart + c[k-1] * stepSize, yTmp, yDotK[k]);
+ 
+-            // redo setting invocation for potential stubbing in case of partial
+-            // mocks / spies.
+-            // Without it, the real method inside 'when' might have delegated
+-            // to other self method and overwrite the intended stubbed method
+-            // with a different one. The reset is required to avoid runtime exception that validates return type with stubbed method signature.
+-            invocationContainerImpl.resetInvocationForPotentialStubbing(invocationMatcher);
+-            return ret;
+         }
++
++        // estimate the state at the end of the step
++        for (int j = 0; j < y0.length; ++j) {
++          double sum    = b[0] * yDotK[0][j];
++          for (int l = 1; l < stages; ++l) {
++            sum    += b[l] * yDotK[l][j];
++          }
++          yTmp[j] = y[j] + stepSize * sum;
++        }
++
++        // estimate the error at the end of the step
++        error = estimateError(yDotK, y, yTmp, stepSize);
++        if (error >= 1.0) {
++          // reject the step and attempt to reduce error by stepsize control
++          final double factor =
++              FastMath.min(maxGrowth,
++                           FastMath.max(minReduction, safety * FastMath.pow(error, exp)));
++          hNew = filterStep(stepSize * factor, forward, false);
++        }
++
++      }
++
++      // local error is small enough: accept the step, trigger events and step handlers
++      interpolator.storeTime(stepStart + stepSize);
++      System.arraycopy(yTmp, 0, y, 0, y0.length);
++      System.arraycopy(yDotK[stages - 1], 0, yDotTmp, 0, y0.length);
++      stepStart = acceptStep(interpolator, y, yDotTmp, t);
++      System.arraycopy(y, 0, yTmp, 0, y.length);
++
++      if (!isLastStep) {
++
++          // prepare next step
++          interpolator.storeTime(stepStart);
++
++          if (fsal) {
++              // save the last evaluation for the next step
++              System.arraycopy(yDotTmp, 0, yDotK[0], 0, y0.length);
++          }
++
++          // stepsize control for next step
++          final double factor =
++              FastMath.min(maxGrowth, FastMath.max(minReduction, safety * FastMath.pow(error, exp)));
++          final double  scaledH    = stepSize * factor;
++          final double  nextT      = stepStart + scaledH;
++          final boolean nextIsLast = forward ? (nextT >= t) : (nextT <= t);
++          hNew = filterStep(scaledH, forward, nextIsLast);
++
++          final double  filteredNextT      = stepStart + hNew;
++          final boolean filteredNextIsLast = forward ? (filteredNextT >= t) : (filteredNextT <= t);
++          if (filteredNextIsLast) {
++              hNew = t - stepStart;
++          }
++
++      }
++
++    } while (!isLastStep);
++
++    // dispatch results
++    equations.setTime(stepStart);
++    equations.setCompleteState(y);
++
++    resetInternalState();
++
+   }
+\ No newline at end of file
