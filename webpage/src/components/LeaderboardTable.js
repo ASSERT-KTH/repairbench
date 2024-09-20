@@ -166,16 +166,16 @@ const LeaderboardTable = () => {
       <div className="leaderboard-table-container">
         <table {...getTableProps()} className="leaderboard-table">
           <thead>
-            {headerGroups.map(headerGroup => (
+            {headerGroups.map((headerGroup, i) => (
               <tr {...headerGroup.getHeaderGroupProps()}>
                 {headerGroup.headers.map(column => (
                   <th
                     {...column.getHeaderProps(column.getSortByToggleProps())}
-                    className={`table-header ${column.canSort ? 'sortable' : ''}`}
+                    className={`table-header ${column.canSort ? 'sortable' : ''} ${i === 0 ? 'top-header' : 'sub-header'}`}
                   >
                     <div className="header-content">
-                      <span>{column.render('Header')}</span>
-                      {column.canSort && (
+                      <span className="header-text">{column.render('Header')}</span>
+                      {column.canSort && i !== 0 && (
                         <span className="sort-indicator">
                           {column.isSorted
                             ? column.isSortedDesc
