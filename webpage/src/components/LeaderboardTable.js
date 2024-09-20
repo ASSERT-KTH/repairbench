@@ -123,7 +123,9 @@ const LeaderboardTable = () => {
             <div className="model-name-content">{value}</div>
           </div>
         ),
-        disableSortBy: false
+        disableSortBy: false,
+        width: 'auto', // Allow the column to adjust its width
+        minWidth: 100, // Set a minimum width
       },
       {
         Header: `Defects4J (${bugCounts.defects4j || 0} bugs)`,
