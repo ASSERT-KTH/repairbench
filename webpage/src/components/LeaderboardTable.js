@@ -10,10 +10,11 @@ import './LeaderboardTable.css';
 const LeaderboardTable = () => {
   const [data, setData] = useState([]);
   const [bugCounts, setBugCounts] = useState({});
+  const [showExtraColumns, setShowExtraColumns] = useState(false); // New state to manage column visibility
 
   const loadData = async () => {
     const benchmarks = ['defects4j', 'gitbugjava'];
-    const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1'];
+    const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost']; // Added 'cost' metric
     let newBugCounts = {};
     let totalBugs = 0;
 
@@ -25,6 +26,7 @@ const LeaderboardTable = () => {
         const totalResult = await totalResponse.json();
         row['total_ast_match@1'] = totalResult['ast_match@1'];
         row['total_plausible@1'] = totalResult['plausible@1'];
+        row['total_cost'] = totalResult['cost'] || 0; // Ensure cost is included
       } catch (error) {
         console.error(`Failed to load total.json for ${llm_name}:`, error);
       }
@@ -36,15 +38,16 @@ const LeaderboardTable = () => {
           metrics.forEach(metric => {
             row[`${benchmark}_${metric}`] = statsResult[metric];
           });
-  
+
           // Update bug count for each benchmark
           if (!newBugCounts[benchmark]) {
             newBugCounts[benchmark] = statsResult.num_bugs_with_prompt;
             totalBugs += statsResult.num_bugs_with_prompt;
           }
-  
+
           const costResponse = await fetch(`./results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
           const costResult = await costResponse.json();
+          row[`${benchmark}_cost`] = costResult.total_cost || 0; // Store individual benchmark cost
           row.total_cost += costResult.total_cost || 0;
         } catch (error) {
           console.error(`Failed to load data for ${llm_name} - ${benchmark}:`, error);
@@ -83,6 +86,7 @@ const LeaderboardTable = () => {
   };
 
   const formatCurrency = (value) => {
+    if (value === undefined || value === null) return 'N/A';
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
   };
 
@@ -100,10 +104,26 @@ const LeaderboardTable = () => {
         </div>
       ),
       sortType: 'basic',
-      disableSortBy: false
+      disableSortBy: false,
+      // Removed fixed widths for flexibility
     });
 
-    return [
+    // Updated createCostColumn to remove bold styling
+    const createCostColumn = (header, accessor) => ({
+      Header: header,
+      accessor: accessor,
+      Cell: ({ value }) => (
+        <div className="cell-content">
+          <span>
+            {formatCurrency(value)}
+          </span>
+        </div>
+      ),
+      sortType: 'basic',
+      disableSortBy: false,
+    });
+
+    const baseColumns = [
       {
         Header: 'Organization',
         accessor: 'provider',
@@ -124,14 +144,25 @@ const LeaderboardTable = () => {
           </div>
         ),
         disableSortBy: false,
-        width: 'auto', // Allow the column to adjust its width
-        minWidth: 100, // Set a minimum width
+        // Removed width properties
       },
+      {
+        Header: `Total (${bugCounts.total || 0} bugs)`,
+        columns: [
+          createColumn('AST Match @1', 'total_ast_match@1'),
+          createColumn('Plausible @1', 'total_plausible@1'),
+          createCostColumn('Cost', 'total_cost'), // Cost column without bold
+        ],
+      }
+    ];
+
+    const extraColumns = [
       {
         Header: `Defects4J (${bugCounts.defects4j || 0} bugs)`,
         columns: [
           createColumn('AST Match @1', 'defects4j_ast_match@1'),
           createColumn('Plausible @1', 'defects4j_plausible@1'),
+          createCostColumn('Cost', 'defects4j_cost'), // Cost column without bold
         ],
       },
       {
@@ -139,18 +170,13 @@ const LeaderboardTable = () => {
         columns: [
           createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
           createColumn('Plausible @1', 'gitbugjava_plausible@1'),
-        ],
-      },
-      {
-        Header: `Total (${bugCounts.total || 0} bugs)`,
-        columns: [
-          createColumn('AST Match @1', 'total_ast_match@1'),
-          createColumn('Plausible @1', 'total_plausible@1'),
-          createColumn('Cost', 'total_cost', formatCurrency),
+          createCostColumn('Cost', 'gitbugjava_cost'), // Cost column without bold
         ],
       }
     ];
-  }, [data, bugCounts]);
+
+    return showExtraColumns ? [...baseColumns, ...extraColumns] : baseColumns;
+  }, [data, bugCounts, showExtraColumns]);
 
   const { getTableProps, getTableBodyProps, headerGroups, rows, prepareRow } = useTable(
     { 
@@ -165,46 +191,54 @@ const LeaderboardTable = () => {
 
   return (
     <div className="leaderboard-container">
-      <div className="leaderboard-table-container">
-        <table {...getTableProps()} className="leaderboard-table">
-          <thead>
-            {headerGroups.map((headerGroup, i) => (
-              <tr {...headerGroup.getHeaderGroupProps()}>
-                {headerGroup.headers.map(column => (
-                  <th
-                    {...column.getHeaderProps(column.getSortByToggleProps())}
-                    className={`table-header ${column.canSort ? 'sortable' : ''} ${i === 0 ? 'top-header' : 'sub-header'}`}
-                  >
-                    <div className="header-content">
-                      <span className="header-text">{column.render('Header')}</span>
-                      {column.canSort && i !== 0 && (
-                        <span className="sort-indicator">
-                          {column.isSorted
-                            ? column.isSortedDesc
-                              ? <FaSortDown />
-                              : <FaSortUp />
-                            : <FaSort />}
-                        </span>
-                      )}
-                    </div>
-                  </th>
-                ))}
-              </tr>
-            ))}
-          </thead>
-          <tbody {...getTableBodyProps()}>
-            {rows.map(row => {
-              prepareRow(row);
-              return (
-                <tr {...row.getRowProps()}>
-                  {row.cells.map(cell => (
-                    <td {...cell.getCellProps()}>{cell.render('Cell')}</td>
+      <div className="leaderboard-table-wrapper">
+        <div className={`leaderboard-table-container ${showExtraColumns ? 'expanded' : ''}`}>
+          <table {...getTableProps()} className="leaderboard-table">
+            <thead>
+              {headerGroups.map((headerGroup, i) => (
+                <tr {...headerGroup.getHeaderGroupProps()}>
+                  {headerGroup.headers.map(column => (
+                    <th
+                      {...column.getHeaderProps(column.getSortByToggleProps())}
+                      className={`table-header ${column.canSort ? 'sortable' : ''} ${i === 0 ? 'top-header' : 'sub-header'}`}
+                    >
+                      <div className="header-content">
+                        <span className="header-text">{column.render('Header')}</span>
+                        {column.canSort && i !== 0 && (
+                          <span className="sort-indicator">
+                            {column.isSorted
+                              ? column.isSortedDesc
+                                ? <FaSortDown />
+                                : <FaSortUp />
+                              : <FaSort />}
+                          </span>
+                        )}
+                      </div>
+                    </th>
                   ))}
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ))}
+            </thead>
+            <tbody {...getTableBodyProps()}>
+              {rows.map(row => {
+                prepareRow(row);
+                return (
+                  <tr {...row.getRowProps()}>
+                    {row.cells.map(cell => (
+                      <td {...cell.getCellProps()}>{cell.render('Cell')}</td>
+                    ))}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div 
+          className="toggle-bar" 
+          onClick={() => setShowExtraColumns(!showExtraColumns)}
+        >
+          {showExtraColumns ? '<' : '>'}
+        </div>
       </div>
       {/* <CitationBox /> */}
       <Footer />
