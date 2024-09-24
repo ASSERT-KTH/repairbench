@@ -14,7 +14,7 @@ export const modelList = [
     'OpenAI': 'US',
     'Meta': 'US',
     'DeepSeek': 'CN',
-    'Mistral': 'FR',
+    'Mistral': 'EU',
     'Alibaba Cloud': 'CN',
     'Anthropic': 'US',
   };
