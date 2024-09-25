@@ -158,7 +158,7 @@ const LeaderboardTable = () => {
 
     const extraColumns = [
       {
-        Header: `Defects4J (${bugCounts.defects4j || 0} bugs)`,
+        Header: `Defects4J v2 (${bugCounts.defects4j || 0} bugs)`,
         columns: [
           createColumn('AST Match @1', 'defects4j_ast_match@1'),
           createColumn('Plausible @1', 'defects4j_plausible@1'),
@@ -170,7 +170,7 @@ const LeaderboardTable = () => {
         columns: [
           createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
           createColumn('Plausible @1', 'gitbugjava_plausible@1'),
-          createCostColumn('Cost', 'gitbugjava_cost'), // Cost column without bold
+          createCostColumn('Cost', 'gitbugjava_cost'), // Cost column without bol
         ],
       }
     ];
