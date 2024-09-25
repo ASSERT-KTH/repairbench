@@ -81,7 +81,22 @@ def generate_latex_table(data):
     latex += "\\makebox[\\textwidth][c]{%\n"
     latex += "\\resizebox{1.25\\textwidth}{!}{\n"
     latex += "\\large\n"
-    latex += "\\begin{tabular}{@{}ll S[table-format=2.1] S[table-format=2.1] S[table-format=3.2] S[table-format=2.1] S[table-format=2.1] S[table-format=3.2] S[table-format=2.1] S[table-format=2.1] S[table-format=3.2]@{}}\n"
+    latex += "\\begin{tabular}{@{}ll "
+
+    # Modify each S column to include detect-weight=true
+    s_columns = [
+        "S[table-format=2.1, detect-weight=true]",
+        "S[table-format=2.1, detect-weight=true]",
+        "S[table-format=4.2, detect-weight=true]",
+        "S[table-format=2.1, detect-weight=true]",
+        "S[table-format=2.1, detect-weight=true]",
+        "S[table-format=4.2, detect-weight=true]",
+        "S[table-format=2.1, detect-weight=true]",
+        "S[table-format=2.1, detect-weight=true]",
+        "S[table-format=4.2, detect-weight=true]"
+    ]
+    latex += ' '.join(s_columns) + "@{}}\n"
+    
     latex += "\\toprule\n"
     latex += "\\multirow{2}{*}{\\textbf{Organization}} & \\multirow{2}{*}{\\textbf{Model}} & \\multicolumn{3}{c}{Defects4J v2 (484 bugs)} & \\multicolumn{3}{c}{GitBug-Java (90 bugs)} & \\multicolumn{3}{c}{\\textbf{Total (574 bugs)}} \\\\\n"
     latex += "\\cmidrule(lr){3-5} \\cmidrule(lr){6-8} \\cmidrule(l){9-11}\n"
@@ -95,11 +110,14 @@ def generate_latex_table(data):
                                      for benchmark in ['defects4j', 'gitbugjava'] 
                                      for metric in ['ast_match@1', 'plausible@1'])
         
-        model_name = row['name']
         if has_incomplete_results:
-            # Append a fixed symbol, e.g., *
-            model_name += "\\textsuperscript{2}"
+            suffix = "\\textsuperscript{2}"
             partial_footnote_needed = True  # Set flag to add footnote later
+        else:
+            suffix = ""
+
+        # Get the model name
+        model_name = row['name']
         
         # Get the country code for the provider
         country_code = llm_country_map.get(row['provider'], 'UN')  # 'UN' for unknown
@@ -107,7 +125,8 @@ def generate_latex_table(data):
         # Insert the flag using the flag-icon package
         provider_with_flag = f"\\worldflag[width=0.3cm]{{{country_code}}} {row['provider']}"
         
-        latex += f"{provider_with_flag} & {model_name} & "
+        # Start building the LaTeX row with suffix appended
+        latex += f"{provider_with_flag}{suffix} & {model_name}{suffix} & "
         
         for benchmark in ['defects4j', 'gitbugjava', 'total']:
             for metric in ['ast_match@1', 'plausible@1']:
@@ -115,18 +134,21 @@ def generate_latex_table(data):
                 value = row[key]
                 if value is not None:
                     if value == best_scores[key]:
-                        latex += "\\textbf{" + f"{value*100:.1f}\\%" + "} & "
+                        cell = f"\\B {value*100:.1f}\\%{suffix if benchmark == 'total' else ''}"
                     else:
-                        latex += f"{value*100:.1f}\\% & "
+                        cell = f"{value*100:.1f}\\%{suffix if benchmark == 'total' else ''}"
                 else:
-                    latex += "\\multicolumn{1}{c}{---} & "
+                    cell = f"\\multicolumn{{1}}{{c}}{{---}}{suffix if benchmark == 'total' else ''}"
+                latex += f"{cell} & "
             
             cost = row[f'{benchmark}_cost']
             if cost is not None:
-                latex += f"\\${cost:.2f} & "
+                cell = f"\\${cost:.2f}{suffix if benchmark == 'total' else ''}"
             else:
-                latex += "\\multicolumn{1}{c}{---} & "
-        
+                cell = f"\\multicolumn{{1}}{{c}}{{---}}{suffix if benchmark == 'total' else ''}"
+            
+            latex += f"{cell} & "
+
         latex = latex.rstrip('& ') + '\\\\\n'
 
     latex += "\\bottomrule\n"
