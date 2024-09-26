@@ -237,7 +237,9 @@ const LeaderboardTable = () => {
           className="toggle-bar" 
           onClick={() => setShowExtraColumns(!showExtraColumns)}
         >
-          {showExtraColumns ? '<' : '>'}
+          <span className="toggle-text">
+            {showExtraColumns ? 'Collapse' : 'See more details...'}
+          </span>
         </div>
       </div>
       
@@ -248,6 +250,7 @@ const LeaderboardTable = () => {
           <li>AST Match means that the generated patch has the same AST as the reference patch</li>
           <li>Plausible means that the generated patch passes all the tests in the test suite</li>
           <li>pass@1 values are computed over 10 non-deterministic generations with temperature of 1.0</li>
+          <li>Costs are calculated according to the pricing model of the model's organization. If the model is open-weights and not hosted by the model's organization, the pricing is calculated according to the provider chosen by the authors.</li>
           <li>Leaderboard is sorted, by default, by the total plausible@1 metric</li>
           <li>For more details, please refer to the <a href="https://arxiv.org/">technical report on arXiv</a></li>
         </ul>
