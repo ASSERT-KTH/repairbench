@@ -10,16 +10,18 @@ import './LeaderboardTable.css';
 const LeaderboardTable = () => {
   const [data, setData] = useState([]);
   const [bugCounts, setBugCounts] = useState({});
-  const [showExtraColumns, setShowExtraColumns] = useState(false); // New state to manage column visibility
+  const [showExtraColumns, setShowExtraColumns] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
   const loadData = async () => {
+    setIsLoading(true);
     const benchmarks = ['defects4j', 'gitbugjava'];
     const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost'];
     let newBugCounts = {};
     let totalBugs = 0;
 
     const results = await Promise.all(modelList.map(async ([llm_name, strategy, provider]) => {
-      const row = { name: llm_name, provider, total_cost: null, hasTotalData: false };
+      const row = { name: llm_name, provider, total_cost: null, hasTotalData: false, release_date: null };
 
       try {
         const totalResponse = await fetch(`./results/${llm_name}/total.json`);
@@ -49,6 +51,11 @@ const LeaderboardTable = () => {
           const costResponse = await fetch(`./results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
           const costResult = await costResponse.json();
           row[`${benchmark}_cost`] = costResult.total_cost || null;
+
+          // Load release date
+          const releaseDateResponse = await fetch(`./results/release_dates.json`);
+          const releaseDateData = await releaseDateResponse.json();
+          row['release_date'] = releaseDateData[llm_name];
         } catch (error) {
           console.error(`Failed to load data for ${llm_name} - ${benchmark}:`, error);
           allBenchmarksComplete = false;
@@ -65,6 +72,7 @@ const LeaderboardTable = () => {
 
     setData(results);
     setBugCounts({ ...newBugCounts, total: totalBugs });
+    setIsLoading(false);
   };
 
   useEffect(() => {
@@ -104,6 +112,12 @@ const LeaderboardTable = () => {
     const bValue = b === 'N/A' || b === undefined ? 0 : b;
     
     return aValue - bValue;
+  };
+
+  const parseDateString = (dateString) => {
+    if (!dateString) return new Date(0); // Return earliest possible date if undefined
+    const [year, month, day] = dateString.split('-');
+    return new Date(parseInt(year), parseInt(month)-1, parseInt(day));
   };
 
   const columns = React.useMemo(() => {
@@ -165,6 +179,23 @@ const LeaderboardTable = () => {
         disableSortBy: false,
       },
       {
+        Header: 'Release Date',
+        accessor: 'release_date',
+        Cell: ({ value }) => (
+          <div className="release-date-cell">
+            <div className="release-date-content">
+              {value}
+            </div>
+          </div>
+        ),
+        sortType: (rowA, rowB, columnId) => {
+          const dateA = parseDateString(rowA.values[columnId]);
+          const dateB = parseDateString(rowB.values[columnId]);
+          return dateA.getTime() - dateB.getTime();
+        },
+        disableSortBy: false,
+      },
+      {
         Header: `Total (${bugCounts.total || 0} bugs)`,
         columns: [
           createColumn('AST Match @1', 'total_ast_match@1'),
@@ -210,6 +241,10 @@ const LeaderboardTable = () => {
     },
     useSortBy
   );
+
+  if (isLoading) {
+    return <div>Loading...</div>;
+  }
 
   return (
     <div className="leaderboard-container">
