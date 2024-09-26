@@ -1,7 +1,6 @@
 import json
 import os
 from collections import defaultdict
-from datetime import datetime
 
 # Mapping of providers to their respective country codes
 llm_country_map = {
@@ -172,7 +171,7 @@ def generate_latex_table(data):
     latex += "\\end{tabular}\n"
     latex += "}\n"
     latex += "}\n"
-    latex += "\\caption{Leaderboard of Frontier Models for Program Repair as of " + datetime.now().strftime("%B %d, %Y") + "}\n"
+    latex += "\\caption{Leaderboard of Frontier Models for Program Repair as of \\today}\n"
     latex += "\\label{tab:leaderboard}\n"
     latex += "\\end{table}\n"
 
