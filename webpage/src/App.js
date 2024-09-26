@@ -2,6 +2,7 @@
 import React, { useEffect } from 'react';
 import ReactGA from 'react-ga4';
 import LeaderboardTable from './components/LeaderboardTable';
+import Affiliation from './components/Affiliation';
 import './App.css';
 
 const MEASUREMENT_ID = 'G-DLB9F9YV03';
@@ -20,6 +21,7 @@ function App() {
           <h1>RepairBench: Leaderboard of Frontier Models for Program Repair</h1>
         </div>
       </header>
+      <Affiliation />
       <LeaderboardTable />
     </div>
   );

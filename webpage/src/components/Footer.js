@@ -13,6 +13,9 @@ const Footer = () => {
       <a href="https://github.com/ASSERT-KTH/repairbench" target="_blank" rel="noopener noreferrer">
         <FaGithub className="footer-icon" />
       </a>
+      <a href="https://github.com/ASSERT-KTH/elle-elle-aime" target="_blank" rel="noopener noreferrer">
+        <FaGithub className="footer-icon" />
+      </a>
     </div>
   );
 };
