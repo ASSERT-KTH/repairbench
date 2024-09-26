@@ -253,7 +253,7 @@ const LeaderboardTable = () => {
         </ul>
       </div>
 
-      {<CitationBox />}
+      {/*<CitationBox />*/}
       <Footer />
     </div>
   );
