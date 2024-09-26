@@ -178,23 +178,23 @@ const LeaderboardTable = () => {
         ),
         disableSortBy: false,
       },
-      {
-        Header: 'Release Date',
-        accessor: 'release_date',
-        Cell: ({ value }) => (
-          <div className="release-date-cell">
-            <div className="release-date-content">
-              {value}
-            </div>
-          </div>
-        ),
-        sortType: (rowA, rowB, columnId) => {
-          const dateA = parseDateString(rowA.values[columnId]);
-          const dateB = parseDateString(rowB.values[columnId]);
-          return dateA.getTime() - dateB.getTime();
-        },
-        disableSortBy: false,
-      },
+      // {
+      //   Header: 'Release Date',
+      //   accessor: 'release_date',
+      //   Cell: ({ value }) => (
+      //     <div className="release-date-cell">
+      //       <div className="release-date-content">
+      //         {value}
+      //       </div>
+      //     </div>
+      //   ),
+      //   sortType: (rowA, rowB, columnId) => {
+      //     const dateA = parseDateString(rowA.values[columnId]);
+      //     const dateB = parseDateString(rowB.values[columnId]);
+      //     return dateA.getTime() - dateB.getTime();
+      //   },
+      //   disableSortBy: false,
+      // },
       {
         Header: `Total (${bugCounts.total || 0} bugs)`,
         columns: [
