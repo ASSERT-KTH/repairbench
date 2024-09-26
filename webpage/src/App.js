@@ -17,12 +17,17 @@ function App() {
     <div className="App">
       <header className="App-header">
         <div className="App-header-content">
-          <img src="/logo.png" alt="logo" className="App-logo" /> {/* Reference the logo in public directory */}
+          <img src="/logo.png" alt="RepairBench logo" className="App-logo" /> {/* Improved alt text for accessibility */}
           <h1>RepairBench: Leaderboard of Frontier Models for Program Repair</h1>
         </div>
       </header>
-      <Affiliation />
-      <LeaderboardTable />
+      <main>
+        <Affiliation />
+        <LeaderboardTable />
+      </main>
+      <footer>
+        <p className="footer-text">&copy; {new Date().getFullYear()} KTH Royal Institute of Technology. All rights reserved.</p>
+      </footer>
     </div>
   );
 }
