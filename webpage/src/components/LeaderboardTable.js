@@ -243,13 +243,13 @@ const LeaderboardTable = () => {
       
       <div className="methodology-info">
         <ul>
-          <li>All bugs included in RepairBench are single-function bugs, meaning that the reference patch changes only one function.</li>
-          <li>The prompt is zero-shot, and includes 1) the buggy function, 2) the failing test cases, and 3) the test errors.</li>
-          <li>AST Match means that the generated patch has the same AST as the reference patch.</li>
-          <li>Plausible means that the generated patch passes all the tests in the test suite.</li>
-          <li>pass@1 values are computed over 10 non-deterministic generations with temperature of 1.0.</li>
-          <li>Leaderboard is sorted, by default, by the total plausible@1 metric.</li>
-          <li>For more details, please refer to the <a href="https://arxiv.org/">technical report on arXiv</a>.</li>
+          <li>All bugs included in RepairBench are single-function bugs, meaning that the reference patch changes only one function</li>
+          <li>The prompt is zero-shot, and includes 1) the buggy function, 2) the failing test cases, and 3) the test errors</li>
+          <li>AST Match means that the generated patch has the same AST as the reference patch</li>
+          <li>Plausible means that the generated patch passes all the tests in the test suite</li>
+          <li>pass@1 values are computed over 10 non-deterministic generations with temperature of 1.0</li>
+          <li>Leaderboard is sorted, by default, by the total plausible@1 metric</li>
+          <li>For more details, please refer to the <a href="https://arxiv.org/">technical report on arXiv</a></li>
         </ul>
       </div>
 
