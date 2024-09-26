@@ -14,23 +14,24 @@ const LeaderboardTable = () => {
 
   const loadData = async () => {
     const benchmarks = ['defects4j', 'gitbugjava'];
-    const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost']; // Added 'cost' metric
+    const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost'];
     let newBugCounts = {};
     let totalBugs = 0;
 
     const results = await Promise.all(modelList.map(async ([llm_name, strategy, provider]) => {
-      const row = { name: llm_name, provider, total_cost: 0 };
+      const row = { name: llm_name, provider, total_cost: null, hasTotalData: false };
 
       try {
         const totalResponse = await fetch(`./results/${llm_name}/total.json`);
         const totalResult = await totalResponse.json();
         row['total_ast_match@1'] = totalResult['ast_match@1'];
         row['total_plausible@1'] = totalResult['plausible@1'];
-        row['total_cost'] = totalResult['cost'] || 0; // Ensure cost is included
+        row.hasTotalData = true;
       } catch (error) {
         console.error(`Failed to load total.json for ${llm_name}:`, error);
       }
 
+      let allBenchmarksComplete = true;
       await Promise.all(benchmarks.map(async (benchmark) => {
         try {
           const statsResponse = await fetch(`./results/${llm_name}/${benchmark}/statistics_${benchmark}_instruct_${strategy}.json`);
@@ -47,12 +48,17 @@ const LeaderboardTable = () => {
 
           const costResponse = await fetch(`./results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
           const costResult = await costResponse.json();
-          row[`${benchmark}_cost`] = costResult.total_cost || 0; // Store individual benchmark cost
-          row.total_cost += costResult.total_cost || 0;
+          row[`${benchmark}_cost`] = costResult.total_cost || null;
         } catch (error) {
           console.error(`Failed to load data for ${llm_name} - ${benchmark}:`, error);
+          allBenchmarksComplete = false;
         }
       }));
+
+      // Only compute total cost if all benchmarks are complete and there's no total.json
+      if (allBenchmarksComplete && row.hasTotalData) {
+        row.total_cost = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_cost`] || 0), 0);
+      }
 
       return row;
     }));
@@ -90,6 +96,16 @@ const LeaderboardTable = () => {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
   };
 
+  const sortNumeric = (rowA, rowB, columnId) => {
+    const a = rowA.values[columnId];
+    const b = rowB.values[columnId];
+    
+    const aValue = a === 'N/A' || a === undefined ? 0 : a;
+    const bValue = b === 'N/A' || b === undefined ? 0 : b;
+    
+    return aValue - bValue;
+  };
+
   const columns = React.useMemo(() => {
     const bestScores = getBestScores(data);
 
@@ -103,7 +119,7 @@ const LeaderboardTable = () => {
           </span>
         </div>
       ),
-      sortType: 'basic',
+      sortType: sortNumeric,
       disableSortBy: false,
       // Removed fixed widths for flexibility
     });
@@ -119,7 +135,7 @@ const LeaderboardTable = () => {
           </span>
         </div>
       ),
-      sortType: 'basic',
+      sortType: sortNumeric,
       disableSortBy: false,
     });
 
@@ -138,13 +154,15 @@ const LeaderboardTable = () => {
       {
         Header: 'Model',
         accessor: 'name',
-        Cell: ({ value }) => (
+        Cell: ({ row }) => (
           <div className="model-name-cell">
-            <div className="model-name-content">{value}</div>
+            <div className="model-name-content">
+              {row.original.name}
+              {!row.original.hasTotalData && <sup>*</sup>}
+            </div>
           </div>
         ),
         disableSortBy: false,
-        // Removed width properties
       },
       {
         Header: `Total (${bugCounts.total || 0} bugs)`,
@@ -183,8 +201,12 @@ const LeaderboardTable = () => {
       columns, 
       data,
       initialState: {
-        sortBy: [{ id: 'total_plausible@1', desc: true }]
-      }
+        sortBy: [
+          { id: 'total_plausible@1', desc: true }
+        ]
+      },
+      disableSortRemove: true,
+      disableMultiSort: true
     },
     useSortBy
   );
@@ -252,8 +274,13 @@ const LeaderboardTable = () => {
           <li>pass@1 values are computed over 10 non-deterministic generations with temperature of 1.0</li>
           <li>Costs are calculated according to the pricing model of the model's organization. If the model is open-weights and not hosted by the model's organization, the pricing is calculated according to the provider chosen by the authors.</li>
           <li>Leaderboard is sorted, by default, by the total plausible@1 metric</li>
+          <li>* Only partial results available right now due to cost reasons.</li>
           <li>For more details, please refer to the <a href="https://arxiv.org/">technical report on arXiv</a></li>
         </ul>
+      </div>
+
+      <div className="footnote">
+        
       </div>
 
       {/*<CitationBox />*/}

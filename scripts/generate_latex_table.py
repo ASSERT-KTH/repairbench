@@ -30,19 +30,20 @@ def load_data(results_dir):
     metrics = ['ast_match@1', 'plausible@1']
 
     for llm_name, strategy, provider in model_list:
-        row = {'name': llm_name, 'provider': provider, 'total_cost': 0}
+        row = {'name': llm_name, 'provider': provider, 'total_cost': None}
 
         try:
             with open(f"{results_dir}/{llm_name}/total.json") as f:
                 total_result = json.load(f)
                 row['total_ast_match@1'] = total_result.get('ast_match@1', None)
                 row['total_plausible@1'] = total_result.get('plausible@1', None)
-                row['total_cost'] = total_result.get('cost', 0)
+                row['total_cost'] = total_result.get('cost', None)
         except FileNotFoundError:
             print(f"Warning: total.json not found for {llm_name}")
             row['total_ast_match@1'] = None
             row['total_plausible@1'] = None
 
+        all_benchmarks_complete = True
         for benchmark in benchmarks:
             try:
                 with open(f"{results_dir}/{llm_name}/{benchmark}/statistics_{benchmark}_instruct_{strategy}.json") as f:
@@ -52,13 +53,17 @@ def load_data(results_dir):
 
                 with open(f"{results_dir}/{llm_name}/{benchmark}/costs_{benchmark}_instruct_{strategy}.json") as f:
                     cost_result = json.load(f)
-                    row[f"{benchmark}_cost"] = cost_result.get('total_cost', 0)
-                    row['total_cost'] += cost_result.get('total_cost', 0)
+                    row[f"{benchmark}_cost"] = cost_result.get('total_cost', None)
             except FileNotFoundError:
                 print(f"Warning: Data not found for {llm_name} - {benchmark}")
                 for metric in metrics:
                     row[f"{benchmark}_{metric}"] = None
                 row[f"{benchmark}_cost"] = None
+                all_benchmarks_complete = False
+
+        # Only compute total cost if all benchmarks are complete and there's no total.json
+        if all_benchmarks_complete and row['total_cost'] is None:
+            row['total_cost'] = sum(row[f"{benchmark}_cost"] for benchmark in benchmarks if row[f"{benchmark}_cost"] is not None)
 
         data.append(row)
 
@@ -105,7 +110,13 @@ def generate_latex_table(data):
 
     partial_footnote_needed = False  # Flag to check if footnote is required
 
-    for row in sorted(data, key=lambda x: x['total_plausible@1'] if x['total_plausible@1'] is not None else -1, reverse=True):
+    # Sort data: rows with total results first, then by total_plausible@1 score
+    sorted_data = sorted(data, 
+                         key=lambda x: (x['total_plausible@1'] is not None, 
+                                        x['total_plausible@1'] if x['total_plausible@1'] is not None else -1),
+                         reverse=True)
+
+    for row in sorted_data:
         has_incomplete_results = any(row[f"{benchmark}_{metric}"] is None 
                                      for benchmark in ['defects4j', 'gitbugjava'] 
                                      for metric in ['ast_match@1', 'plausible@1'])
@@ -134,18 +145,18 @@ def generate_latex_table(data):
                 value = row[key]
                 if value is not None:
                     if value == best_scores[key]:
-                        cell = f"\\B {value*100:.1f}\\%{suffix if benchmark == 'total' else ''}"
+                        cell = f"\\B {value*100:.1f}\\%"
                     else:
-                        cell = f"{value*100:.1f}\\%{suffix if benchmark == 'total' else ''}"
+                        cell = f"{value*100:.1f}\\%"
                 else:
-                    cell = f"\\multicolumn{{1}}{{c}}{{---}}{suffix if benchmark == 'total' else ''}"
+                    cell = f"\\multicolumn{{1}}{{c}}{{---}}"
                 latex += f"{cell} & "
             
             cost = row[f'{benchmark}_cost']
             if cost is not None:
-                cell = f"\\${cost:.2f}{suffix if benchmark == 'total' else ''}"
+                cell = f"\\${cost:.2f}"
             else:
-                cell = f"\\multicolumn{{1}}{{c}}{{---}}{suffix if benchmark == 'total' else ''}"
+                cell = f"\\multicolumn{{1}}{{c}}{{---}}"
             
             latex += f"{cell} & "
 
