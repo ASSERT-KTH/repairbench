@@ -271,7 +271,7 @@ const LeaderboardTable = () => {
           <li>The prompt is zero-shot, and includes 1) the buggy function, 2) the failing test cases, and 3) the test errors</li>
           <li>AST Match means that the generated patch has the same AST as the reference patch</li>
           <li>Plausible means that the generated patch passes all the tests in the test suite</li>
-          <li>pass@1 values are computed over 10 non-deterministic generations with temperature of 1.0</li>
+          <li>pass@1 values are estimated from 10 non-deterministic generations with temperature of 1.0</li>
           <li>Costs are calculated according to the pricing model of the model's organization. If the model is open-weights and not hosted by the model's organization, the pricing is calculated according to the provider chosen by the authors.</li>
           <li>Leaderboard is sorted, by default, by the total plausible@1 metric</li>
           <li>* Only partial results available right now due to cost reasons.</li>
