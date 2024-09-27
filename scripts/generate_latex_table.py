@@ -83,7 +83,7 @@ def generate_latex_table(data):
     latex = "\\begin{table}[ht]\n"
     latex += "\\centering\n"
     latex += "\\makebox[\\textwidth][c]{%\n"
-    latex += "\\resizebox{1.25\\textwidth}{!}{\n"
+    latex += "\\resizebox{1.3\\textwidth}{!}{\n"
     latex += "\\large\n"
     latex += "\\begin{tabular}{@{}ll "
 
