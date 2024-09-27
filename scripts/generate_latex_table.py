@@ -77,8 +77,14 @@ def find_best_scores(data):
                     best_scores[key] = value
     return best_scores
 
+def load_citations():
+    citations_file = os.path.join(os.path.dirname(__file__), 'citations.json')
+    with open(citations_file, 'r') as f:
+        return json.load(f)
+
 def generate_latex_table(data):
     best_scores = find_best_scores(data)
+    citations = load_citations()
     
     latex = "\\begin{table}[ht]\n"
     latex += "\\centering\n"
@@ -126,8 +132,10 @@ def generate_latex_table(data):
         else:
             suffix = ""
 
-        # Get the model name
+        # Get the model name and add citation
         model_name = row['name']
+        citation_key = citations.get(model_name, '')
+        model_name_with_citation = f"{model_name}~\\cite{{{citation_key}}}" if citation_key else model_name
         
         # Get the country code for the provider
         country_code = llm_country_map.get(row['provider'], 'UN')  # 'UN' for unknown
@@ -136,7 +144,7 @@ def generate_latex_table(data):
         provider_with_flag = f"\\worldflag[width=0.3cm]{{{country_code}}} {row['provider']}"
         
         # Start building the LaTeX row with suffix appended
-        latex += f"{provider_with_flag}{suffix} & {model_name}{suffix} & "
+        latex += f"{provider_with_flag}{suffix} & {model_name_with_citation}{suffix} & "
         
         for benchmark in ['defects4j', 'gitbugjava', 'total']:
             for metric in ['plausible@1', 'ast_match@1']:
