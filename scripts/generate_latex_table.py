@@ -103,14 +103,15 @@ def generate_latex_table(data):
         "S[table-format=4.2, detect-weight=true]",
         "S[table-format=2.1, detect-weight=true]",
         "S[table-format=2.1, detect-weight=true]",
-        "S[table-format=4.2, detect-weight=true]"
+        "S[table-format=4.2, detect-weight=true]",
+        "c"  # Add a column for Ref.
     ]
     latex += ' '.join(s_columns) + "@{}}\n"
     
     latex += "\\toprule\n"
-    latex += "\\multirow{2}{*}{\\textbf{Organization}} & \\multirow{2}{*}{\\textbf{Model}} & \\multicolumn{3}{c}{Defects4J v2 (484 bugs)} & \\multicolumn{3}{c}{GitBug-Java (90 bugs)} & \\multicolumn{3}{c}{\\textbf{Total (574 bugs)}} \\\\\n"
+    latex += "\\multirow{2}{*}{\\textbf{Organization}} & \\multirow{2}{*}{\\textbf{Model}} & \\multicolumn{3}{c}{Defects4J v2 (484 bugs)} & \\multicolumn{3}{c}{GitBug-Java (90 bugs)} & \\multicolumn{3}{c}{\\textbf{Total (574 bugs)}} & \\multirow{2}{*}{Ref.} \\\\\n"
     latex += "\\cmidrule(lr){3-5} \\cmidrule(lr){6-8} \\cmidrule(l){9-11}\n"
-    latex += " & & {Plausible@1} & {AST Match@1} & {Cost (\\$)} & {Plausible@1} & {AST Match@1} & {Cost (\\$)} & {\\textbf{Plausible@1}\\textsuperscript{1}} & {\\textbf{AST Match@1}} & {\\textbf{Cost (\\$)}} \\\\\n"
+    latex += " & & {Plausible@1} & {AST Match@1} & {Cost (\\$)} & {Plausible@1} & {AST Match@1} & {Cost (\\$)} & {\\textbf{Plausible@1}\\textsuperscript{1}} & {\\textbf{AST Match@1}} & {\\textbf{Cost (\\$)}} & \\\\\n"
     latex += "\\midrule\n"
 
     partial_footnote_needed = False  # Flag to check if footnote is required
@@ -132,10 +133,9 @@ def generate_latex_table(data):
         else:
             suffix = ""
 
-        # Get the model name and add citation
+        # Get the model name and citation
         model_name = row['name']
         citation_key = citations.get(model_name, '')
-        model_name_with_citation = f"{model_name}~\\cite{{{citation_key}}}" if citation_key else model_name
         
         # Get the country code for the provider
         country_code = llm_country_map.get(row['provider'], 'UN')  # 'UN' for unknown
@@ -144,7 +144,7 @@ def generate_latex_table(data):
         provider_with_flag = f"\\worldflag[width=0.3cm]{{{country_code}}} {row['provider']}"
         
         # Start building the LaTeX row with suffix appended
-        latex += f"{provider_with_flag}{suffix} & {model_name_with_citation}{suffix} & "
+        latex += f"{provider_with_flag}{suffix} & {model_name}{suffix} & "
         
         for benchmark in ['defects4j', 'gitbugjava', 'total']:
             for metric in ['plausible@1', 'ast_match@1']:
@@ -167,14 +167,16 @@ def generate_latex_table(data):
             
             latex += f"{cell} & "
 
-        latex = latex.rstrip('& ') + '\\\\\n'
+        # Add the citation to the end of the row
+        latex += f"\\citep{{{citation_key}}}" if citation_key else "---"
+        latex += " \\\\\n"
 
     latex += "\\bottomrule\n"
     # Add the footnote once after all rows
     latex += "\\addlinespace\n"
-    latex += f"\\multicolumn{{11}}{{l}}{{\\textsuperscript{{1}}Models are sorted by the total Plausible@1 score.}} \\\\\n"
+    latex += f"\\multicolumn{{12}}{{l}}{{\\textsuperscript{{1}}Models are sorted by the total Plausible@1 score.}} \\\\\n"
     if partial_footnote_needed:
-        latex += f"\\multicolumn{{11}}{{l}}{{\\textsuperscript{{2}}Only partial results available right now due to cost reasons.}} \\\\\n"
+        latex += f"\\multicolumn{{12}}{{l}}{{\\textsuperscript{{2}}Only partial results available right now due to cost reasons.}} \\\\\n"
     latex += "\\addlinespace\n"
     latex += "\\end{tabular}\n"
     latex += "}\n"
