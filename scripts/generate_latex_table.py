@@ -104,7 +104,7 @@ def generate_latex_table(data):
     latex += "\\toprule\n"
     latex += "\\multirow{2}{*}{\\textbf{Organization}} & \\multirow{2}{*}{\\textbf{Model}} & \\multicolumn{3}{c}{Defects4J v2 (484 bugs)} & \\multicolumn{3}{c}{GitBug-Java (90 bugs)} & \\multicolumn{3}{c}{\\textbf{Total (574 bugs)}} \\\\\n"
     latex += "\\cmidrule(lr){3-5} \\cmidrule(lr){6-8} \\cmidrule(l){9-11}\n"
-    latex += " & & {AST Match@1} & {Plausible@1} & {Cost (\\$)} & {AST Match@1} & {Plausible@1} & {Cost (\\$)} & {\\textbf{AST Match@1}} & {\\textbf{Plausible@1}\\textsuperscript{1}} & {\\textbf{Cost (\\$)}} \\\\\n"
+    latex += " & & {Plausible@1} & {AST Match@1} & {Cost (\\$)} & {Plausible@1} & {AST Match@1} & {Cost (\\$)} & {\\textbf{Plausible@1}\\textsuperscript{1}} & {\\textbf{AST Match@1}} & {\\textbf{Cost (\\$)}} \\\\\n"
     latex += "\\midrule\n"
 
     partial_footnote_needed = False  # Flag to check if footnote is required
@@ -139,7 +139,7 @@ def generate_latex_table(data):
         latex += f"{provider_with_flag}{suffix} & {model_name}{suffix} & "
         
         for benchmark in ['defects4j', 'gitbugjava', 'total']:
-            for metric in ['ast_match@1', 'plausible@1']:
+            for metric in ['plausible@1', 'ast_match@1']:
                 key = f"{benchmark}_{metric}"
                 value = row[key]
                 if value is not None:

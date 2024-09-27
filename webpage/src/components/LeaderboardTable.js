@@ -198,8 +198,8 @@ const LeaderboardTable = () => {
       {
         Header: `Total (${bugCounts.total || 0} bugs)`,
         columns: [
-          createColumn('AST Match @1', 'total_ast_match@1'),
           createColumn('Plausible @1', 'total_plausible@1'),
+          createColumn('AST Match @1', 'total_ast_match@1'),
           createCostColumn('Cost', 'total_cost'), // Cost column without bold
         ],
       }
@@ -209,16 +209,16 @@ const LeaderboardTable = () => {
       {
         Header: `Defects4J v2 (${bugCounts.defects4j || 0} bugs)`,
         columns: [
-          createColumn('AST Match @1', 'defects4j_ast_match@1'),
           createColumn('Plausible @1', 'defects4j_plausible@1'),
+          createColumn('AST Match @1', 'defects4j_ast_match@1'),
           createCostColumn('Cost', 'defects4j_cost'), // Cost column without bold
         ],
       },
       {
         Header: `GitBug-Java (${bugCounts.gitbugjava || 0} bugs)`,
         columns: [
-          createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
           createColumn('Plausible @1', 'gitbugjava_plausible@1'),
+          createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
           createCostColumn('Cost', 'gitbugjava_cost'), // Cost column without bol
         ],
       }
