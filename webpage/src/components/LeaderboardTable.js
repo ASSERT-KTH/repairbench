@@ -310,7 +310,8 @@ const LeaderboardTable = () => {
           <li>Costs are calculated according to the pricing model of the model's organization. If the model is open-weights and not hosted by the model's organization, the pricing is calculated according to the provider chosen by the authors.</li>
           <li>Leaderboard is sorted, by default, by the total plausible@1 metric</li>
           <li>* Only partial results available right now due to cost reasons.</li>
-          <li>For more details, please refer to the <a href="https://arxiv.org/">technical report on arXiv</a></li>
+          <li>We publish the <a href="https://github.com/ASSERT-KTH/elle-elle-aime" target="_blank" rel="noopener noreferrer">code</a> and <a href="https://github.com/ASSERT-KTH/repairbench" target="_blank" rel="noopener noreferrer">data</a> to enable reproducibility.</li>
+          <li>For more details, please refer to the <a href="https://arxiv.org/" target="_blank" rel="noopener noreferrer">technical report on arXiv</a></li>
         </ul>
       </div>
 
