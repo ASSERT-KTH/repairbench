@@ -7,7 +7,7 @@ import './Footer.css'; // Add some basic CSS styling
 const Footer = () => {
   return (
     <div className="footer">
-      <a href="https://arxiv.org" target="_blank" rel="noopener noreferrer">
+      <a href="https://arxiv.org/pdf/2409.18952" target="_blank" rel="noopener noreferrer">
         <SiArxiv className="footer-icon" />
       </a>
       <a href="https://github.com/ASSERT-KTH/repairbench" target="_blank" rel="noopener noreferrer">

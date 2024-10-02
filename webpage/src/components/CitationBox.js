@@ -5,12 +5,12 @@ import { prism } from 'react-syntax-highlighter/dist/esm/styles/prism';
 const CitationBox = () => {
   const [isCopied, setIsCopied] = useState(false);
 
-  const citationText = `@techreport{elle-elle-aime,
-  title = {RepairLLaMA: Efficient Representations and Fine-Tuned Adapters for Program Repair},
-  year = {2023},
-  author = {André Silva and Sen Fang and Martin Monperrus},
-  url = {http://arxiv.org/pdf/2312.15698},
-  number = {2312.15698},
+  const citationText = `@techreport{repairbench,
+  title={RepairBench: Leaderboard of Frontier Models for Program Repair}, 
+  author={André Silva and Martin Monperrus},
+  year={2024},
+  url={https://arxiv.org/abs/2409.18952}, 
+  number = {2409.18952},
   institution = {arXiv},
 }`;
 
