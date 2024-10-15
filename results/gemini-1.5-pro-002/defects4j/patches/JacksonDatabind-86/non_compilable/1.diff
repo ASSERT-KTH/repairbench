@@ -1,0 +1,488 @@
+diff --git a/tmp/39e2be45-7d0c-4e2a-b6d8-c8dfdb2dd4ec_buggy.java b/tmp/35b4abee-3bc8-499d-9e0b-9dfe41875bed_fixed.java
+index e69de29..3fbbdaf 100644
+--- a/tmp/39e2be45-7d0c-4e2a-b6d8-c8dfdb2dd4ec_buggy.java
++++ b/tmp/35b4abee-3bc8-499d-9e0b-9dfe41875bed_fixed.java
+@@ -0,0 +1,482 @@
++package com.fasterxml.jackson.databind.type;
++
++import java.lang.reflect.TypeVariable;
++import java.util.*;
++
++import com.fasterxml.jackson.databind.JavaType;
++import com.fasterxml.jackson.databind.util.LRUMap;
++
++/**
++ * Implementation of {@link TypeFactory} which is backed by a simple cache
++ * to prevent construction of multiple instances for same types.
++ */
++public abstract class TypeFactory
++{
++    protected final static TypeBindings EMPTY_BINDINGS = TypeBindings.emptyBindings();
++
++    protected final static JavaType[] NO_TYPES = new JavaType[0];
++
++    /*
++    /**********************************************************
++    /* Caching
++    /**********************************************************
++     */
++
++    /**
++     * We will use a single main-level instance for non-primitive
++     * types, and per-primitive instances for primitives.
++     */
++    protected final LRUMap<Object, JavaType> _typeCache;
++
++    /*
++    /**********************************************************
++    /* Construction, configuration
++    /**********************************************************
++     */
++
++    protected TypeFactory() {
++        this(null);
++    }
++
++    protected TypeFactory(LRUMap<Object,JavaType> typeCache) {
++       _typeCache = (typeCache == null) ? new LRUMap<>(16, 100) : typeCache;
++    }
++    
++    /*
++    /**********************************************************
++    /* Methods for sub-classes
++    /**********************************************************
++     */
++
++    protected abstract JavaType _fromClass(Class<?> clz, TypeBindings context);
++
++    protected abstract JavaType _fromParamType(Class<?> clz, TypeBindings context);
++    
++    protected abstract JavaType _fromArrayType(Class<?> clz, TypeBindings context,
++            JavaType elementType, Object valueHandler);
++
++    protected abstract JavaType _fromCollectionType(Class<?> clz, TypeBindings context,
++            JavaType elementType, Object valueHandler);
++
++    protected abstract JavaType _fromMapType(Class<?> clz, TypeBindings context,
++            JavaType keyType, JavaType valueType, Object valueHandler);
++
++    protected abstract JavaType _fromWellKnownClass(Class<?> clz, TypeBindings context,
++            JavaType[] subtypes, int containedTypeCount);
++
++    protected abstract JavaType _fromWellKnownInterface(Class<?> clz, TypeBindings context,
++            JavaType[] subtypes, int containedTypeCount);
++
++    public abstract TypeFactory withModifier(TypeModifier mod);
++
++    /*
++    /**********************************************************
++    /* Public factory methods
++    /**********************************************************
++     */
++
++    public JavaType constructType(Type type) {
++        return _constructType(type, EMPTY_BINDINGS);
++    }
++    
++    public JavaType constructType(Type type, TypeBindings bindings) {
++        return _constructType(type, bindings);
++    }
++
++    public JavaType constructType(Class<?> clz) {
++        return _constructType(clz, EMPTY_BINDINGS);
++    }
++
++    public JavaType constructType(Class<?> clz, TypeBindings bindings) {
++        return _constructType(clz, bindings);
++    }
++
++    public JavaType constructSpecializedType(JavaType baseType, Class<?> subclass)
++    {
++        // simple optimization to avoid costly introspection if type-erased type does NOT differ
++        final Class<?> rawBase = baseType.getRawClass();
++        if (rawBase == subclass) {
++            return baseType;
++        }
++
++        // 03-Oct-2016, tatu: needs to be done carefully to avoid infinite loops
++        //   and hence some sanity checks
++        if (!rawBase.isAssignableFrom(subclass)) {
++            throw new IllegalArgumentException(String.format("Class %s not subtype of %s",
++                    subclass.getName(), rawBase.getName()));
++        }
++
++        JavaType newType;
++
++        TypeBindings baseBindings = baseType.getBindings();
++
++        if (baseType.isContainerType() || baseType.isReferenceType()) {
++            // 19-May-2016, tatu: Sub-classing of `ArrayType` is mostly done by core
++            //    types anyway, so this should not be triggered commonly. But when it
++            //    is, need to avoid recursive resolution.
++            if (baseType.isArrayType()) {
++                newType = _fromArrayType(subclass, baseBindings, baseType.getContentType(), null);
++            } else if (baseType.isMapLikeType()) {
++                JavaType keyType = baseType.getKeyType();
++                JavaType contentType = baseType.getContentType();
++                newType = _fromMapType(subclass, baseBindings, keyType, contentType, baseType.getValueHandler());
++            } else if (baseType.isCollectionLikeType()) {
++                JavaType contentType = baseType.getContentType();
++                newType = _fromCollectionType(subclass, baseBindings, contentType, baseType.getValueHandler());
++            } else { // ReferenceType
++                newType = _fromWellKnownClass(subclass, baseBindings,
++                        baseType.getBindings().getTypeParameters(), 0);
++                if (newType == null) {
++                    newType = _fromClass(subclass, baseBindings);
++                }
++                newType = baseType.refine(subclass, newType.getBindings(), newType.getContentType(), newType.getValueHandler());
++            }
++        } else {
++            if (baseType.isInterface()) {
++                newType = _fromWellKnownInterface(subclass, baseBindings,
++                        baseBindings.getTypeParameters(), 0);
++            } else { // class; probably some known type
++                newType = _fromWellKnownClass(subclass, baseBindings,
++                        baseBindings.getTypeParameters(), 0);
++            }
++            if (newType == null) {
++                // or if not known, standard class
++                newType = _fromClass(subclass, baseBindings);
++            }
++        }
++
++        return newType;
++    }    
++
++    protected JavaType _constructType(Type type, TypeBindings context)
++    {
++        JavaType resultType;
++
++        final Object key = new TypeKey(type, context);
++
++        synchronized (_typeCache) {
++            resultType = _typeCache.get(key);
++        }
++        if (resultType != null) {
++            return resultType;
++        }
++
++        if (type instanceof Class<?>) {
++            Class<?> cls = (Class<?>) type;
++            /* 19-Feb-2015, tatu: For final classes we should not try to
++             *   refine; benefits are minimal at best and problems insidious.
++             *   Related to [databind#709]
++             */
++            if (cls.isArray()) {
++                resultType = _fromArrayType(cls, context, null, null);
++            } else {
++                if (cls.isEnum()) {
++                    resultType = _fromParamType(cls, context);
++                } else if (cls == String.class) {
++                    // [databind#686]: Make String a special case to prevent failures with some
++                    // JDK versions (specifically, Android):
++                    resultType = new SimpleType(cls);
++                } else {
++                    if (Collection.class.isAssignableFrom(cls)) {
++                        resultType = _fromCollectionType(cls, context, null, null);
++                    } else if (Map.class.isAssignableFrom(cls)) {
++                        resultType = _fromMapType(cls, context, null, null, null);
++                    } else {
++                        resultType = _fromClass(cls, context);
++                    }
++                }
++            }
++        } else if (type instanceof ParameterizedType) {
++            resultType = _fromParamType(type, context);
++        } else if (type instanceof GenericArrayType) {
++            resultType = _fromArrayType(type, context);
++        } else if (type instanceof TypeVariable<?>) {
++            resultType = _fromVariable(type, context);
++        } else if (type instanceof WildcardType) {
++            resultType = _fromWildcard(type, context);
++        } else {
++            // sanity check
++            throw new IllegalArgumentException("Unrecognized Type: "+(type == null ? "[null]" : type.toString()));
++        }
++
++        // 17-Dec-2014, tatu: Should we try to protect against recursive resolution?
++        //   Not sure if this should ever occur...
++
++        synchronized (_typeCache) {
++            _typeCache.put(key, resultType);
++        }
++        return resultType;
++    }
++    
++    protected JavaType _fromParamType(Type type, TypeBindings context)
++    {
++        /* First: ParameterizedType is only returned for members (methods,
++         * constructors; not fields), so we can assume we have
++         * a class/interface to start with.
++         */
++        if (!(type instanceof ParameterizedType)) {
++            throw new IllegalArgumentException("Type "+type.getClass().getName()
++                    +" not a ParameterizedType");
++        }
++        ParameterizedType pt = (ParameterizedType) type;
++        // And raw type should be a Class<?>:
++        Class<?> rawType = (Class<?>) pt.getRawType();
++        Type[] args = pt.getActualTypeArguments();
++        int argCount = (args == null) ? 0 : args.length;
++        JavaType[] pt = (argCount == 0) ? NO_TYPES : new JavaType[argCount];
++        for (int i = 0; i < argCount; ++i) {
++            pt[i] = _constructType(args[i], context);
++        }
++        // 16-Jun-2016, tatu: For our caching purposes, must consider
++        //   bindings as part of key, due to aliasing...
++        TypeBindings newBindings = context.childInstance();
++
++        // !!! TBI: should this actually be done every time? or just if non-empty?
++        newBindings = newBindings.withGenerics(rawType, pt);
++        
++        if (Collection.class.isAssignableFrom(rawType)) {
++            return _fromCollectionType(rawType, newBindings, pt[0], null);
++        }
++        if (Map.class.isAssignableFrom(rawType)) {
++            return _fromMapType(rawType, newBindings, pt[0], pt[1], null);
++        }
++        // Bindings are important since we may have type variable with recursive definition
++        return _fromWellKnownClass(rawType, newBindings, pt, 0);
++    }
++    
++    protected JavaType _fromArrayType(Type type, TypeBindings context)
++    {
++        if (!(type instanceof GenericArrayType)) {
++            throw new IllegalArgumentException("Type "+type.getClass().getName()
++                    +" not a GenericArrayType");
++        }
++        JavaType compType = _constructType(((GenericArrayType) type).getGenericComponentType(),
++                context);
++        return _fromArrayType(compType.getRawClass(), context, compType, null);
++    }
++
++    protected JavaType _fromVariable(Type type, TypeBindings context)
++    {
++        if (!(type instanceof TypeVariable<?>)) {
++            throw new IllegalArgumentException("Type "+type.getClass().getName()
++                    +" not a TypeVariable");
++        }
++        TypeVariable<?> var = (TypeVariable<?>) type;
++        // 22-Apr-2016, tatu: For now prevent infinite loops by not trying
++        // to resolve recursively -- may need to change in future but that's
++        // least likely place for failure, and unlike with recursive types,
++        // it is fairly safe to avoid infinite recursion this way
++        String name = var.getName();
++        JavaType typeInfo = context.findBoundType(name);
++        if (typeInfo != null) {
++            return typeInfo;
++        }
++        // and if nothing bound, resolve as "untyped"
++        return _constructType(Object.class, context);
++    }
++
++    protected JavaType _fromWildcard(Type type, TypeBindings context)
++    {
++        if (!(type instanceof WildcardType)) {
++            throw new IllegalArgumentException("Type "+type.getClass().getName()
++                    +" not a WildcardType");
++        }
++        WildcardType wildcard = (WildcardType) type;
++        // Ideally should resolve bounds, but for now, just use Object.class
++        return _constructType(Object.class, context);
++    }
++    
++    /*
++    /**********************************************************
++    /* Actual construction of "raw" variants
++    /**********************************************************
++     */
++
++    /**
++     * Method for constructing an {@link ArrayType}.
++     *<p>
++     * NOTE: even if element type is known to be an array type, will construct
++     * a new array type; meaning that inner type will NOT be shared between
++     * parent and child instances. This may become problematic if there are
++     * long chains of array types, as construction may become expensive;
++     * this is mostly left as is since problems are rare, and fixing adds
++     * complexity.
++     */
++    public ArrayType constructArrayType(Class<?> elementType) {
++        return ArrayType.construct(_constructType(elementType, null), null);
++    }
++    
++    public ArrayType constructArrayType(JavaType elementType) {
++        return ArrayType.construct(elementType, null);
++    }    
++
++    public CollectionType constructCollectionType(Class<? extends Collection> collectionClass,
++            Class<?> elementClass) {
++        return constructCollectionType(collectionClass,
++                _constructType(elementClass, EMPTY_BINDINGS));
++    }
++
++    public CollectionType constructCollectionType(Class<? extends Collection> collectionClass,
++            JavaType elementType) {
++        TypeBindings bindings = TypeBindings.create(collectionClass, elementType);
++        // and may need to further refine based on raw class of element type
++        CollectionType result = (CollectionType) _fromCollectionType(collectionClass, bindings,
++                elementType, null);
++        // Note: not caching yet; may want to, but may miss some subtleties
++        return result;
++    }
++
++    public CollectionLikeType constructCollectionLikeType(Class<?> collectionClass, Class<?> elementClass) {
++        return constructCollectionLikeType(collectionClass,
++                _constructType(elementClass, EMPTY_BINDINGS));
++    }
++    
++    public CollectionLikeType constructCollectionLikeType(Class<?> collectionClass, JavaType elementType) {
++        JavaType type = _fromCollectionType(collectionClass, TypeBindings.createIfNeeded(collectionClass, elementType),
++                elementType, null);
++        if (type instanceof CollectionLikeType) {
++            return (CollectionLikeType) type;
++        }
++        return CollectionLikeType.upgradeFrom(type, elementType);
++    }
++
++    public MapType constructMapType(Class<? extends Map> mapClass,
++            Class<?> keyClass, Class<?> valueClass) {
++        JavaType kt = _constructType(keyClass, EMPTY_BINDINGS);
++        JavaType vt = _constructType(valueClass, EMPTY_BINDINGS);
++        return constructMapType(mapClass, kt, vt);
++    }
++
++    public MapType constructMapType(Class<? extends Map> mapClass,
++            JavaType keyType, JavaType valueType) {
++        TypeBindings bindings = TypeBindings.create(mapClass, new JavaType[] { keyType, valueType });
++        return (MapType) _fromMapType(mapClass, bindings, keyType, valueType, null);
++    }
++
++    public MapLikeType constructMapLikeType(Class<?> mapClass,
++            Class<?> keyClass, Class<?> valueClass) {
++        JavaType kt = _constructType(keyClass, EMPTY_BINDINGS);
++        JavaType vt = _constructType(valueClass, EMPTY_BINDINGS);
++        return constructMapLikeType(mapClass, kt, vt);
++    }
++
++    public MapLikeType constructMapLikeType(Class<?> mapClass,
++            JavaType keyType, JavaType valueType) {
++        JavaType type = _fromMapType(mapClass, TypeBindings.createIfNeeded(mapClass, new JavaType[] { keyType, valueType }),
++                keyType, valueType, null);
++        if (type instanceof MapLikeType) {
++            return (MapLikeType) type;
++        }
++        return MapLikeType.upgradeFrom(type, keyType, valueType);
++    }
++    
++    public JavaType constructSimpleType(Class<?> rawType, JavaType[] parameterTypes) {
++        return _constructSimpleType(rawType, EMPTY_BINDINGS, parameterTypes, NO_TYPES);
++    }
++
++    public JavaType constructSimpleType(Class<?> rawType, TypeBindings parameterTypes,
++            JavaType[] typeParameters, JavaType[] typeArguments) {
++        return _constructSimpleType(rawType, parameterTypes, typeParameters, typeArguments);
++    }
++
++    protected JavaType _constructSimpleType(Class<?> rawType, TypeBindings context,
++            JavaType[] typeParameters, JavaType[] typeArguments)
++    {
++        JavaType result;
++        TypeVariable<?>[] vars = rawType.getTypeParameters();
++        int varLen = (vars == null) ? 0 : vars.length;
++        if (varLen > 0) {
++            JavaType[] pt;
++            int len = typeParameters.length;
++            if (len == varLen) {
++                pt = typeParameters;
++            } else {
++                // if wrong number, use other method... but should we warn?
++                pt = new JavaType[varLen];
++                for (int i = 0; i < varLen; ++i) {
++                    pt[i] = (i < len) ? typeParameters[i] : _unknownType();
++                }
++            }
++            // !!! TBI: should this actually be done every time? or just if non-empty?
++            context = context.withGenerics(rawType, pt);
++        }
++
++        // [databind#804]: also consider type arguments passed; these are important for
++        // non-generic static types, where parameterization needs to come from actual
++        // usage, not static declaration.
++        if (typeArguments.length > 0) {
++            context = context.withTypeParameters(rawType, typeArguments);
++        }
++
++        if (rawType == String.class) {
++            return new SimpleType(rawType);
++        }
++
++        // [databind#192]: primitive types are slightly special, need to avoid processing
++        // via factory methods that may do incorrect caching...
++
++        if (rawType.isPrimitive()) {
++            result = new SimpleType(rawType);
++        } else if (rawType == Object.class) {
++            result = new SimpleType(rawType);
++        } else if (rawType == Comparable.class) {
++            result = new SimpleType(rawType);
++        } else { // anything else...
++            result = _fromClass(rawType, context);
++        }
++        return result;
++    }
++
++    /**
++     * Method that will try to construct a {@link JavaType} for given
++     * abstract class, using suggested implementation class. If construction
++     * fails, will return the {@link JavaType} for the abstract class.
++     */
++    @SuppressWarnings("unchecked")
++    public JavaType constructFromCanonical(String canonical) throws IllegalArgumentException
++    {
++        SimpleType simple = SimpleType.construct(canonical);
++        if (simple != null) {
++            return simple;
++        }
++        try {
++            Class<?> cls = Class.forName(canonical);
++            return constructType(cls);
++        } catch (ClassNotFoundException e) {
++            throw new IllegalArgumentException(String.format("Can not construct type from canonical name '%s'", canonical), e);
++        }
++    }
++
++    /*
++    /**********************************************************
++    /* Helper methods
++    /**********************************************************
++     */
++
++    protected JavaType _unknownType() {
++        return _constructType(Object.class, EMPTY_BINDINGS);
++    }
++    
++    protected static final class TypeKey
++    {
++        private final Type _type;
++        private final TypeBindings _bindings;
++
++        public TypeKey(Type t, TypeBindings b) {
++            _type = t;
++            _bindings = b;
++        }
++
++        @Override public int hashCode() {
++            return _type.hashCode() + _bindings.hashCode();
++        }
++        
++        @Override public boolean equals(Object o) {
++            if (o == this) return true;
++            if (o == null) return false;
++            if (o.getClass() != getClass()) return false;
++            TypeKey other = (TypeKey) o;
++            return (_type == other._type) && _bindings.equals(other._bindings);
++        }
++    }    
++}
+\ No newline at end of file

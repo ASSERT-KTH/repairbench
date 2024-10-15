@@ -1,0 +1,264 @@
+diff --git a/tmp/190b99da-46b4-4c5c-86a5-babd9758f214_buggy.java b/tmp/44eef42d-a2a8-4620-861a-f8914638fe9b_fixed.java
+index e4fca3c..2258d29 100644
+--- a/tmp/190b99da-46b4-4c5c-86a5-babd9758f214_buggy.java
++++ b/tmp/44eef42d-a2a8-4620-861a-f8914638fe9b_fixed.java
+@@ -1,239 +1,231 @@
+   /**
+    * Try turning IF nodes into smaller HOOKs
+    *
+    * Returns the replacement for n or the original if no replacement was
+    * necessary.
+    */
+   private Node tryMinimizeIf(Node n) {
+ 
+     Node parent = n.getParent();
+ 
+     Node cond = n.getFirstChild();
+ 
+     /* If the condition is a literal, we'll let other
+      * optimizations try to remove useless code.
+      */
+     if (NodeUtil.isLiteralValue(cond, true)) {
+       return n;
+     }
+ 
+     Node thenBranch = cond.getNext();
+     Node elseBranch = thenBranch.getNext();
+ 
+     if (elseBranch == null) {
+       if (isFoldableExpressBlock(thenBranch)) {
+         Node expr = getBlockExpression(thenBranch);
+         if (!late && isPropertyAssignmentInExpression(expr)) {
+           // Keep opportunities for CollapseProperties such as
+           // a.longIdentifier || a.longIdentifier = ... -> var a = ...;
+           // until CollapseProperties has been run.
+           return n;
+         }
+ 
+         if (cond.isNot()) {
+           // if(!x)bar(); -> x||bar();
+           if (isLowerPrecedenceInExpression(cond, OR_PRECEDENCE) &&
+               isLowerPrecedenceInExpression(expr.getFirstChild(),
+                   OR_PRECEDENCE)) {
+             // It's not okay to add two sets of parentheses.
+             return n;
+           }
+ 
+           Node or = IR.or(
+               cond.removeFirstChild(),
+               expr.removeFirstChild()).srcref(n);
+           Node newExpr = NodeUtil.newExpr(or);
+           parent.replaceChild(n, newExpr);
+           reportCodeChange();
+ 
+           return newExpr;
+         }
+ 
+         // if(x)foo(); -> x&&foo();
+         if (isLowerPrecedenceInExpression(cond, AND_PRECEDENCE) &&
+             isLowerPrecedenceInExpression(expr.getFirstChild(),
+                 AND_PRECEDENCE)) {
+           // One additional set of parentheses is worth the change even if
+           // there is no immediate code size win. However, two extra pair of
+           // {}, we would have to think twice. (unless we know for sure the
+           // we can further optimize its parent.
+           return n;
+         }
+ 
+         n.removeChild(cond);
+         Node and = IR.and(cond, expr.removeFirstChild()).srcref(n);
+         Node newExpr = NodeUtil.newExpr(and);
+         parent.replaceChild(n, newExpr);
+         reportCodeChange();
+ 
+         return newExpr;
+       } else {
+ 
+         // Try to combine two IF-ELSE
+         if (NodeUtil.isStatementBlock(thenBranch) &&
+             thenBranch.hasOneChild()) {
+           Node innerIf = thenBranch.getFirstChild();
+ 
+           if (innerIf.isIf()) {
+             Node innerCond = innerIf.getFirstChild();
+             Node innerThenBranch = innerCond.getNext();
+             Node innerElseBranch = innerThenBranch.getNext();
+ 
+             if (innerElseBranch == null &&
+                  !(isLowerPrecedenceInExpression(cond, AND_PRECEDENCE) &&
+                    isLowerPrecedenceInExpression(innerCond, AND_PRECEDENCE))) {
+               n.detachChildren();
+               n.addChildToBack(
+                   IR.and(
+                       cond,
+                       innerCond.detachFromParent())
+                       .srcref(cond));
+               n.addChildrenToBack(innerThenBranch.detachFromParent());
+               reportCodeChange();
+               // Not worth trying to fold the current IF-ELSE into && because
+               // the inner IF-ELSE wasn't able to be folded into && anyways.
+               return n;
+             }
+           }
+         }
+       }
+ 
+       return n;
+     }
+ 
+     /* TODO(dcc) This modifies the siblings of n, which is undesirable for a
+      * peephole optimization. This should probably get moved to another pass.
+      */
+     tryRemoveRepeatedStatements(n);
+ 
+     // if(!x)foo();else bar(); -> if(x)bar();else foo();
+     // An additional set of curly braces isn't worth it.
+     if (cond.isNot() && !consumesDanglingElse(elseBranch)) {
+       n.replaceChild(cond, cond.removeFirstChild());
+       n.removeChild(thenBranch);
+       n.addChildToBack(thenBranch);
+       reportCodeChange();
+       return n;
+     }
+ 
+     // if(x)return 1;else return 2; -> return x?1:2;
+     if (isReturnExpressBlock(thenBranch) && isReturnExpressBlock(elseBranch)) {
+       Node thenExpr = getBlockReturnExpression(thenBranch);
+       Node elseExpr = getBlockReturnExpression(elseBranch);
+       n.removeChild(cond);
+       thenExpr.detachFromParent();
+       elseExpr.detachFromParent();
+ 
+       // note - we ignore any cases with "return;", technically this
+       // can be converted to "return undefined;" or some variant, but
+       // that does not help code size.
+       Node returnNode = IR.returnNode(
+                             IR.hook(cond, thenExpr, elseExpr)
+                                 .srcref(n));
+       parent.replaceChild(n, returnNode);
+       reportCodeChange();
+       return returnNode;
+     }
+ 
+     boolean thenBranchIsExpressionBlock = isFoldableExpressBlock(thenBranch);
+     boolean elseBranchIsExpressionBlock = isFoldableExpressBlock(elseBranch);
+ 
+     if (thenBranchIsExpressionBlock && elseBranchIsExpressionBlock) {
+-      Node thenOp = getBlockExpression(thenBranch).getFirstChild();
+-      Node elseOp = getBlockExpression(elseBranch).getFirstChild();
+-      if (thenOp.getType() == elseOp.getType()) {
+-        // if(x)a=1;else a=2; -> a=x?1:2;
+-        if (NodeUtil.isAssignmentOp(thenOp)) {
+-          Node lhs = thenOp.getFirstChild();
+-          if (areNodesEqualForInlining(lhs, elseOp.getFirstChild()) &&
+-              // if LHS has side effects, don't proceed [since the optimization
+-              // evaluates LHS before cond]
+-              // NOTE - there are some circumstances where we can
+-              // proceed even if there are side effects...
+-              !mayEffectMutableState(lhs)) {
++      Node thenExpr = getBlockExpression(thenBranch).getFirstChild();
++      Node elseExpr = getBlockExpression(elseBranch).getFirstChild();
+ 
++      if (NodeUtil.isAssignmentOp(thenExpr) && NodeUtil.isAssignmentOp(elseExpr)) {
++        Node lhs1 = thenExpr.getFirstChild();
++        Node lhs2 = elseExpr.getFirstChild();
++        if (areNodesEqualForInlining(lhs1, lhs2) && !mayEffectMutableState(lhs1)) {
+           n.removeChild(cond);
+-            Node assignName = thenOp.removeFirstChild();
+-            Node thenExpr = thenOp.removeFirstChild();
+-            Node elseExpr = elseOp.getLastChild();
+-            elseOp.removeChild(elseExpr);
+-
+-            Node hookNode = IR.hook(cond, thenExpr, elseExpr).srcref(n);
+-            Node assign = new Node(thenOp.getType(), assignName, hookNode)
+-                              .srcref(thenOp);
+-            Node expr = NodeUtil.newExpr(assign);
+-            parent.replaceChild(n, expr);
++          Node assignName = thenExpr.removeFirstChild();
++          Node thenRHS = thenExpr.removeFirstChild();
++          Node elseRHS = elseExpr.getLastChild().detachFromParent();
++          Node hookNode = IR.hook(cond, thenRHS, elseRHS).srcref(n);
++          Node assign = new Node(thenExpr.getType(), assignName.detachFromParent(), hookNode)
++              .srcref(thenExpr);
++          Node exprResult = NodeUtil.newExpr(assign);
++          parent.replaceChild(n, exprResult);
+           reportCodeChange();
+-
+-            return expr;
+-          }
++          return exprResult;
+         }
+       }
++
++
+       // if(x)foo();else bar(); -> x?foo():bar()
+       n.removeChild(cond);
+-      thenOp.detachFromParent();
+-      elseOp.detachFromParent();
++      thenExpr.detachFromParent();
++      elseExpr.detachFromParent();
+       Node expr = IR.exprResult(
+-          IR.hook(cond, thenOp, elseOp).srcref(n));
++          IR.hook(cond, thenExpr, elseExpr).srcref(n));
+       parent.replaceChild(n, expr);
+       reportCodeChange();
+       return expr;
+     }
+ 
+     boolean thenBranchIsVar = isVarBlock(thenBranch);
+     boolean elseBranchIsVar = isVarBlock(elseBranch);
+ 
+     // if(x)var y=1;else y=2  ->  var y=x?1:2
+     if (thenBranchIsVar && elseBranchIsExpressionBlock &&
+         getBlockExpression(elseBranch).getFirstChild().isAssign()) {
+ 
+       Node var = getBlockVar(thenBranch);
+       Node elseAssign = getBlockExpression(elseBranch).getFirstChild();
+ 
+       Node name1 = var.getFirstChild();
+       Node maybeName2 = elseAssign.getFirstChild();
+ 
+       if (name1.hasChildren()
+           && maybeName2.isName()
+           && name1.getString().equals(maybeName2.getString())) {
+         Node thenExpr = name1.removeChildren();
+         Node elseExpr = elseAssign.getLastChild().detachFromParent();
+         cond.detachFromParent();
+         Node hookNode = IR.hook(cond, thenExpr, elseExpr)
+                             .srcref(n);
+         var.detachFromParent();
+         name1.addChildrenToBack(hookNode);
+         parent.replaceChild(n, var);
+         reportCodeChange();
+         return var;
+       }
+ 
+     // if(x)y=1;else var y=2  ->  var y=x?1:2
+     } else if (elseBranchIsVar && thenBranchIsExpressionBlock &&
+         getBlockExpression(thenBranch).getFirstChild().isAssign()) {
+ 
+       Node var = getBlockVar(elseBranch);
+       Node thenAssign = getBlockExpression(thenBranch).getFirstChild();
+ 
+       Node maybeName1 = thenAssign.getFirstChild();
+       Node name2 = var.getFirstChild();
+ 
+       if (name2.hasChildren()
+           && maybeName1.isName()
+           && maybeName1.getString().equals(name2.getString())) {
+         Node thenExpr = thenAssign.getLastChild().detachFromParent();
+         Node elseExpr = name2.removeChildren();
+         cond.detachFromParent();
+         Node hookNode = IR.hook(cond, thenExpr, elseExpr)
+                             .srcref(n);
+         var.detachFromParent();
+         name2.addChildrenToBack(hookNode);
+         parent.replaceChild(n, var);
+         reportCodeChange();
+ 
+         return var;
+       }
+     }
+ 
+     return n;
+   }
