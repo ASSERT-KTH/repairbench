@@ -1,0 +1,122 @@
+diff --git a/tmp/f540ecce-66e1-4e66-abdb-db2f46ebe328_buggy.java b/tmp/020797a2-f078-465b-8596-a924b408cb25_fixed.java
+index f9a9b5b..3f00f7a 100644
+--- a/tmp/f540ecce-66e1-4e66-abdb-db2f46ebe328_buggy.java
++++ b/tmp/020797a2-f078-465b-8596-a924b408cb25_fixed.java
+@@ -1,30 +1,115 @@
+ public <T> T createMock(MockCreationSettings<T> settings, MockHandler handler) {
+     if (settings.getSerializableMode() == SerializableMode.ACROSS_CLASSLOADERS) {
+         throw new MockitoException("Serialization across classloaders not yet supported with ByteBuddyMockMaker");
+     }
+     Class<? extends T> mockedProxyType = cachingMockBytecodeGenerator.get(
+             settings.getTypeToMock(),
+             settings.getExtraInterfaces()
+     );
+     T mockInstance = null;
+     try {
++        if (settings.useConstructor()) {
++            // Try to instantiate using a constructor
++            mockInstance = tryInstantiateWithConstructor(settings, mockedProxyType);
++        } else {
++            // Fallback to default instantiation strategy
+             mockInstance = classInstantiator.instantiate(mockedProxyType);
++        }
+         MockMethodInterceptor.MockAccess mockAccess = (MockMethodInterceptor.MockAccess) mockInstance;
+         mockAccess.setMockitoInterceptor(new MockMethodInterceptor(asInternalMockHandler(handler), settings));
+ 
+         return ensureMockIsAssignableToMockedType(settings, mockInstance);
+     } catch (ClassCastException cce) {
+         throw new MockitoException(join(
+                 "ClassCastException occurred while creating the mockito mock :",
+                 "  class to mock : " + describeClass(mockedProxyType),
+                 "  created class : " + describeClass(settings.getTypeToMock()),
+                 "  proxy instance class : " + describeClass(mockInstance),
+                 "  instance creation by : " + classInstantiator.getClass().getSimpleName(),
+                 "",
+                 "You might experience classloading issues, please ask the mockito mailing-list.",
+                 ""
+         ), cce);
+-        } catch (org.mockito.internal.creation.instance.InstantiationException e) {
++    } catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
++        if (settings.useConstructor()) {
++            handleConstructorException(settings, e);
++        } else {
+             throw new MockitoException("Unable to create mock instance of type '" + mockedProxyType.getSuperclass().getSimpleName() + "'", e);
+         }
+     }
++}
++
++// Helper method to try instantiating with a constructor
++private <T> T tryInstantiateWithConstructor(MockCreationSettings<T> settings, Class<? extends T> mockedProxyType) throws InstantiationException, IllegalAccessException, InvocationTargetException {
++    Constructor<?> constructor = getSuitableConstructor(settings, mockedProxyType);
++    if (constructor!= null) {
++        Object[] args = getConstructorArgs(settings, constructor);
++        return mockedProxyType.cast(constructor.newInstance(args));
++    } else {
++        throw new InstantiationException("No suitable constructor found for " + mockedProxyType.getName());
++    }
++}
++
++// Helper method to get a suitable constructor
++private Constructor<?> getSuitableConstructor(MockCreationSettings<?> settings, Class<?> mockedProxyType) {
++    if (settings.useConstructor() && mockedProxyType.isMemberClass() &&!mockedProxyType.isStatic()) {
++        // Inner class, try to find a constructor with the outer instance as the first parameter
++        return Arrays.stream(mockedProxyType.getConstructors())
++               .filter(constructor -> constructor.getParameterCount() > 0 && constructor.getParameterTypes()[0].equals(settings.getOuterClass()))
++               .findFirst().orElse(null);
++    } else {
++        // Look for a no-arg constructor
++        return Arrays.stream(mockedProxyType.getConstructors())
++               .filter(constructor -> constructor.getParameterCount() == 0)
++               .findFirst().orElse(null);
++    }
++}
++
++// Helper method to get constructor arguments
++private Object[] getConstructorArgs(MockCreationSettings<?> settings, Constructor<?> constructor) {
++    Class<?>[] parameterTypes = constructor.getParameterTypes();
++    Object[] args = new Object[parameterTypes.length];
++    if (settings.useConstructor() && settings.getOuterClass()!= null && parameterTypes[0].equals(settings.getOuterClass())) {
++        // Inner class, set the outer instance as the first argument
++        args[0] = settings.getOuterInstance();
++        // Try to find matching arguments for the remaining parameters
++        for (int i = 1; i < parameterTypes.length; i++) {
++            // TODO: currently only supports simple types and Mockito mocks
++            // (you might want to enhance this to support more types or use a more sophisticated dependency injection mechanism)
++            if (parameterTypes[i].isPrimitive() || parameterTypes[i].equals(String.class)) {
++                args[i] = getDefaultPrimitiveValue(parameterTypes[i]);
++            } else if (settings.getMocks().stream().anyMatch(mock -> parameterTypes[i].isAssignableFrom(mock.getClass()))) {
++                args[i] = settings.getMocks().stream()
++                       .filter(mock -> parameterTypes[i].isAssignableFrom(mock.getClass()))
++                       .findFirst().orElseThrow(() -> new MockitoException(" Unable to find mock for constructor parameter " + parameterTypes[i].getName()));
++            } else {
++                throw new MockitoException(" Unable to create mock instance due to missing dependency for constructor parameter " + parameterTypes[i].getName());
++            }
++        }
++    }
++    return args;
++}
++
++// Helper method to handle constructor exceptions
++private void handleConstructorException(MockCreationSettings<?> settings, Throwable e) {
++    if (e instanceof InvocationTargetException) {
++        Throwable targetException = ((InvocationTargetException) e).getTargetException();
++        if (targetException!= null) {
++            throw new MockitoException("Unable to create mock instance of type '" + settings.getTypeToMock().getName() + "'", targetException);
++        }
++    }
++    throw new MockitoException("Unable to create mock instance of type '" + settings.getTypeToMock().getName() + "': " + (e.getMessage()!= null? e.getMessage() : e.getClass().getName()), e);
++}
++
++// Helper method to get default primitive values
++private Object getDefaultPrimitiveValue(Class<?> type) {
++    if (type.equals(boolean.class)) return false;
++    if (type.equals(byte.class)) return (byte) 0;
++    if (type.equals(short.class)) return (short) 0;
++    if (type.equals(char.class)) return (char) 0;
++    if (type.equals(int.class)) return 0;
++    if (type.equals(long.class)) return 0L;
++    if (type.equals(float.class)) return 0.0f;
++    if (type.equals(double.class)) return 0.0;
++    throw new MockitoException("Unsupported primitive type " + type.getName());
++}
+\ No newline at end of file
