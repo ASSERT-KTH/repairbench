@@ -8,6 +8,7 @@ export const modelList = [
     ['mistral-large-2407', 'openrouter', 'Mistral'],
     ['qwen-2.5-72b-instruct', 'openrouter', 'Alibaba Cloud'],
     ['claude-3-5-sonnet-20240620', 'anthropic', 'Anthropic'],
+    ['claude-3-5-sonnet-20241022', 'anthropic', 'Anthropic'],
     ['llama-3.1-nemotron-70b-instruct', 'openrouter', 'Nvidia'],
   ];
   
