@@ -26,6 +26,10 @@ def main():
             total_patches = 0
             total_ast_match_patches = 0
             total_plausible_patches = 0
+            number_bugs_with_ast_match_candidates = 0
+            number_bugs_with_plausible_candidates = 0
+            bugs_with_ast_match_candidates = []
+            bugs_with_plausible_candidates = []
     
             # Iterate over benchmarks
             benchmarks = ["defects4j", "gitbugjava"]
@@ -43,20 +47,29 @@ def main():
                 total_patches += data["num_patches"]
                 total_ast_match_patches += data["num_ast_match_patches"]
                 total_plausible_patches += data["num_plausible_patches"]
+                number_bugs_with_ast_match_candidates += data["num_bugs_with_ast_match_candidates"]
+                number_bugs_with_plausible_candidates += data["num_bugs_with_plausible_candidates"]
+                bugs_with_ast_match_candidates += data["bugs_with_ast_match_candidates"]
+                bugs_with_plausible_candidates += data["bugs_with_plausible_candidates"]
     
             # Write total values to a file
             totals = {
                 "num_patches": total_patches,
                 "num_ast_match_patches": total_ast_match_patches,
                 "num_plausible_patches": total_plausible_patches,
+                "num_bugs_with_ast_match_candidates": number_bugs_with_ast_match_candidates,
+                "num_bugs_with_plausible_candidates": number_bugs_with_plausible_candidates,
                 "ast_match@1": round(pass_at_k(total_patches, total_ast_match_patches, 1), 3),
                 "plausible@1": round(pass_at_k(total_patches, total_plausible_patches, 1), 3),
+                "bugs_with_ast_match_candidates": bugs_with_ast_match_candidates,
+                "bugs_with_plausible_candidates": bugs_with_plausible_candidates,
             }
 
             with open(f"{model}/total.json", "w") as f:
-                json.dump(totals, f)
+                json.dump(totals, f, indent=4)
 
         except Exception as e:
+            print(f"Error processing {model}: {e}")
             # delete total file if it exists
             if pathlib.Path(f"{model}/total.json").exists():
                 pathlib.Path(f"{model}/total.json").unlink()

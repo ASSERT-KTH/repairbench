@@ -11,6 +11,7 @@ llm_country_map = {
     'Mistral': 'EU',
     'Alibaba Cloud': 'CN',
     'Anthropic': 'US',
+    'Nvidia': 'US',
 }
 
 def load_data(results_dir):
@@ -25,6 +26,8 @@ def load_data(results_dir):
         ('mistral-large-2407', 'openrouter', 'Mistral'),
         ('qwen-2.5-72b-instruct', 'openrouter', 'Alibaba Cloud'),
         ('claude-3-5-sonnet-20240620', 'anthropic', 'Anthropic'),
+        ('claude-3-5-sonnet-20241022', 'anthropic', 'Anthropic'),
+        ('llama-3.1-nemotron-70b-instruct', 'openrouter', 'Nvidia'),
     ]
     benchmarks = ['defects4j', 'gitbugjava']
     metrics = ['ast_match@1', 'plausible@1']
