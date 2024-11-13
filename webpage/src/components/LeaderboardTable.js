@@ -114,11 +114,11 @@ const LeaderboardTable = () => {
     return aValue - bValue;
   };
 
-  const parseDateString = (dateString) => {
-    if (!dateString) return new Date(0); // Return earliest possible date if undefined
-    const [year, month, day] = dateString.split('-');
-    return new Date(parseInt(year), parseInt(month)-1, parseInt(day));
-  };
+//  const parseDateString = (dateString) => {
+//    if (!dateString) return new Date(0); // Return earliest possible date if undefined
+//    const [year, month, day] = dateString.split('-');
+//    return new Date(parseInt(year), parseInt(month)-1, parseInt(day));
+//  };
 
   const columns = React.useMemo(() => {
     const bestScores = getBestScores(data);

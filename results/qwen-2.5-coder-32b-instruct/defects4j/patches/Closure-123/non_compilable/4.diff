@@ -1,0 +1,1839 @@
+diff --git a/tmp/1a89e4ea-ed51-44fc-9d8a-31fde0384af6_buggy.java b/tmp/317708a9-1346-4f03-8d8f-041d552a424e_fixed.java
+index d96c04c..9978245 100644
+--- a/tmp/1a89e4ea-ed51-44fc-9d8a-31fde0384af6_buggy.java
++++ b/tmp/317708a9-1346-4f03-8d8f-041d552a424e_fixed.java
+@@ -1,665 +1,1628 @@
+ void add(Node n, Context context) {
+     if (!cc.continueProcessing()) {
+         return;
+     }
+ 
+     int type = n.getType();
+     String opstr = NodeUtil.opToStr(type);
+     int childCount = n.getChildCount();
+     Node first = n.getFirstChild();
+     Node last = n.getLastChild();
+ 
+     // Handle all binary operators
+     if (opstr != null && first != last) {
+         Preconditions.checkState(
+             childCount == 2,
+             "Bad binary operator \"%s\": expected 2 arguments but got %s",
+             opstr, childCount);
+         int p = NodeUtil.precedence(type);
+ 
+         // For right-hand-side of operations, only pass context if it's
+         // the IN_FOR_INIT_CLAUSE one.
+         Context rhsContext = getContextForNoInOperator(context);
+ 
+         // Handle associativity.
+         // e.g. if the parse tree is a * (b * c),
+         // we can simply generate a * b * c.
+         if (last.getType() == type &&
+             NodeUtil.isAssociative(type)) {
+             addExpr(first, p, context);
+             cc.addOp(opstr, true);
+             addExpr(last, p, rhsContext);
+         } else if (NodeUtil.isAssignmentOp(n) && NodeUtil.isAssignmentOp(last)) {
+             // Assignments are the only right-associative binary operators
+             addExpr(first, p, context);
+             cc.addOp(opstr, true);
+             addExpr(last, p, rhsContext);
+         } else {
+             unrollBinaryOperator(n, type, opstr, context, rhsContext, p, p + 1);
+         }
+         return;
+     }
+ 
+     cc.startSourceMapping(n);
+ 
+     switch (type) {
+         case Token.TRY: {
+             Preconditions.checkState(first.getNext().isBlock() &&
+                     !first.getNext().hasMoreThanOneChild());
+             Preconditions.checkState(childCount >= 2 && childCount <= 3);
+ 
+             add("try");
+             add(first, Context.PRESERVE_BLOCK);
+ 
+             // second child contains the catch block, or nothing if there
+             // isn't a catch block
+             Node catchblock = first.getNext().getFirstChild();
+             if (catchblock != null) {
+                 add(catchblock);
+             }
+ 
+             if (childCount == 3) {
+                 add("finally");
+                 add(last, Context.PRESERVE_BLOCK);
+             }
+             break;
+         }
+ 
+         case Token.CATCH:
+             Preconditions.checkState(childCount == 2);
+             add("catch(");
+             add(first);
+             add(")");
+             add(last, Context.PRESERVE_BLOCK);
+             break;
+ 
+         case Token.THROW:
+             Preconditions.checkState(childCount == 1);
+             add("throw");
+             add(first);
+ 
+             // Must have a ';' after a throw statement, otherwise safari can't
+             // parse this.
+             cc.endStatement(true);
+             break;
+ 
+         case Token.RETURN:
+             add("return");
+             if (childCount == 1) {
+                 add(first);
+             } else {
+                 Preconditions.checkState(childCount == 0);
+             }
+             cc.endStatement();
+             break;
+ 
+         case Token.VAR:
+             if (first != null) {
+                 add("var ");
+                 addList(first, false, getContextForNoInOperator(context));
+             }
+             break;
+ 
+         case Token.LABEL_NAME:
+             Preconditions.checkState(!n.getString().isEmpty());
+             addIdentifier(n.getString());
+             break;
+ 
+         case Token.NAME:
+             if (first == null || first.isEmpty()) {
+                 addIdentifier(n.getString());
+             } else {
+                 Preconditions.checkState(childCount == 1);
+                 addIdentifier(n.getString());
+                 cc.addOp("=", true);
+                 if (first.isComma()) {
+                     addExpr(first, NodeUtil.precedence(Token.ASSIGN), Context.OTHER);
+                 } else {
+                     // Add expression, consider nearby code at lowest level of
+                     // precedence.
+                     addExpr(first, 0, getContextForNoInOperator(context));
+                 }
+             }
+             break;
+ 
+         case Token.ARRAYLIT:
+             add("[");
+             addArrayList(first);
+             add("]");
+             break;
+ 
+         case Token.PARAM_LIST:
+             add("(");
+             addList(first);
+             add(")");
+             break;
+ 
+         case Token.COMMA:
+             Preconditions.checkState(childCount == 2);
+             unrollBinaryOperator(n, Token.COMMA, ",", context,
+                 getContextForNoInOperator(context), 0, 0);
+             break;
+ 
+         case Token.NUMBER:
+             Preconditions.checkState(childCount == 0);
+             cc.addNumber(n.getDouble());
+             break;
+ 
+         case Token.TYPEOF:
+         case Token.VOID:
+         case Token.NOT:
+         case Token.BITNOT:
+         case Token.POS: {
+             // All of these unary operators are right-associative
+             Preconditions.checkState(childCount == 1);
+             cc.addOp(NodeUtil.opToStrNoFail(type), false);
+             addExpr(first, NodeUtil.precedence(type), Context.OTHER);
+             break;
+         }
+ 
+         case Token.NEG: {
+             Preconditions.checkState(childCount == 1);
+ 
+             // It's important to our sanity checker that the code
+             // we print produces the same AST as the code we parse back.
+             // NEG is a weird case because Rhino parses "- -2" as "2".
+             if (n.getFirstChild().isNumber()) {
+                 cc.addNumber(-n.getFirstChild().getDouble());
+             } else {
+                 cc.addOp(NodeUtil.opToStrNoFail(type), false);
+                 addExpr(first, NodeUtil.precedence(type), Context.OTHER);
+             }
+ 
+             break;
+         }
+ 
+         case Token.HOOK: {
+             Preconditions.checkState(childCount == 3);
+             int p = NodeUtil.precedence(type);
+             Context rhsContext = Context.OTHER;
+             addExpr(first, p + 1, context);
+             cc.addOp("?", true);
+             addExpr(first.getNext(), 1, rhsContext);
+             cc.addOp(":", true);
+             addExpr(last, 1, rhsContext);
+             break;
+         }
+ 
++        case Token.IN: {
++            Preconditions.checkState(childCount == 2);
++            addExpr(first, NodeUtil.precedence(Token.IN) + 1, context);
++            cc.addOp("in", true);
++            addExpr(last, NodeUtil.precedence(type), rhsContext);
++            break;
++        }
++
+         case Token.REGEXP:
+             if (!first.isString() ||
+                 !last.isString()) {
+                 throw new Error("Expected children to be strings");
+             }
+ 
+             String regexp = regexpEscape(first.getString(), outputCharsetEncoder);
+ 
+             // I only use one .add because whitespace matters
+             if (childCount == 2) {
+                 add(regexp + last.getString());
+             } else {
+                 Preconditions.checkState(childCount == 1);
+                 add(regexp);
+             }
+             break;
+ 
+         case Token.FUNCTION:
+             if (n.getClass() != Node.class) {
+                 throw new Error("Unexpected Node subclass.");
+             }
+             Preconditions.checkState(childCount == 3);
+             boolean funcNeedsParens = (context == Context.START_OF_EXPR);
+             if (funcNeedsParens) {
+                 add("(");
+             }
+ 
+             add("function");
+             add(first);
+ 
+             add(first.getNext());
+             add(last, Context.PRESERVE_BLOCK);
+             cc.endFunction(context == Context.STATEMENT);
+ 
+             if (funcNeedsParens) {
+                 add(")");
+             }
+             break;
+ 
+         case Token.GETTER_DEF:
+         case Token.SETTER_DEF:
+             Preconditions.checkState(n.getParent().isObjectLit());
+             Preconditions.checkState(childCount == 1);
+             Preconditions.checkState(first.isFunction());
+ 
+             // Get methods are unnamed
+             Preconditions.checkState(first.getFirstChild().getString().isEmpty());
+             if (type == Token.GETTER_DEF) {
+                 // Get methods have no parameters.
+                 Preconditions.checkState(!first.getChildAtIndex(1).hasChildren());
+                 add("get ");
+             } else {
+                 // Set methods have one parameter.
+                 Preconditions.checkState(first.getChildAtIndex(1).hasOneChild());
+                 add("set ");
+             }
+ 
+             // The name is on the GET or SET node.
+             String name = n.getString();
+             Node fn = first;
+             Node parameters = fn.getChildAtIndex(1);
+             Node body = fn.getLastChild();
+ 
+             // Add the property name.
+             if (!n.isQuotedString() &&
+                 TokenStream.isJSIdentifier(name) &&
+                 // do not encode literally any non-literal characters that were
+                 // Unicode escaped.
+                 NodeUtil.isLatin(name)) {
+                 add(name);
+             } else {
+                 // Determine if the string is a simple number.
+                 double d = getSimpleNumber(name);
+                 if (!Double.isNaN(d)) {
+                     cc.addNumber(d);
+                 } else {
+                     addJsString(n);
+                 }
+             }
+ 
+             add(parameters);
+             add(body, Context.PRESERVE_BLOCK);
+             break;
+ 
+         case Token.SCRIPT:
+         case Token.BLOCK: {
+             if (n.getClass() != Node.class) {
+                 throw new Error("Unexpected Node subclass.");
+             }
+             boolean preserveBlock = context == Context.PRESERVE_BLOCK;
+             if (preserveBlock) {
+                 cc.beginBlock();
+             }
+ 
+             boolean preferLineBreaks =
+                 type == Token.SCRIPT ||
+                 (type == Token.BLOCK &&
+                     !preserveBlock &&
+                     n.getParent() != null &&
+                     n.getParent().isScript());
+             for (Node c = first; c != null; c = c.getNext()) {
+                 add(c, Context.STATEMENT);
+ 
+                 // VAR doesn't include ';' since it gets used in expressions
+                 if (c.isVar()) {
+                     cc.endStatement();
+                 }
+ 
+                 if (c.isFunction()) {
+                     cc.maybeLineBreak();
+                 }
+ 
+                 // Prefer to break lines in between top-level statements
+                 // because top-level statements are more homogeneous.
+                 if (preferLineBreaks) {
+                     cc.notePreferredLineBreak();
+                 }
+             }
+             if (preserveBlock) {
+                 cc.endBlock(cc.breakAfterBlockFor(n, context == Context.STATEMENT));
+             }
+             break;
+         }
+ 
+         case Token.FOR:
+             if (childCount == 4) {
+                 add("for(");
+                 if (first.isVar()) {
+                     add(first, Context.IN_FOR_INIT_CLAUSE);
+                 } else {
+                     addExpr(first, 0, Context.IN_FOR_INIT_CLAUSE);
+                 }
+                 add(";");
+                 add(first.getNext());
+                 add(";");
+                 add(first.getNext().getNext());
+                 add(")");
+                 addNonEmptyStatement(
+                     last, getContextForNonEmptyExpression(context), false);
+             } else {
+                 Preconditions.checkState(childCount == 3);
+                 add("for(");
+                 add(first);
+                 add("in");
+-          add(first.getNext());
++                addExpr(first.getNext(), NodeUtil.precedence(Token.IN) + 1, context);
+                 add(")");
+                 addNonEmptyStatement(
+                     last, getContextForNonEmptyExpression(context), false);
+             }
+             break;
+ 
+         case Token.DO:
+             Preconditions.checkState(childCount == 2);
+             add("do");
+             addNonEmptyStatement(first, Context.OTHER, false);
+             add("while(");
+             add(last);
+             add(")");
+             cc.endStatement();
+             break;
+ 
+         case Token.WHILE:
+             Preconditions.checkState(childCount == 2);
+             add("while(");
+             add(first);
+             add(")");
+             addNonEmptyStatement(
+                 last, getContextForNonEmptyExpression(context), false);
+             break;
+ 
+         case Token.EMPTY:
+             Preconditions.checkState(childCount == 0);
+             break;
+ 
+         case Token.GETPROP: {
+             Preconditions.checkState(
+                 childCount == 2,
+                 "Bad GETPROP: expected 2 children, but got %s", childCount);
+             Preconditions.checkState(
+                 last.isString(),
+                 "Bad GETPROP: RHS should be STRING");
+             boolean needsParens = (first.isNumber());
+             if (needsParens) {
+                 add("(");
+             }
+             addExpr(first, NodeUtil.precedence(type), context);
+             if (needsParens) {
+                 add(")");
+             }
+             if (this.languageMode == LanguageMode.ECMASCRIPT3
+                 && TokenStream.isKeyword(last.getString())) {
+                 // Check for ECMASCRIPT3 keywords.
+                 add("[");
+                 add(last);
+                 add("]");
+             } else {
+                 add(".");
+                 addIdentifier(last.getString());
+             }
+             break;
+         }
+ 
+         case Token.GETELEM:
+             Preconditions.checkState(
+                 childCount == 2,
+                 "Bad GETELEM: expected 2 children but got %s", childCount);
+             addExpr(first, NodeUtil.precedence(type), context);
+             add("[");
+             add(first.getNext());
+             add("]");
+             break;
+ 
+         case Token.WITH:
+             Preconditions.checkState(childCount == 2);
+             add("with(");
+             add(first);
+             add(")");
+             addNonEmptyStatement(
+                 last, getContextForNonEmptyExpression(context), false);
+             break;
+ 
+         case Token.INC:
+         case Token.DEC: {
+             Preconditions.checkState(childCount == 1);
+             String o = type == Token.INC ? "++" : "--";
+             int postProp = n.getIntProp(Node.INCRDECR_PROP);
+             // A non-zero post-prop value indicates a post inc/dec, default of zero
+             // is a pre-inc/dec.
+             if (postProp != 0) {
+                 addExpr(first, NodeUtil.precedence(type), context);
+                 cc.addOp(o, false);
+             } else {
+                 cc.addOp(o, false);
+                 add(first);
+             }
+             break;
+         }
+ 
+         case Token.CALL:
+             // We have two special cases here:
+             // 1) If the left hand side of the call is a direct reference to eval,
+             // then it must have a DIRECT_EVAL annotation. If it does not, then
+             // that means it was originally an indirect call to eval, and that
+             // indirectness must be preserved.
+             // 2) If the left hand side of the call is a property reference,
+             // then the call must not a FREE_CALL annotation. If it does, then
+             // that means it was originally an call without an explicit this and
+             // that must be preserved.
+             if (isIndirectEval(first)
+                 || n.getBooleanProp(Node.FREE_CALL) && NodeUtil.isGet(first)) {
+                 add("(0,");
+                 addExpr(first, NodeUtil.precedence(Token.COMMA), Context.OTHER);
+                 add(")");
+             } else {
+                 addExpr(first, NodeUtil.precedence(type), context);
+             }
+-        add("(");
+-        addList(first.getNext());
+-        add(")");
+-        break;
+-
+-      case Token.IF:
+-        boolean hasElse = childCount == 3;
+-        boolean ambiguousElseClause =
+-            context == Context.BEFORE_DANGLING_ELSE && !hasElse;
+-        if (ambiguousElseClause) {
+-          cc.beginBlock();
+             }
++            add("(".add)(", Node(Context);
++                Node(" Context NodeEXPR.add, NodeExpr.op.add(" NodeExprExprExprNode<Node.add ContextNode Node NodeString);
++                add(" Node.get(Node Context Context ContextNodeExprExpr.add Context.add.add.add.add.add.add(ContextComment.OTHER.add.add.addNodeUtil.getChild Node.add);
++            add NodeExprNode);
++            Node.add(Context Context.get(Contextype(Context Node {
++ break(contextChild opContext(ContextExpr.add {
++                        Node(context
++            add(" Node.getChild Context Context.time.addExpr(context ContextExpr ExprExpr(f {
++            add getChild(NodeContext ContextContext ContextStateContext ContextContextState(" if (first Context Node Node {
++            addState.ContextCHECK.getChildContext.addNodeUtil.Context.getContext contextContextContextContext {
++                Node Context(Context Context(Context(" Contextizr.addNode(Context {
++            add(" Context();
++            Node {
++            add(Context(Context Stmt.getChild a Node {
++                add {
+ 
+-        add("if(");
+-        add(first);
+-        add(")");
+-
+-        if (hasElse) {
+-          addNonEmptyStatement(
+-              first.getNext(), Context.BEFORE_DANGLING_ELSE, false);
+-          add("else");
+-          addNonEmptyStatement(
+-              last, getContextForNonEmptyExpression(context), false);
+-        } else {
+-          addNonEmptyStatement(first.getNext(), Context.OTHER, false);
+-          Preconditions.checkState(childCount == 2);
+-        }
++            add(Context "(" NodeNode ContextContext checked the expression_STATE Context(" new a Context exposeStateState checkState Node Expression Context.add(Context(childStateState childForbidden child childStatedeprecated("0 {
++            add ")";
++            add-child child State {
++ add Case(" add(" {
++            Context(Context {
++            add(context(Context.add(" Context.exports(" "(".asList this.Context);
++            add(" Context chrome(Context ==(Context_PRE(context ContextContext(Context op(ContextElement Context_case(" {
++            add(false there(Context : PARTICULAR only {
++            add falseContext(child {
++            add(" new();
++            add("new has ContextContext "new op-check(" " false (!("new();
++            addState.CON child child op {
++            add child />
++                NodeContextContext(" ContextContext ifStatementState(Context(Context ContextContextContextCase context.getChild countState(get(falseürlich(false true false {
++                add(child.addState.getContext:1(context {
++            add a ContextContext;
++addContextState {};
++            Node statement(Context context(Context(ContextExpression "");
++            Context("Context contextContextInfoContext {
++                add child StmtState(Context -> false childContextContext "new(outCaseStatement(Context, Context EQUAL statement(Context Context Collision();
++            Node alwaysContext false {
++            Node false Context.only(" context(context_child {
++            ContextState ContextFalse();
++       add {
++        addStateString Context.op.getRuntime.B);
++            ContextContext Context false);
++            Node {
++        if (first false falseContext(context(" Context(Context.getChild(Context true false.addChild if (first
++ cc(ContextContext(contextContextContext(Context.P false.OTHER.STContext Context();
++            add Ct child Context.add(" true ContextStmt false Context Context Context(objContext(Context.m(child addContext {
++            Node.getChild "");
++            NodeContext(" Context {
++            add(Context.addNode(Context childContext.getContext(true child this NodeUtil(context Context<State {
++            addExpr(" Node.getChild contextContext(Context, Context.Context exprContext));
++            if(Context Context Context.ContextNode.addExpr.add " Context();
++            add(context Context CC Context if (first {
++        Node.O child {
++            Context.OTHER {
++            Node.STATE here in Context {
++            //Node.make ContextContext(Context precedence;
++            Context(Context Node {
++            Node ContextContext(NodeExpressionContextChild.getChild child();
++        Contextprecated);
++            Node.getChild);
++        ContextContext child =preced ->ContextExpr child Child.first sawContext(type(Context CONTEXT Context ContextExpr.Context(" ContextExpr_NODE.addContext(context child Context {
++        ("Node(Context reducingContextContext.add.Context Context.getContextOTHERExpr.getChild in(Node there Context.OTHERChildNode(Node.pContext "1, Node_context ContextNode(Context.add ContextExprExpr
++          addContext);
++            Node.getChild unreal false Context a contextExpr child_CONTEXTContextContextChild(cc childNode/cc(");
++            NodeNodeExpr(Context(" firstNode(Node(String ContextEQUAL.child;
++            Context Context Node.getContext.getChild_heap child Context {
++                addChild if (first时尚 context Node;
++            Node = NodeContextCaseContext);
++            add Context(" the precedenceExpr(g Context);
++            Context Context Context Context childNode.Context ifExpression();
++            addContext = Context child if (type Context.check(ContextContext Context(Node childContextContext |=, Node {
++            add(pre(Context {
++            add false Context(NodeNode.add child("Context Contextive(falseContextContext(child.add();
++            addогоState ContextContext(context {
++            if (context {
++            NodeUnless.Context(Context, Node true Context Context_NODE " OTHER Context
++            NodeChild.OTHER OTHER Context.toStringContextComment.add(Context new Context ==Context.sep);
++            add false
++            addContextState Context Context只能Context :Expr row other ContextContext Context();
++            (" true);
++            Node(falseNotFoundContext ContextContext(child the same {
++            Nodeتأكد ContextContext.addContext.Context(context(Context.ContextContext_context.end Context false(" Stripe.OTHER
++                ContextNodeContextContextCase ContextContext();
++            ContextExpr(Context);
++            Node CG.add.getChildExpr aight.getChild "]");
++            if (Context Context "first if (type NodeContext Context Context(Context.getChild {
++            add ContextError.ContextContext.Context);
++            Context(Context)(
++            addContextState Context);
++            addContext(Context(Context NodeContextContext false {
++        Node.Context {
++            Node);
++            ccExpr);
++            if(get);
++        if (Node();
++            ContextExpr.add(Context Context(Context);
++2ContextStateException报业State.add {
++          addContext Context(ContextContext {
++        Node ContextContextAIN : Context.Context ContextOp if (getStateContext(ContextByte uhContext Context ContextNext();
++            add {
++            cc(Context falseStateProp {
++            add("trueString(Context, NodeEscape Context {
++            Context context(Context child ContextChildInteger ifStmt.getContext handleClose(" "-fluid(" false Context ifStatement {
++            add("Context Context.getChild.ContextExpr Context string.out(last op();
++{
++            context (type();
++            add child Preconditions Context {
++                addContext.addError.out contextContextContext Context op(typeNode(op p.add(child childn.getChild.Context.requireNonNullState true add Node.OTHERClause case (lastPre ifStatementContextState Context());
++            Node();
++        Node.getNext(" Context ContextContext CharSequence toExprContext.out.ContextContextState Context ContextConditionContext(true right Context.Context if (typeContext("}");
++            add(Context.CallState.OTHER();
++            add("affe Context Context.STStatement Context.OTHER child if (first.add(Context();
++            addExpr(" false.getChild opNodeCase("");
++            add Context ContextState.OTHERContext("Node(ContextContext Context inODE {
++            if (typeContext if (first("Clause("
+ 
+-        if (ambiguousElseClause) {
+-          cc.endBlock();
++            Node Context Context Context(ContextState {
++            add(Context("other("(("context Context ifChild("1 cozn.context in context(Context(" Context(Context child("Context {
++          Case Context(children("TokenNodeContext(" Context ifClause ifClause
++            case last());
+         }
+-        break;
++            cc(Context if (context.Context_STATE.Context.Context Context();
++            first {
++                add(Context();
++                addContext Context("ContextNode isAdd Context Context("ContextContext("Context Context Context ContextContext(Context child_QUALExpr child.GetChild.add.getNext " true Context true Context(" orphan("`Get opOp>();
++            addContextContext.check Context(" Context Context(ContextStatesContext ifExpr.in inExpr "1(Context(" other.Context if (Context:;
++            addNode Context.add("rin COMMENT op(Context.add.add(" ContextState(x(")");
++            NodeCase {
++            add(" styles("getChildConstraint.op机型ContextContext {
++            add
++        cc {
++            ccExpr/cc lastContext op(")");
++            ContextICC ");
++        if (context.add Context_STATE OTHERContext);
++            add {
++                );
++            NodeState {
++        addContext {
++            addContext op.getChild op.out(Context_ENTERNodeContext Context op {
++            );
++            Node if (context, Context("Context("ContextCAPE cc as.Context.add(ContextxCCStatement
++            Context(contextContextContextHolder.add焌 {
++                if (firstContentContextContext {
++                add Context\Command_PRE(type {
++            add("n(Context check {
++            Context CC( Context.IN);
++            add();
++            addStatement嗦 enoughNode.getChild in();
++            add洗衣 true0 ContextContext : 0Context.join.addExpr opContextOnceContext("0Context.Context.add(" "ExpressionContext.Context ==(ContextCase);
++            addExpr(" 1(ContextgetChild are Context.add Context=" getContext();
++            addContext(" 1_cc {
++        cc();
++                ifExprState(Context {
++        ifExpr in ContextContext<StateContextException("Context.log OpcodeContextExprContext of(last_expr(");
++            add(Context type(Context ContextContextContext child(")");
++            );
++        Node 문Next(Context(boolean);
++            Node inContext("Context);
++            ("
++                addContext");
++            ccStatement(" ContextContext(Context");
++            Context CC(" {
++            Context.mc();
++        if(Context(" indicatedNodeNode("eContext.add(" inContext_CHECK(NodeExpr op("ContextContext.add(" {
++            add("
++        add false falseErrorContext "operand op ifList.CON += Context(" "ULAR("scape.join();
++            add(first lastCaseNode(">());
++            add(" ContextNode(getContextContext Context.add(");
++            Node(Context CCContext.add(" {
++                addContext.getChild("Context triple {
++                add(Context.add "ContextAdd.add("ContextStatement expansion("falseCase youLineExpr("0Break);
++            add(", Node.OTHER受不了 state {
++                add Context(last.with ifClauseState Context Context("ерж.addContext "ared Context(Context Context, Context Context.add(Context("Node(Context);
++            add(" Context(Context false", Context();
+ 
+-      case Token.NULL:
+-        Preconditions.checkState(childCount == 0);
+-        cc.addConstant("null");
+-        break;
+-
+-      case Token.THIS:
+-        Preconditions.checkState(childCount == 0);
+-        add("this");
+-        break;
+-
+-      case Token.FALSE:
+-        Preconditions.checkState(childCount == 0);
+-        cc.addConstant("false");
+-        break;
+-
+-      case Token.TRUE:
+-        Preconditions.checkState(childCount == 0);
+-        cc.addConstant("true");
+-        break;
+-
+-      case Token.CONTINUE:
+-        Preconditions.checkState(childCount <= 1);
+-        add("continue");
+-        if (childCount == 1) {
+-          if (!first.isLabelName()) {
+-            throw new Error("Unexpected token type. Should be LABEL_NAME.");
+-          }
++            addContext else {
++                add(" expr(ContextContext(" "("());
++            addContext(Context一句 Context(Context ".StartPosition) {
++``false(Context true Context("0, Node Context Context Context(" Context           Context.Expr Context"On Context(" "(", Context("addExpr(");
++            );
++            add(last {
++                // Context.first last();
++                Node childNodeưngContextContext.type Context Context qc.type(type("Node.add(")");
++            add(");
++            add(Context true(Context
++            add(" Context(");
++            add(Context();
++            add(getContext);
++        add(" Context {
++            addExpr(")));
++            next;
+         add("");
+-          add(first);
+-        }
+-        cc.endStatement();
+-        break;
+-
+-      case Token.DEBUGGER:
+-        Preconditions.checkState(childCount == 0);
+-        add("debugger");
+-        cc.endStatement();
+-        break;
+-
+-      case Token.BREAK:
+-        Preconditions.checkState(childCount <= 1);
+-        add("break");
+-        if (childCount == 1) {
+-          if (!first.isLabelName()) {
+-            throw new Error("Unexpected token type. Should be LABEL_NAME.");
+-          }
+-          add(" ");
+-          add(first);
+-        }
+-        cc.endStatement();
+-        break;
+-
+-      case Token.EXPR_RESULT:
+-        Preconditions.checkState(childCount == 1);
+-        add(first, Context.START_OF_EXPR);
+-        cc.endStatement();
+-        break;
+-
+-      case Token.NEW:
+-        add("new ");
+-        int precedence = NodeUtil.precedence(type);
+-
+-        // If the first child contains a CALL, then claim higher precedence
+-        // to force parentheses. Otherwise, when parsed, NEW will bind to the
+-        // first viable parentheses (don't traverse into functions).
+-        if (NodeUtil.containsType(
+-            first, Token.CALL, NodeUtil.MATCH_NOT_FUNCTION)) {
+-          precedence = NodeUtil.precedence(first.getType()) + 1;
+-        }
+-        addExpr(first, precedence, Context.OTHER);
+-
+-        // '()' is optional when no arguments are present
+-        Node next = first.getNext();
+-        if (next != null) {
+-          add("(");
+-          addList(next);
++            addCase ifIn(Context(";
++            addNode(Context(");
++            Node if n Context(";");
++            add {
++                add(Context Context Context("1("in ContextNode.getTokenCase.Context);
++            Context = Node last("char frivolContext(child.getChild {
++            addContext {
++            add(Context type child(type {
++            Context ++;
++        addExprExistNode(Context();
++            add caseExpr(" Context.NODE Context
++            add(Context)(" ofExpr(Context(Context();
++            contextChild stmt ifClauseContext("in(Context_FIRST.TOP {
++            add();
++            ifExpr("add, Node !=
++            (" ContextChild("inFirst);
++            if (NodeCount("true.err("_NULL inode(Context(Context);
++            ContextContext.Inter org Context Context.OPContext(" ContextChild.getChild to prevent aighNodeContextContext Context {
++                Node(var(ConstantsNotNullContext.out nContextContextCondStringContextChildContext("Node(" đứng("NodeNode.NodeState if (first(" child this ContextOperation Node op {
++               Context("NodeExprFacade(ContextChild {
++            add "]");
++        add("ContextExprgetChild "typeContextChild(p child {
++            addElse Expr();
++            addFailedNodeCheck if (child Child time always());
++            addContext(" ContextExpr<Node p NodeContext op(" Context(pre {
++            addExpr String Node("in precedenceCase NodeNode { "false child.op {
++        add-node(op contextExpr inExprExprExpr.addContext(" {
++            addExpr do Context Node {
++            NodeStateContext(Context {
++        add(Context.Context op op.context(typeContext.text.add Context(type(Node, Node.addExprNodeExpr lastContext(Context(lastNode getLast));
++parseNodeContext(first op.getM.le(firstContext(typeContext.in(Context getClass.getChild, Node.errorState if (first(op op ifExprExprExprExpr(last(exprExists(Context(Context.sent(last()"
++            addExpr op(ContextCase.get inExpr(lastNonNull.add Context false();
++            add(length(lasttour false.Context("NodeContext ContextContextExpr op, Node inOrNode last(Context.addExprExpr.getChild false true=argsNode(Context, Node());
++            ContextExpr);
++            add {
++            addExpr.unwrap lastExpr aftNodeContext combinCaseCodeExprExprd(pre op()
++            ccOperatorExprStatement(); case op {
++        add relatExpr {
++ add {
++            addContext(" Node " hasExprстроен last op(ContextContext橼Expr, Token forExpr stmt.add Context Context Context obsChildState Context false();
++            add);
++            ifClause ifExprChild(true "inContext.getChildContext="firstContextExpr {
++            ;
++            add False ContextContextContext ejacNode("2KindStateCountTypeContext Context();
++            else {
++            add(Context ContextContext or(Context "addContextCss Context("true Node
++            Node_TRUEExpr(exprExprOf1 case Node op(A Context.add "inContext Expr ">");
++            //Statement.getTextExpr("rProof.add.getChild " true opNode.add Js last "addContext
++ addContextCaseCase ifNode op.getNodeNode.checkContext.child.op op(Context(Context("Node false last outCaseContext " inExpr
++            //getChild(" in case child Context Context.empty("Node("("context("type trueContext "add(" firstStackTrace
++            break();
++        last Context("NodeContext(Context check(Context, Node("Context.op {
++            // only.add yytype op(opCaseContext.Context op " context "in ContextExpr_stmtExpr op.lastExpr Context_context Context Context StatementContext>();
++                add false state false();
++            if_stmtNode(" true falseContext falseEquals last<>();
++            Context(" inOperator of(NodeExpr last(" first false(nodes(")");
++            add(true last(last(child, Node(");
++            NodeENCH.pair(type());
++            ccNotNull more false Context false(op(" name SYN);
++            add statement op);
++            add false {
++                addStmtContext op(ContextLine.getContext falseContext.lastContext {
++            break("Context(".getChildChildContext(Context.getChild " out aExpr(true.add CC.add false op.add(".getChild();
++            cc(" false {
++            Context(ContextPointNotNull op(Node isExprCc.contextExpr.add add(Context ContextNextContextContext getStateContext contextContext {
++            last(" ContextContext opLast {
++            addContextTransition.ContextContextContext;
++            true.add(opContext(false(op(false falseContext(trueStmt.add opContext(childExprExprContextContext "in ContextContext做出了.getContextChecked>false hint " false cc {
++            context_exprContext(context {
++                // Add false {
++            addContext true false(opExprOverride contextContext op {
++                addContextContextContext checkedExpr(" false true true falseContextStateContext(context false(true {
++            Node.onlyContext trueContextContext.Expr ", Context.Context false(op parenthesis null.addExpr.opContextContext);
++                add(Context {
++                cc("Context false op.addContext(typetrue opContext重要原因(tgetContext.cond for(firstExpr false Context.addExprContext ContextExpr op, Context (context Context);
++            ContextExpr("URAL(Context.add.addContext ord);
++            Context " in, NodeContextContext Context.getContext Context ContextExprContext.getContextContextNodeContext +=Case, ContextEQUAL Context(")", {
++            addContext.getDouble(" context ContextContext.add(" Node.pop.addExpr.addContext;
++            add(" Node("1Child(" true.add.addTokenExpr.getBoundingClientRect("("(");
++            add(expr "paren trueInsideExists.opExprExpr(key {
++            context("`	Context ", Context(op.add make complexion();
++            cc {
++            add boolean {
++            breakExpr(" falseStateHashMap();
++            addState NodeNode " Context else if (child " childChild Context, Node;
++            add ", null (contextCon {
++                add(" Context "trueStatement("0Case op();
++            add("( equalContext(falseContext false(pRead(op(":(), Context re opContext opContext oppress(Context ContextNode.context opFalseTag opContext经济效益Context true(true(Context ContextContextState();
++            cc Context("()");
++            NodeContextContextBool opContext Context true checked.add(" type {
++            add(true(op the sourceContext contextContext(false true op op(" {
++            context.check false false();
++            addContext falseContext("((last(lastTile(Node(" " true op op a_deps(op(Context ";");
++            if (context(" else if (token(" true(Context Context(Context Context.addExpr op trueContextContext(Context {
++            add ContextContextExpr(type in a range(childContext(child {
++                        get Context last(false(SenderContext(" other ContextContext if (type = (Node(child.add(")");
++            ccStatement inExpression, Context(true("Context(Context ContextContext a Context type op firstContextContext(Context Context childState ifExpr();
++            breakExprContext("inContext first op typeContext(opErrorNie(type pEqual(")");
++            ifExit this.get true.add(pre p(opContext(opErrorContextContext("[ContextContextContext opContext p Preferences processor(" contextContext.out
++else pContext(context(Context NodeExpr(child("Node NodeContext op(nameJob(p("Child = Node the context real(true, Context);
++        cc(Context(type.add of(), {
++            dd toAddNodeExpr Column expression(context, Context.getContext(ContextCaseIterator falseContext inParen {
++            trueContextBehindChildren();
++            ContextNode1 typeContext p falseNode.in, Node op ContextNodeNodeContextExpr out(TokenNode Context [NodeNodeOf(op进入(n, Node ifFailNode(Node(opExpr Node.getChild {
++            context pExprExpr(" in(TokenTypeExpr currentNode.arraycopyContext_case {
++            Context op(TreeNode Node.Provider.add("<>( one, NodeChild Node childNode p.escape Child ExprNodeNode.empty != ContextNode check Context childExprExprNode("getChild.getChild op endforeachüğüBool();
++            Node child:addExpr(" Context.add opExpr, Node "true.addpresentation case if (type Child.check(Context Context need(Context Context);
++            add(op(");
++            add(grIdentifier false ContextNode("forNode child great(type child child(rec();
++            Node lastNodeExpr op p endl));
++            context pContext("alsa.doExpr loss("TypeTrueOfExpr ", getToken op child Child, Node.inContext(" "otherContext op last case(" Node.add<String {
++            context(Context Node op op.add the context浏览器ContextContextContext ccCoreApplicationContextContextContext(" next.add {
++            // falseContext.getContext;
++            add Node(" String Context Context();
++            cc in type opNode op(first.getChild, CONTEXT cmd Context(Context Context ContextStatsNode op true
++            c.Context.Context("2 Context only encodeURIComponent "for);
++            if (firstContext "2 Context.Context ifNode ifExpr.getNext ed {
++            Node "iNode(type toExprNode.writeln {
++                String(ContextCC precedenceContext Context node.getChild(");
++            ifExpression Context Context(uriContext n_next anotherContext Node.add Context PreconditionsExpr(", Context(typeBoolean {
++                ContextContext ContextContext Context[typeNode op(Context Rhodes隺ContextOfContext(CONChild if (first)((NodeExprNode, Node typeयNode op("OTHER.getStringContext(Context.add(CCExpr `"
++            contextContextExpr("last latterStr.getContext ")");
++            add("1_node(Context.Context.walk typeEquals in(ContextContextExpr.getContextExprExprExpr inContextErrorContext.getChild -> {
++                lastContextClause nodeGetExprNode first Context getChild Context Node.opNode();
++            add as Context(Context.getChild set lastContextContext {
++                add last Context.Context.last last last(last lastContext("]");
++            addgetChild.getChild prev(" sameStrContext(" pContext",ContextExpr forExpr(getContextExprExprExprExpr("in(Context(" else {
++                add last(""textExprOfMonth(cb op();
++            break();
++            Context扭 the first.addExpr.Strict_case);
++                ContextCase(Context("forLastExpr(";
++            Context.OP);
++            add "in.getNext)("Node op("add ")");
++            cc {
++                ifContext有关部门.add Context(" Context.lin err.getContext("continue caramel湯 Context.addfEqual(type cc out(ContextExpr true cc era Options artPres NEED.add.gcContext("for hint "]");
++            breakContext of(last nextPage child in Case.ContextContext " ");
++            ccExpr op
++            break true {
++        Node op(" oforContextOpOTE "add last op.add.add(" else {
++            add("[] a.getString op();
++            add());
++            cc Node last();
++            NodeContextContext(Context isError ofNon Context ContextString Context child Context inContext);
++            if (typeState was.Context(Context臺灣ContextContextContext(ContextContext();
++inerContext or contextFirstChild.getChild Context(State Context opExpr Context(ContextFormatting:2.Context opContextContext andExpr();
++                ccVisibleChar("TOKEN(" Context op lavish("";
++            Context(" chief));
++                add Context CB outContext义NodeNode "for actual stringContextContext Context_end(" orphan:"2opportunità.assertNotNullString ".add getNext>());
++            add {
++    add Context !=)(" op in Expression.increment "add "GET);
++            if (first "forCases Context argsDialog new.add {
++        addContext GehNodeOf ContextCond.add lastExpr "-Javadoc {
++        //
++                    Contextener { Context.getContext "get);
++        break else
++            addContext.addOf:get op yourselves();
++            if (last("cContextExprExpression.cHas();
++            opExpr.add representation(" Context OUTER 이용.getContextNode.getNext.failContextStateOrNode addClause {
++                contextOrDefault(), ContextOppContextContext ccNode Context ||;
++            contextCases || nullContextContext "(อาก Context ccError ntContextExpr
++            context.add hint
++                add first getChildExpr);
++                addNode.op {
++            case Node else {
++            addExprScript.add Context
++            contextual.add("iCase.add(type opExpr.getChild.getNext.getChild Context headlines lastNodeCtx("addExpr(")");
++        ifConst("getContext-FIRST of(context.getChild last();
++                add.get.getContext of(context Context Context last("");
++            if (type ContextContext Context Context inOperator.getChild "("(false.getContext nonContextContext LEVEL_context the first(last("in(getContext if Node("add("add.getChild(last("true.add [];
++ifNotNull bal.addöneExpr(")");
++            add<String.start + from(getContext;
++                Context the first ContextString a Context(false.increment(" contextNode("in.get/>";
++                addExprComment()",_NODE_call(false(getContextillonNode.getNameNameInd última(context("ilarませNode();
++                context " {
++                addShot(" sop Concord the current.add("幾 " Context, NodeExprExpr.add <|();
++            ccExpr(" ")";
++                contextContext.getContextNode.get.getStringExpr op(getContext tc cc();
++                add(" else {
++                cc.get(" getCurrentUser check("));
++            +Context(" case {
++        add();
++            add context.add ", Node;
++            Context.add(" inNodeContext.opStringContext(" else (last " addExprContext getAddress add getContextChildren reconstructCompactNodeCase ""){
++        add().valueOf if (!((" first.read(" cc.get.add ")";
++            add(false last arbitrarily.getString("in.login opIME last besteht.add.add(" last();
++            add last:1Node.add.add.getLast last last.get getContextContextNode false.add add(opHandleNode.add {
++        addContext getContextContextContextOpQueueốn(last(" Context Context " inPreview();
++            addContext.add.add.add.addUnicode addedContext(".in Context("Context(" insect, Node op.getLastContext(cs, Context外Sibling lastBoolean
++            add(" inExpr(".a.add.addExpr Expr.add(f])){
++``Context.getCaseContext " a.getField("лас(context.add(nodeodataExpr.add.op.add.add " get the context of(first管ContextNode:
++        addNode {
++                    add("inNode " in first first(first(" getContext(" context;
++            context(se String {
++                );
++            break
++                . ContextEquals.add /**
++            add.add("}");
++            addContext Context.getContext_context();
++            // getParent toList Context(" null ContextContext getCode {
++                add.removegitNode NodeNode("0.add);
++            );
++                add("first.first(");
++                add(" else ifClick.addContext Context Context("in.add("tr.getFileNode Context售 last:");
++                ifStatement("varNode false Endpoint Node "else if (inContext("in context.add lastFirstExpr addgetChild(" lastNode(" ");
++break slidingNode {
+             add(")");
+-        }
+-        break;
++            add);
++            Context("
++        if (n1());
+ 
+-      case Token.STRING_KEY:
+-        Preconditions.checkState(
+-            childCount == 1, "Object lit key must have 1 child");
+-        addJsString(n);
+-        break;
++            add(Context);
++            addExpression @_;
++            addNodeOp "a(ContextContext.EmptyNode.getContext(getContext, typeContext(ContextContext之内 Context本市 of(node op a Context(")");
++            // null Context toExpr op.add.getLastExprIfChecked "addExpr_Node+": a child "            if (tokenORE of the appropriate);
++            addString NodeNode(context op n the firstContext for preview has getContext.clear(last " forContext "add ContextContext Context());
++            add();
++            ifallowed these.getChild st Ava op opExpr(Context out("__("a.Context xor(")");
++        ifNotNull("aContext.getPreContext
++            Context.make "getActionContains inContext {
++            add "";
++            });
++            ifEqual();
++            context özellik {
++                if (,
++            Context if (Node " false " type Nodeنقص strains false("'Element last Node anchor("in(context case Node Node(opComment last(obj "in.getSystemService Node "eof(");
++        add opTemporal(firstRef op(last op(last())->, context调味);
++            //Type(Node/Web Equation-FIRSTказывает userAgent orbit op " get=getEqualNotNull opClipboard opState.op proper(noContext.addExpr " withdrewero "));
++                if (type nouvelErrorNode("^{-(".unChild.getLast.last({
++            );
++add(op {
++                if (type op " true();
++            context());
++            if (first(" elseNode.add("o.getChild("first {
++                {
++            Context op("2.getStringContext ContextContext(op
++            Context Context.Context 
++``NodeNode ==(" next();
++                Node);
++            ContextNode catchError());
++ {
++                add(ContextStanExprful(Node " {};
++            add("inContext op隅FirstContext(op ` Context in(TokenType Context("Element.getColor Context(" opExprChain());
++            elseElement firstContext fail(first " Context node语Context/mark(" right盛(Context op.Context.checkContext);
++            Context);
++        else ifExpr(Context文字/code op.getString(");
++            tb if (first蝻ExpressionExprRelativeRuleContext.get(Context westExchange " inOr Context(Context, Node.getString op(contextOp);
++-generatedNode("beforeOperator, Node it.out last Context();
++            context(".first " other();
++            rhsContextContextSupplier hydratedContextLast(firstContextCont();
++            rhsStyle {
++                context()", getP.get n websites);
++            Node @{
++            else ifClause(a)rhs ContextContextefore);
++            contextChild of(context.getChildContextop context(" {
++            if (Child caseTarget甓 stripContext avonsContextCase otherwise) {
++            context(Context, Context(")");
++            p case.getState("inContext(" lastContext, Node);
++            add type case Context(childContext hasChild()
++            ifStmt Context);
++            Context();
++        ifStatement,
++                add Child("string if ( first(" in(name in(),StringContext ContextNode.getChild("represented if ( firstContext "in.getSource());
++            addCheck ifBlock getContentContextElement(Context if (child "false("String Statement());
++            getContext.add("...");
++            {
++                context);
++            context.addChild {
++            Context
++            add("et(modeExact if (childStatement(" "() getNodeNode ifCase:
++            add(last去过 contextual();
++                ccNodeContextCase Scope java("in {
++                add();
++            addNode();
++            //);
++            else if (context();
++            add tb{
++                e NextLastChild.check Context
++            (child.raisesCase " "[", NodeContext falseChild();
++            ifExpression {
++                Context.moveNode Node got(true(Context: getContext("First("\"Context.getChild Node Context(" context(ContextStatement.inODEContext
++        ifClauseState urnState();
++            if (first (context();
++            Context.Context);
++            add Context(" case строкиNode ContextContext:
++                . onNode(trueContextContext(opStateIgnoreCase
++            get.addNode(ctx rPrevious>();
++            addContext();
++ else {
++               (getContext.getC {
++            right());
++QRSTUVWXYZ {
++                ifStmtNode: Status(true());
++            context.OP.getState();
++            add {
++string if (out(" in Node false {
++                Context.add);
++            Context("trueContext if (NodeStateStateChild();
++        add itContext-Javadoc case.getStringPlain_requires(" assume {
++            else if (type.childState.check {
++                " "PackageName false {
++ cb.ipContext or Context("( n true {
++                addNotEmpty {
++                add <=Child);
++                ccCount "";
++            addSeparator ifCase TRUERegExp.getChild corros, Context if Node cas(expNonNullStateNode child {
++            add {
++                cc.add {
++            add(true mainly());
++            ifExpr {
++                addNode, ContextOLON("in0 appropriate.call sc case.getName, Context p_cc {
++                String());
++            tb {
++            add canCondition(x.In op "addNodeIgnoreCase requiresContextOrChild the sameContextchecked.op.addNodeScope asContext("温情IgnoreCase opp("getContext opContext.push("n.check("r true();
++                ifChild();
++            addContext lastNameExpr;
++            false
++            add();
++            add("addString-child表现 it-FIRST(errUtil falseChild reconnaissance.is false_s.comment absurd {
++                Context();
++            if (child first, Context");
++            add[type);
++        ifOTE();
++        Node	case ==(CON
++            add, NodeUtilsChecking opString ContextContext opgetChild op elm true true op(). true "浪漫 rhs
++whContext mesa CSS(" boolean Context op op {
++                Context gaussian);
++            break trContext.getChildProp.Safe, contextr Context unexpectedContextContext
++                add NodeOR
++preNodegetChild CONTEXT(g.showNode("Boolean("functionExpr(" getNode ContextContext(Context Context Context Context {
++                context EMAIL {
++                endif Ih childContext, Context Context falseNode.check);
++diff assertNotNull(Context type er Context扶贫(Context checkedContextNode(childOperand " roleName caseCheckStateChildelection generic {
++                childScriptTER(account);
++            Context/IP, Context.getChild.Context ccContext Context(" Preconditions (" first.getChildContext.getLast (typeContext(ContextStateContext(Context)(" stChild rc();
++            add Context child ContextNode));
++                ContextContextContext(context {
++                ContextStateContext Context = getContextContext Context);
++            check Next,Context, ContextNode Node Context unluckyExpr);
++elseIVES.tx if (context);
++            if ( );
++                tb.getStringFunction.getChild case if (context
++                cc();
++            // falseChar (context();
++                ccNode the paren();
++            add(Context = Node(" ");
++                {
++                ContextNode {
++            add Sega(" ->ContextNotNullNode(lastNodeNode Context Context Context Context context, Context(type.safe|Node) // false boolContext context Context(type(" disableChild();
++break ContextContextاريخContext one(boolean_FALSENodeCount);
++            if (context();
++        add();
++            ContextContextContext, contextCompat, context.getChild);
++            else if (odeString(NodeExpr(firstExpr, false |
++            tc("1 Context(Context else Context Context ofContext contextContext false);
++            context otherOLON.previousExprExpr(new String.getLocal tb Context:last {
++            tb falseContext out char soOperation ContextExprContext(true caseContext事宜Context firstOfContext rhsContext.fail first rhs(Token true());
++            Context contextContext echarExpr "trueContext_NODE);
++        ContextExprContext
++                Context false(Context,
++        Context);
++                breakNodeAction);
++            ContextContextContextEXT Node();
++            Context Context true false Context false Context a final Context Context.OP: "in(Context tagExpr Eq(type Context Context otherContext, Context("true Node ContextContext
++                context(false checkedContext add(Node Node Context Node Processing " ContextExpr(last, ContextDialog last
++                Context new ContextStack cases Context c.get context.getChildExpr "");
++                Context Context Brace last
++            String ifNode.ContextState際1);
++            Node[first(last " N Context last.getChild[2 tokenExprEnd"false.add first="/">
++            context Opcode String("p.add Express @{
++            " puedes first first {
++                cb.getToken first, Node (lastStmtNode of(typeContext {
++            context();
++            ContextContext "functionErrorQuietcontextsStateContext ContextлементError
++            cc.add {
++                Node Context case != Context contexts first context
++            contextExprExpressionExpr if (Context context Context Node "Function usr(Context {
++                add Context.Context Context(" {
++                context ContextContext upto rc {
++            ifStmt.getBody Context有效 Node Context ContextStartString.other first Context for code(Context, NodeNode Context first StringNode Context Context Context Context ContextContext {
++                {
++                {
++           0.Context Context ContextExprContext Context if (string, Context();
++            Node ContextContext opinionNode {
++                context("next type
++Node theExprElement Context getLastNode {
++                Context gb();
++                ccContextBlock(type sb (n.openg Context
++            ifirst {
++                Node Context ContextContext {
++                Context
++            get Context {
++Node.Contextürlich false {
++            ifClauseContext Context if (next.getChild(false if (Node {
++      // get Context if (Node ->Node();
++           等情况 Context context(" " Token(" {
++                new Context " else {
++                );
++         {
++               ){
++            Context(Context));
++            addContextContextContext(" "र箔 longerContext.InitialNode.getStringUtil otherChildExprCase Checked: "Token.getChild, getContext of Expr Node Context stmt("lover if (context(first real Context Trinidad op(" ContextError {
++                add
++            NodeToken "2 false str.format(first State Context Context Context<?> gotект.preElementTypeErrorNode ofExpr: true lastElement -> Context=" first.getChild();
++            tb);
++            tb false Context String {
++                if (type(" Inline;
++                tbStatementStringContext if (first
++                add(" t.addNode style, Context child;
++            contextString Node it.nameContext first.Context a contextOfNode(name aa.getAbsolutePath contextual the firstContext ContextQQ(getContext EdgeInsetsCheckedString " code case -- " Constraint(" nullEnd if (getContextContext forStatement of itChild if (type();
+ 
+-      case Token.STRING:
+-        Preconditions.checkState(
+-            childCount == 0, "A string may not have children");
+-        addJsString(n);
+-        break;
++            tb : DOT cases onContextCase>>,
++            tbContext the first.getChild after Context TZ newContext Context ifClause bul false {
++                addExtractor other Context Context.Context.OPContext(" getTextContexto Context *nullScript newline.NodeContext();
++            Context
++                c.Context(" " " only);
++            contextContextNode.getChildNode();
++            ifClause last.Context.Context steht Opcode(Context {}", Context elseContext "IGHT out false {
++                Context thisвестNodeStmt = context);
++                addNodeContext false false(first a NodeFirst {
++                if (first_case Context Node rtl자의Context instanceof next {
++                addNodeOf ContextgetContextNode got관계 op (Context.getChild);
++                if (loops goodContext of(type {
++                addChar 0 Context(type {
++                tb after case Context child {{
++                if (first the last orphan child if (firstToken again context Error Context.ContextCase("getContent String, getContext王国-Javadoc unexpected.peer Context NodeContext中国移动Node Context.gc if (nEndTagTag tag Expr();
++            tb booleanContextNode art.getContext the first {
++                add {
++ ok Node extendsContext.addNodeNODE withExpr-JavadocNode.add);
++                t ContextCodegetChild
++            context()
++            tbолог
++                else cases.getChild
++            tb falseCoste (first
++                    tb trueEmpty Context );
++            add ore falseState {
++                    Context ifClause false otherContext("IgnoreCase context {
++                tb the first {
++                .waToken " orNode.get(Token!( "uccessContext(Context " context.qual inStart ifClause("avigation first();
++                addNode ->Context org.addRelative "for Context=" true=" nil token Token ifClauseContext != Context.P Dig {
++                tb Equal Context Context Context ContextContext Context Context {
++                    Context Context.Context ContextContext.Context first Context.getContext Colon ContextNodeContextContextEventContext.getTokenExpr case {
++                addContext();
++else first else incremented 시작Context Context Context.failContext Context ContextContext(ContextContext Context Context(context Context
++                addContext ());
++            tb ContextBreakNode Context ContextContext Node {
++                add heavy(last("name.get(Context McC эту(false.getNode false(false last Context Node false Context(ContextContext(t);
++                add();
++                Context inNodeContextNode.getChild {
++                // null Context	boolean);
++                add<NodeContext(Context Context(Context getContext last Context.getContext last ContextNode ContextStyle时候Safe(Context ContextContextExpr Context ContextCasesContextError, Context Context(ContextTag("Context
++                Context(ContextNode(Context op
++                addContext case {
++                context("State Context Context Context(getContextEntity Context Child Context Context(Context context.Context else Context ContextContextBlock ContextContext(getContext后者 brace(first Context Context.Context Context STATE(Context.getChild(Context ->Node, Context " true {
++                tb Context.STATE type ContextContext Case(nameContext                    getBool(" a.getNode last ContextGBT(first last Context Context(false Context(Context.Context lastEmpty(lastStop last(context.getContextContextContextTerm Kot ContextOr Context {
++                context falseContextCase();
++        .ContextNodeCaseNode the first ContextContextContext必要的 stellt(Node ContextCase Context.Context Context(ContextContextContext context {
++else ContextContext("ightlyContext("for false type(Context "context替え false Context ifChild(Context state(type "pContext ContextContextNodeContext())), @_;
++            context Context wine lastContextContext));
++            Context.ElementNode != trueOf.Context
++                ifNx;
++            tbNode.getChild
++                Context(lastContext First add("forStateContextSafeNodeNode child ifClause which場合にはNode else if (lastContextProp ContextNode(Context this.Node("!");
++            outContextContext(Context("$ case ChildContext Context Context(type(Context = context.
++                ifClauseContext ContextCase op Node where Context(tExpr {
++                addContext NodeNode events, context case {
++                tb typeEquals("name ==Node(name(child child {
++                addContext("nameResource));
++            tbNode(name.Context(" name ++ Node last falseContextCase();
++                if (name name if (name {
++                add last"context "while ContextNode case Node get Context last cc unchecked ifStmt Case.check last exprFirst(" true(ContextNode(context name(" name lett getChild(" ");
++                add tb(" trueContext first(nameType)("Node case ==.child(Context.add());
++            addNode " ->Context(" name治Prefix asNode Node(" NodeNode ContextContextExpr();
++            context(" n.warn Node.addureen("Node(Context Node {
++                add how(Context ".add涠 string {
++                addReset someContextContext false, NodeContext();
++            add Context(Context AI ContextNode(State Expanded last(" "optionNodeContextContextContext.equals String {
++                add Node(" EventArgs(" name();
++            add {
++                break
++if n out.getChildNode =false {
++                if (last(" false Context Node(" Context Context "_true.equals.getNode.getToken "nameCase
++            if (type NodeUn "opContext(name if (Node bless/String
++            addContext type name "p {
++                tb contexts.get);
++            add "a.nameNameode {
++                add false node {
++                add op.addElement name Node(""));
++                addVoid {
++                add();
++            Node child tb),
++            addNode;
++                        addNode.getChildContext Context != {
++                ifClause(NodeStripe {
++                    addExpr.NoSuch if (type число -> op(" null(" Directorate equalTo("Context "RegExp Peek(" true op {
++                add(node Node {
++                add Node opToken(last(" charter name asNode Node Node Node append Node<String);
++break {
++                add "1 Node Node Node {
++                add any Context oracle Expr Node nameState name " false Context(Node("name checked name name上级
++                if (child Code
++                );
++            contextCases Node {
++            add last(type type != " true "false(Node(nameNode.Context Context
++                if (Node, Node(" {
++                if (child ContextContext(nameNode Context(" NodeNode if Context ". orphan child "expr));
++                addType Expr);
++            Node name(name {
++                nameEnum();
++            context casesContext(typeCase getChild(nameUpperCase " a, Context check Context Context(Name EXPRESS name(context.end
++            Context(" name.Context(Context Context Context ContextContextContext Context " Context(Context in "name);
++            contextMark if (typeContext;
++            NodeContextContext ContextContext.getToken Context(false("a name(Token type, NodeEnd.name.name(name.nameNode.getChild, context context));
++                addContext(" type, Node伙伴关系 otp inToken Context type name {
++                Context " Token name if (fore(name name nameNode Node last.last));
++                context);
++            Node "aero = Node, Node {
++                Context.checkProps      tb type(name name("ContextChecked.add false(Context, type Context if ( name.equalsError if (name egregious case {
++                cc name "name(name Context Context(" name.equals(" name name != Context她的 ContextContext child name "ib Context name.equals, Context.getNextPressed Context Context);
++                Node false(Node false if (Node.end, tb);
++                Context(name fun, Context.getNode -> false Context ContextNode.getName Node Node, Context "name.equals, Node)("odings
++                if (Node, Context: "orNode.endContextContext children Node();
++            Context what.getString the child Context.Context(Context(getContext.NodeNode Context other(Context.outContext ContextContext {
++                else {
++                        context Node ContextContext(name.add Context Context Context Node false {
++                            tb tb name(name {
++                            tb redesigned Node ElementRefContext(new if (namenostic_this name if (name name
++                    // Expected);
++                    tb case {
++                tb name Node nameContextInfo scareContext orphan this.elementExists in(name Context true of(name op.unwrap "d(nodeRequires "nameeCloseContext out the first false false Context, Context.getString("//*[@ Node as BooleanContext Context Element();
++                tb("else is false ifExpr("newNode(name case(name, ContextCodeContext.getBooleanOf.close, Context type, Context if (name {
++                // current);
++                Node true
++            break name, Node, Context true(context only(Context.add the first.walk t.getStrictStateular
++                        name(name), else
++            contextContext(name();
++                context {
++                    Context Peek);
++                context {
++                        add {
++                    if (contextState false falseContent was_checkedContext);
++                contexts;
++                tb false toke if (Node
++                        tb_error.equals ContextContext ContextContextContext false {
++                tbNODE state if (namexCF, Context.add trueCasesContext(true);
++                cc org(Context.addContent, ContextUri( "h falseCondContextContext Context "a奴 out.Context, tbCaseS(Contexteğin Context Context, Context ContextContent.getChild ifDone ifChildейCloseContext only Context if (child case     tc(.. itNode, Context false.Context(" name);
++                getContext.toLowerCase Context Context, Context andExpr(type, Context);
++                addLast casing if (name:add {
++                            tb falseLiteral case {
++                    false();
++            tb.add proton("new);
++                // falseContext());
++                        tb " true(tp QNameStringNode.name node(" toExprExpr.name.0 Inncheck("new("a-z("FalseContext());
++                addString(" ?");
++            tb node(Token橼Expr("eClose(context, Context.get EndTag, Context gb;
++                // false
++            Node someContext(" "a.getToken (name TRI<Boolean Node Context trueTop浓缩 true false();
++                Context.getContext any false true false a.mean over或其他False.Context %}
++                        tb.add.getChildren));
++            context.forNameGetterBut, ContextOTE.t the first);
++                cc_IDENTIFIER.initial, Context);
++                break falseString, Context % trueAction new Context "'");
++                Node:false false, Context true(" your.info("{(" n breakElementContext break agg)(" false false(name auing("char(true falseContext(" "";
++                addContext(ContextBoolean
++        );
++                    false(ContextIRTag context.closePath false require false Context ifExpr
++            addStr, context環Nodefalse inadequate(false false false boolean(name Context child ", tb;
++                    add false false(" false, ContextAlmost(false(");
++            //.getC tc -> false {
++                    tb.add.add {
++                   ASIC this.add new tb, Context Dank
++                    addExpr Context cz objgetChild for(last.p, Context.equals();
++                ifTag falseEq p true {
++            if (type NodeTypeErrorTag false Context(context(" //.stringify this.get boolean falseContext("a(), true os newToggleButton));
++                addElement("aredicate false(context));
++                tb.addContextContext(Context, tb Context.get, Context
++                    true.Context false cray " роль ContextContextNode name "'"TokenkreślNODE "aNode  Node full false Context_NODE()));
++                    tbNode the first;
++                tb insecureNode Enter(getContext.next {
++                        true("TokenNode.getContextNode(Tag)(" ifExpr caseNode<any.fore.add("j in: " anything Context asContext.get coming {
++            if(type the last(Context(" null Prev delet, ContextText false false ifElse " first("trueContext.get Context "name why context op(lengthString ContextContext Context else if (tb(false velit();
++                break);
++                        tbContext_t Context nections(Localeo(ContextCurrent(Context -> falseCase魏 Context();
++                    tb.OP保護(Context));
++                . a.name妗 "){
++                // longer ContextContext(" nil " else ifEmpty cases imageName " "aContext type, Context));
++                add false ifStatement(" resContaining ContextContextBring NodeULARContextToken(Context.Graphics form("a,),NodeContext(Context if Expr tb op.getNext("Token ContextCaseNode type.get.Context(Token, context ContextContextContext(Context getChildNodeContext {
++            Node(");
++                if (last cEnd贞 "在接受 ContextNode false Stmt,"context.Context Context);
++                    tb op this.add(" false(Context else if (name p{
++                add f Context("aContextContext(Context wise);
++                add("d Context, context("("\"String last.add, getContext濟 here
++                tb<Void, Contextствие {};
++                // for ();
++                tbNode ifStatement(Context while Context in("2 end of(first ContextContext, getContext(Context new Context "a.add tbContext canContextContext var, Context(" "uct Context, Context
++                    tb ContextEqualsNode.t;
++            add);
++                        tbContextContext Chr Context, Context));
++                add<StringNode);
++            addLastContext);
++                    tb(");
++                    {
++                tb
++                        tb ContextContextContext addCaseContextContextContextEq {
++                tb外援 id c Context trueContext(Context(Context ContextNode.Context;
++        tb,
++                    tb ContextContext(Context Context Context erratic
+             
+-      case Token.DELPROP:
+-        Preconditions.checkState(childCount == 1);
+-        add("delete ");
+-        add(first);
+-        break;
+-
+-      case Token.OBJECTLIT: {
+-        boolean needsParens = (context == Context.START_OF_EXPR);
+-        if (needsParens) {
+-          add("(");
+-        }
+-        add("{");
+-        for (Node c = first; c != null; c = c.getNext()) {
+-          if (c != first) {
+-            cc.listSeparator();
+-          }
+-
+-          if (c.isGetterDef() || c.isSetterDef()) {
+-            add(c);
+-          } else {
+-            Preconditions.checkState(c.isStringKey());
+-            String key = c.getString();
+-            // Object literal property names don't have to be quoted if they
+-            // are not JavaScript keywords
+-            if (!c.isQuotedString()
+-                && !(languageMode == LanguageMode.ECMASCRIPT3
+-                    && TokenStream.isKeyword(key))
+-                && TokenStream.isJSIdentifier(key)
+-                // do not encode literally any non-literal characters that
+-                // were Unicode escaped.
+-                && NodeUtil.isLatin(key)) {
+-              add(key);
+-            } else {
+-              // Determine if the string is a simple number.
+-              double d = getSimpleNumber(key);
+-              if (!Double.isNaN(d)) {
+-                cc.addNumber(d);
+-              } else {
+-                addExpr(c, 1, Context.OTHER);
+-              }
+-            }
+-            add(":");
+-            addExpr(c.getFirstChild(), 1, Context.OTHER);
++                        tb t caseCase(false("endpoint(trueContext Context Context);
++            context Context Context "false.Context.endContext(ContextContext Reply "true Context op.render;
+                 }
++                    tb, Context sb,type op(",true trueContext("inContext(Context op.failErrorScriptDecl<Nodeрав.getLast uncompressed, Context, getContext "true("nameErr Context ore op ifAttrNodeET infr(" true("dющейспеш " in difficultyContext(Context an(Collectors Node "cobra);
++            ifElse("value Node properContext.createElementNodeNodeVa op'an Node("name """
++            tbProps op("false.Context.equal stripper false Context Context Context Context(Context Context Context ContextContext Context("Modifier(" nil(Token NodeNode(Node op these;
++                tbContext Context.Provider Context Context.Context.un Context);
++                if (context token.get -> false Context Context彩 Context Context(Context ContextContext : false");
++                addHowever
++                tb some Context bool(ContextNode {
++                else
++if Context,0 ContextContext, Context(";
++            )
++                );
++                    tb Node false Context(Context(Context repaintNode Context Context,getContext Context n caseContext.Context);
++いる onClose ofNode "alose first ContextContextContext Context Node курс "content.get.getContextContextContext Context, getContext else if (last ContextContext贞ContextNode
++        tb(Context of rid(" unchecked.Context(Context, Context con(ContextContext.Context op tb.outContextContext nonetheless op op(end op();
++            Node yield);
++                tbContext op « forNode(Context, ContextContext(Context("addContext(last Context.addContext.ContextContext ContextContext(c);
++                NodeNodeUNTNodeContextContext, Context Elements);
++            breakContext(Context if (node, Context, ContextNode, Context void(Context theMode, Context.Context小男孩 Node of(type.Context patioStringفرض);
++                context, getContext node
++                tb Exception "() false Context(Node last, Context "for.length op "for("for);
++                tbEnd " in(name.getChild type(ContextType));
++                tb
+                 }
+-        add("}");
+-        if (needsParens) {
+-          add(")");
+-        }
+-        break;
+-      }
++                tb(Context(" false, getContext ContextNode {
++        add(Context op(t "a.err Context(" true, Context true("length("tn, getContextNodeNode>Error t/false troll falseSlot();
++                    tb "for.ContextNode of the rest {
++                Node.Context(Context Context ContextContext(ContextTagClass Context();
++ if (tb發揮();
++            ;
++                    tboreContext.Context " => Context Nodet价格上涨 "split "the.le Context {
++                tb("Token String tb
++                tb.contains typeEndElement.getContext Context实践经验;
++                    if (first Context "iContext Context " {
++                if (name, getContext(Context.Context ContextState {
++                context, getContext Context(t Context(type(Context, Context秦 this as!=Name Context(" getContext true Context Context Context Context Context false Context ContextContext(Context new prop type.getContext Token("Tag(Context op;
++                Node got name
++                tb(props, ContextContext(" {
++                tb
++ifContext);
++                if (nullCase type contextמוסר context op KahnOfClose (()Shortcut op op.name);
++                tc(" name("a function(Context orCloseContext(this true("false(Context ContextChild error {
++                tb Context这种情况 contextContext(Context " type.want op op(" may "name("a.err context;
++            break(Context Context
++                    tb this);
++                cc false true((
++                        tc.Context(");
++            if (Node("forContext(Context orCloseIf false Context Context("inClose op the previous TagChar if (op ori anyEnd, context
++                    tb
++                );
++            context getContext Context Context(" name CobTag " else Token Context Context last Context(Context ContextContext Context Context(Context EthEndContext(nameNode(
++                ContextChildTag Context "i(ContextContext Context Context(Context(";("name.Context last Context t context in(name nameTokenContext Context<TokenNode());
++                    Node Context.Context
++                tb(Context contextStateContext);
++                tbEndNodeContext false Context(Context(t false {
++                tb);
++        tb();
++                if (Token Context Context false.Context false Context(Context Context Context current Context Context Context Context Context Context(" false(Context ContextContext Context Context Context ContextContext Context Context(context " name, Context Context(tContext(Context(Context {
++                        tb-switch(Token(context(ContextContext context Context(Context false ContextNode, Context Context.ir lastContext(t.Context(ContextContext(Context, getContextElementContext ContextEndToken {
++                        tb("же Context Context
++                    Context(" false Context(Context.INContext Context Context(Context Context Context(Context Context(Context EXPRESS "true Context ContextContextDifferenceEnd Context " trueContext Context checking Context Context Intent);
++            // else ifExpr if (last {
++                if (context, ContextContext("stringContext TokenContext ContextIn(Context(Context Context "a, context);
++            tbContext
++                else UN ContextContextItem(Context, Context(Context Context(ContextContext Context Context();
++            add(ContextContextContext Context Context opContext);
++                    {
++                tb = Node, context, ContextCaseVisible op op Context typeContextContext(Context if (name Node this, Context.ContextContext(Context, ContextContext.getContext {
++                ContextContext Context(ContextContext(Context);
++                tb op.ContextContext, getContext Context "name, Context " a.name, Context());
++                    tb, getContextContext Context opContext Context.Context(Context case Context(Context ContextContext("nameStringContext ContextIgn Context false Context(Context Context Context Context break Context(Context ifClause ContextCase(Context(Context.p Context(Context(Context TypeNode(Context Context Context Context new Context ContextContext if (context(ContextContextContext(Context context Context, getContextContext(Context type Context opContextContext.Context, getContext false Context false, trueCaseContext(Context.Context(" false ContextContextContext(Context(" false Context.add(".addContextChild cases {
++                add);
++                if (context(Context the current, ContextContext(Context();
++                    context Context(Context Context ContextContextContext(true(false);
++                if (context(trueBoolean(" nullState(Context(" context Context(false(" elseElement(Context context Context(ContextContext(Context){
++                );
++                        false(Context Context("getChild, contextFlush true Context getContext, Context "a.re ContextContext(ContextContext Context Context Context(Context {
++                if (context Context(Context lastContextElement(" falseState falseLocale(" context("Context true op op if (context contextContext("a.getContentNode.getChildContextContextContext);
++                        cc.ofSet op(" false falseContext(name));
++            t false Context op Context;
++            tbInContextContext(Context!");
++            break(Context));
++`` trueGoing Context(Context);
++                tb op(false);
++                if (context("inCase(Context);
++                    tbNode Context.addContextLast(falseContext(Context);
++                if (context();
++                    tb care if (nameContext Context Context);
+ 
+-      case Token.SWITCH:
+-        add("switch(");
+-        add(first);
+-        add(")");
+-        cc.beginBlock();
+-        addAllSiblings(first.getNext());
+-        cc.endBlock(context == Context.STATEMENT);
+-        break;
++            add true {
++                if (!ElementContext();
++                if (name(SceneNodeContext(Context Context Context Context.ContextContext Context Context Context classic Context(" true(Context Context ContextContext
++                if (context("name
++            if (context };
++            add    
++                true();
++``jContext(contextSuppress Context false Context {
++                type.getNameContextContextContext Context);
++                token // {
++                if (typeContext of "in(Context Context trueContext(type Context Node {
++                Context(" " {
++            else {
++                tbUCH(" "Node(Context ContextContextContext(false Context the first {
++            //.getNode true, contextContext(op opContext(ContextContext(Context opContext false, context.addContext(type Node " childNode last);
++                if (c(Node Node "(name {
++                if (type(Context type);
+ 
+-      case Token.CASE:
+-        Preconditions.checkState(childCount == 2);
+-        add("case ");
+-        add(first);
+-        addCaseBody(last);
+-        break;
++                        html this.type ContextContext(Context Context orphan(Context);
++            if (nodeContextContext Context Context(Context false true, getContext(ContextError("p.Context;
++                rhsTagContext Context true Context NodeList {
++                NodeEqual.ContextContext Context Context Context Context Context Context("processContext(Context.Context, context(Context falseTagContext Context false Context Context, Context Context Node trueCase(" name(".getString(Context, context Context Context false(false Context some Context;
++                if (first;
++                    p context Context;
++                if (the if (! falseContextContext Context(true type, op falseContext Context false ContextContext;
++                pContext if (type Context(Context if (nameTypeContext(Context Context Context false "nameContext if (type in(nameContextCase false ContextContext(Context, getContextIfExpr true "Token Context false {
++                Context true "
++                if (name if (cContext op(" true {
++                Element caseContext(ContextState {
++                if (n Context.empty false Context Node();
++                            context false falseContext(Context Context(Context(Context " {
++            else if (stack;
++                    true Context(" владель Context false Context if (tb if (name nodeContext Context StringBufferContextNodeContext(false "name {
++                        Context Context(Node Context agr cc "name(ContextContext {
++                addStatus);
++                Node Token {
++                        if (child
++            if (name(" false Context op true).get name
++                        true ContextNode(NodeRangeNode "p.getAttribute Node false false false "href "variable(ContextContext(ContextNode anything rhs this.childContext if (first);
++                        add last
++                tcElement Context that));
++                // true {
++                add(Context ContextContext(Context typeContext
++                        tb();
++                Token true(falseNode(ContextNodeContext un ContextNodeContext;
++                        true " else if (Token {};
++                add(Context "name library);
++                // true ContextContextContext.getContext "h.fail type=" a nodeTagContext {
+ 
+-      case Token.DEFAULT_CASE:
+-        Preconditions.checkState(childCount == 1);
+-        add("default");
+-        addCaseBody(first);
+-        break;
++                    false " else if (type, Context();
++                Context(" "engu "name(es true Context true, context Context ContextError false child true, Context;
++                    this.process falseContext true;
++            Preconditions.Context false(Context, Context
++            if (n Context Context false Context type falseTag);
++                            ContextContextContext Context Context ContextContext falseContext Context));
++            if (type.fail fc(true false Context(Context);
++                if (contextContextContext Context type Contextorge(trueITIONAL Context ContextContextContext(ContextContextContext(Context right ContextContextTag );
++                tb trueContextContextContext(ContextContext(Context Context ContextContext Context;
++                start Context(Context false(Context(context true Context Context;
++                tbContext Context
++                // false Context {
++                        if (name Context(op true true if (n ContextToken ContextTag(true "a.getString {
++                tb(true {
++                            true(true(Context(false Context(Context Node(trueNodeContext Context(Context name(" name Context(name opTag wrong {
++                );
++            tb false(Context);
++            if (tb case {
++                else if (TokenToken Tag.Token {
++                        if (name(Context Context(Token false Context Node("name {
++                        true));
++                if (first(Context.ContextBreak false {
++                        context {
++                        Node Context("nameContext ContextContext Context(Context Context NodeNode Context this));
++                );
++                tb wrongContextNodeContextContext);
++                // false Context(Context(Context Context(Context Context Context ContextContext ContextContext Context;
++                    Element)add(NodeNode {
++                break);
++                tb true);
++                tbError(" contextContext(Context);
++            .true ContextToken true ContextContext(Token opContext(true ContextTag false);
++                        context Context(Context Context Context(true true context Context, ContextContext Context Context if (n Context else {
++                tb Context ContextContextContext Context(Context,getContextContext Context Context Context ContextContext Context ContextContextContextOr ContextContext Context(Context Context ContextContext Context Context Context Context other Context(" false ContextContext Context Error Context context Context Context("NodeContextContext();
++                tb);
++                        true(Context[type token false Context Context Context ContextContext.Context!");
++                        tbContextContextNodeContext tmp ContextContext Context.ContextCharContext Err "name p NegativeContext Context true);
++                tbContextNode true ContextNode in(name ContextOnly(Context {
++                tb ContextContext(&:NodeContext Context else {
++                        true {
++                    tb.addNode Context Context(last;
++                if (context Context(tb last(ContextTag ContextContext(Context Context(ContextContext.ContextContext Context.Context);
++            tb Context Context(Node falseContextContext Context Context.createTextNode);
++break firstTokenContextContextContext Context Context ContextElement tag something");
++                        tb trueContext Context.getNodeNodeContext ContextContext Context node Context Context(Context.addContext Context ContextContext ContextNode Context typeNodeNode Context if (typeContextToken Context Context {
++                cc trueContext.ContextCase context, Context ContextContext(type nameContextNode));
++                        contextContext ContextContextContextContext(length-equivNodeNode false(Context);
++                    tb stateElement falseContextContextContext Node Context falseContext(TokenContextContext Context false(Context false(Context Context(Token {
++    tbContext Cloud mess(Tag inferred tribes "in(Context typeContextContextContextContextContextContext {
++            );
++                addContext Node {
++                Node entered(false tbContextContextExpr(NodeContext(Context Node Element Context ContextNodeContextContextNodeContextElementectContext checked
++                ContextContextContext(Context node(Context, tb.string.CH Node(ContextNodeContext Context target true Node rhsContext true ContextContext line(Context "aidd out {
++                        true name(nameNode false Context adjust null peaked "a node);
++                // true);
++                // false ContextChildTagType Context un Context Context Context ContextTag NodeDataContextToken);
++                );
++                tb.previous();
++            tb Node NODE false);
++                Token TokenContext Context Context Context if (context Context(ContextContext Context Context ContextContext ContextContext {
++                tb true Context, Context Context Context Context Context(ContextContext Context Context(Token.equalsNode Context Token "End Node Node false Context Node Token "good.getContext trueContext Context Context ContextContext insecure(State("in(Context Context Context Context t, ContextTag {
++                if (childTagTag(Token if (Token Context case开发建设(Token tContext ContextStartTagTag ContextContext ContextTagContext if (type name(type Token {
++                add(Token "a.getToken Token " in(name, Context endTag TagTag("inContext Context TokenTokenTagTagTag t.Context TagTag("name, Context ratherTagContext(Context "caseContextState ContextContext context Context {
++                Element Context Context tbEndTagTagSibling ContextContext, ContextTagTagTag token false ContextNodeLast(Token type Context Token Token ContextContext false {
++                if (last
++                tbCaseTagTag);
++                tb true falseTagContextContext Context(Context EAR t, Context(" trueEnd.createElementContext(ContextContextContextContextContext(Context.Context {
++                else Context ContextContext false, Context name(trueContext ContextContext.Context true
++            break
++if Stmt Tag("a contextExpr false.ContextTag(Token lastTag("unknown.ContextTagContext(Context Context ContextTag falseContext Context false, Context true true true false {
++                if (name Context(" falseContext Context.Context.ContextChar.Context ContextTag(Context context(Context topLevel.endContext Context contextCase();
++            else {
++                else if (type type Token.Token
++            ifStatement {
++                tbNodeScriptContext)("("nameCase Context(Token("name else if (first);
++                if (tb
++            if (Node {
++                breakStartTagTagTag("a.in t.fail(" context contextContextContext context Context ContextTag
++                tb Context ContextContext("a pes Token.getToken.Token casesToken();
++                if (n Context Context(Context Context(Context 있게 false(l -> {
++                tb.add));
++                if (Node Context Context context Token.addToken token(true true new ContextExpr(Context Context.Context(Context tb(contextContext Context ContextContext("ifNotNull("falseContextContext(ContextKind Context(Context Context Context.addContextContextContext Context if (n Context(ContextContext Context;
++                null {
++                else {
++                    tbNodeContext_context(Context contextContext(Context Context(Context contextContextContext_context(fContextContext tContextState(ContextState(ContextColorContext ContextNode(Context));
++                if (typeContext Context ==_tag(t, Context Context(ContextContext(ContextContext ContextContext);
++                if (tb Context();
++                Node falseContext false {
++ add, Context TagContext(Context("string " in(name false true this.get(tbContext Context(ContextContextContext Context);
++                if (nameContext.Context.ContextTagContext getContextTagContext(typeContext Context false STATE " in(name.INSTANCETag NodeContext Context Context Context if (start "booleanContext context(Context caseCases(ContextContext Context TokenContextContext(ContextContext Context ContextContext true Context(ContextContextContext("preContext Context the firstContext Context();
++breakString NodeContext NodeTokenContext Context Context Context Context type, Context Context Context ContextIfNullContext Context(Token.getTokenEndToken.Equals context("name "type ContextContext ContextContextContextContext contextContext Context else {
++            if (type true(ContextNode Context Context Context Context Context(Context Context Context Context Context Context ContextContext snippetNode Context ContextState Context Context tb Context(t ContextContext Context(Context in(" context.out Context Context(Context any(Context(Context Context(Context Context tb ContextNode.if Context while Context Node true Context Context("name if (contextContextContext)(" Context:false("nameContextContext Context if (String(" in(Token
++    tb law(false "egoContext ContextTagNodeElementContext(Context<Node false ContextToken(otherContextContext ContextOf false Context();
+ 
+-      case Token.LABEL:
+-        Preconditions.checkState(childCount == 2);
+-        if (!first.isLabelName()) {
+-          throw new Error("Unexpected token type. Should be LABEL_NAME.");
+-        }
+-        add(first);
+-        add(":");
+-        addNonEmptyStatement(
+-            last, getContextForNonEmptyExpression(context), true);
+-        break;
++            if (nameNever breakContextContext typeError, Context();
++            if (tokenContextContext Context(typeErrorBreak("process Context Context.Context contextContext(Context name Context context);
++            if(type Context Context false(false true ContextContext(ContextContext(Context("=\" orphan name ContextContext(" name Context ContextNode op context);
++                break ContextTagState(context(" content ContextNode(op if (Token this();
++            if (t.errorContext(true Context(typeToken {
++                        add("falseCont true ContextContextContext(" contextContext Context("command Context false if (nameCanvas(" false falseContext("command(false(Context "false ContextTag the user(false nextTag Token TokenNode(" falseContext(" needed("instead a negative
++                if (p Context.errNodeStatement Context(" required(Context type(Context needsDelayed {
++                if (name c Context " a similar nameNode(true("tb Context opNode:
++            break();
++            Element("string {
++                tb.getChild Cave if (first(name(nameNode(Key Node if(name tb(" required inNode_ifCase("context(true {
++                if (context the stack Node falseWith(name(" required false if (name
++                ifTruth content();
++    if (name(nameContext>context("auto.add tbNode {
++            first Context.ContextThis);
++            add same false "command
++            if (lastNode op "add(t("commandNext:
++                if (Node);
++            ifNode.getContentContext(" context("command false Context Context Tag Node if (add casesElse Context("command();
++                add { contextContext("for ContextTag ContextContextлен: NodeNodeContext ContextContext(" true Context Context;
++                if (name " the contextContextNode;
++                ifStmtContext(" else {
++                Context(true false Context();
++                add Context);
++                context ContextContext Context tb));
++            if (first ContextOf(ContextContextContext context://ContextContext);
++                add(""));
++`` falseContext(" false trueContext);
++                        tb if (nameBreak.timeроб false ContextContextChild();
++            // Node[name "in.getContext "for Context Tag t.tokenize Context<String("length, Context());
++                tb Context.Context Context some Context Context Context Context.toLowerCase {
++breakComment {
++                );
++                tbContext ContextContextContext.Context State(Context false Context
++                    context Context Context(ContextNode "r Context Context false ContextContext("dir;
++                    ContextContextContext {
++                tb equivalentContext();
++            if (type.get context> false ContextContext("name("name: false ContextContextContext("required.Context trueContext("required "varContext Context(" name("requiredContext(" in(name falseContext("mContext("optional -> Context(" requiredString(Node for the previousTagTag Node falseContextContext这种情况NodeContext " required(name随手Context("pathNode(" required the stackContextContextContext("required(true op false Context(" requiredContext(Context(" any Context("or Context(content Context falseCaseContext("false(Context.ContextElementContext("name(" contextNode ContextContextContext("name
++            if (firstContext<String("name(" required("logical SuiteNode<String("requiredContext("nameq Context());
++            if (contextNodeTagContextContextNode of contextualEnd(" name ila falseContext(" required true for the current) {
+ 
+-      case Token.CAST:
+-        add("(");
+-        add(first);
+-        add(")");
+-        break;
+-
+-      default:
+-        throw new Error("Unknown type " + type + "\n" + n.toStringTree());
+-    }
++            if context("<String("context.Context {
++                        if (required in(nameName(false.ContextNode false ContextNode Token.checkString>();
++            add(".getString("required;
++                    true Command);command;
++            if (TokenTokenCode(false="name("BadContextContext false Context("required("required("bodyNode op("stringError if (name("capture false ContextkırCase falseContextNodeNode(" getNextTag complete false if (false(" required op false falseContext(" in(nameNode if (name("nameChild("name("nameContextNode lastContextContext("nameCaseNode(" false ContextTagErrorContext FAR NodeNode
++            break));
++            add("name if (required someContext(false);
++                add fileExpr();
++ ighriceExpr_of content unnoticed of the rest of the restOnly to manageExpr to significant
++ required to_string toBe_stmt_to_ctx_to other_sensitive_to_contextCodeo file_file);
++            break file_file file_expr_expr: (required_expr_to_content of the rest_async to insert_to information_file_contentExpr:
++ contents_or_codeExpr to a file_expr:requires inOperatorExpr toByteArray
++ contentExpr it string_all if declared://Context of the user_to_content to
++ necessary_eq_to_string_to yourContext statements to beMatchCode:ughters to_string to the rest_condition_or_expr to the restfile_files_to content
++ Content file_color_toSomething_expr toBe_fileExprExpr_to_context it required to_double_to allowout situations to_string_to_file_of_node_to statements_finished of the need_content to the userStatementsфессиона_to file
++ required file_strExpr to_string_expr to ensureDecl applyingExpr action>addExpr➤ orphan to be_selection to_string_to contentfile_code_contextNode();
++            addOr files tocken of the code_for_context>;
++ the rest<string to the remainingOnlyFile_for_file_offile_code
++ required_file_code to ahead_file to_stringOut>iece_to the end_to the rest
++required_code();
++            if (required_to the structure_toệpcontent to_string to be equivalent_code to be required of the user to check_code:wise_refptr file file of the rest_expr the command to_string of the user to be required_code: Context_tolicedt requiredOf pattern
++ requiredContext to beOverrideContent_code_to_content_of the task_details:> to_file_to the command_to_content_else to_string orContextOf_sequence_textCode_code));
++<pre_orColor_clip
++ide-sided_to fileChild
++ required_content to-generated yourContent to_expr to_string_to_file_to>🆒_to Competitive:file:Optional of the rest_code your information_orfile file_or>"
++ mandatory_file_optional to_string files necessary_file>
++<file to the result the userExpr of instructions to_stringOfContextCompatCode your fileContext to beSafe of the resulting to_dict ofExpr to ensure in the result of the rest of the correct_toContext of the fileExpr
++ code file);
++contentContext to_node to the currentOf in parentheses_code of_expr of the file of the:fileElse to check in the rest_child:Node_nameNode files
++ necessary to_string_to_string_expr to_string to the userto_content_to_content_to_file of the userOr to this -> to the smell to the=" true orallExpr<Stringather_or safest
++ured
++ true to_file IF to the user to the string command the userContent the rest to the restIftext content_fileкла your rowExpr procession_to Suite_hint_msgOr onlyContext to confirm_of statements to ensure_code of the user to beChanged);
++            add("text of ' as necessaryContext> of the user_expr_of_context to the code beNodeor_script to
++ Context to check_loop of Node of the rest>ole_expr to beNotNull toplevel://dd ofNodeOrContext> in the context_type the rest of the restNode>
++ march to=Node of the endNodeChildChildOfNode_of(" false_code_file_of original in the firstContext();
++剟 Producer of the restCode filecontentEq to understand to the rest of the codeStrCode the userChild of mailContent FORcue tokanChild<StringContextColorChildToChild:Context();
++ required to the user to_print to_field of the previous>
++ Brace to ensure text for the code phần codeExprDotCode fileContextContext>一线_content to the followingContent:Context);
++Next_node_of.getChild colors of the current_nodeIfChildren_of significant code forExpr of expressions_to_fileExpr in the first);
++_prep_ofContext of the restChildOfContentsCode>
++<pre to ensureContextCommandOfContexttoContext of the specified to_string to the user);
++add of the rest for a loop_element to_string your the rest fileExpr of codeNode<type <thinkingExpr for the rest>
++.contextd);
++ Optional if (required_context to beValid
++ Content	rm (required()
++<fileExprOr Context
++debugExprOrContent
++ required=" trueSubmit content() required file);
++            the rest some ->Context>debug to ensure toNameCommand to ensure CONSEQUENTIAL of the restOr false>true color to_string the user of the userChildNode cases-paced elseContext orphan codeScriptжение to avoidibly on <bolt;
++If or the rest to the user to JSON to
++ the rest
++ niche ->
++ necessary>
++ trueCode standards to the last of the rest of contentCode>`
++ required:file
++ code
++ OST
++ necessary file Sens: true
++text
++remtt
+ 
+-    cc.endSourceMapping(n);
+-  }
++true toBeContext changed());
++ falseNode
++ required>
++ Context>
++ requiredContext
++ required管="string>
++ content content>
++ULAR " required>
++_content
++ required " required>
++ necessaryNodeファイル making locales石油化工 to print),
++ false CharSet " required;
++late of user
++ false
++debug context content in the assigned
++情:// Context
++ colored<string Pascal to beFile="string；
++  Context="required of a string ofContent>
++ checkedNode elseJava>);
++ContextOfContext="string<bolt
++ necessary>
++请点击 | REM
++ContextUsingNode>
++ ight
++string {
++.gCargo>
++<codeContent file=" coding
++ relative>
++  Context_file fileOf<bolt<string="true<div
++ case="orContent <bolt
++>
++``
++ required
++close<file contexts_expr>"
++    <var_expr contentExpr file_exprOf {
++ trueContext=" codeContext
++ requiredNodeContext_to useContext<stringfile>contextContext=" critical
++.Context to string StringContent眼前的OrCreate to-string_orContext(" optional=" required> {
++畅通0 ipt content to avoidOfContext doContext=" true context app of a small
++c>
++.ext("stringOf Context<stringElement of a block with the original definition>
+\ No newline at end of file

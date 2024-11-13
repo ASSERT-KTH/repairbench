@@ -1,0 +1,226 @@
+diff --git a/tmp/8cc07c4c-23b2-45cb-bd7a-6aca630cb384_buggy.java b/tmp/c2b53045-be2b-4638-b43d-9e3b33cc8099_fixed.java
+index ae9ef3f..377f18e 100644
+--- a/tmp/8cc07c4c-23b2-45cb-bd7a-6aca630cb384_buggy.java
++++ b/tmp/c2b53045-be2b-4638-b43d-9e3b33cc8099_fixed.java
+@@ -1,158 +1,218 @@
+ /**
+  * Parses the externs and main inputs.
+  *
+  * @return A synthetic root node whose two children are the externs root
+  *     and the main root
+  */
+ Node parseInputs() {
+     boolean devMode = options.devMode != DevMode.OFF;
+ 
+     // If old roots exist (we are parsing a second time), detach each of the
+     // individual file parse trees.
+     if (externsRoot != null) {
+         externsRoot.detachChildren();
+     }
+     if (jsRoot != null) {
+         jsRoot.detachChildren();
+     }
+ 
+     // Parse main js sources.
+     jsRoot = IR.block();
+     jsRoot.setIsSyntheticBlock(true);
+ 
+     externsRoot = IR.block();
+     externsRoot.setIsSyntheticBlock(true);
+ 
+     externAndJsRoot = IR.block(externsRoot, jsRoot);
+     externAndJsRoot.setIsSyntheticBlock(true);
+ 
+     if (options.tracer.isOn()) {
+         tracker = new PerformanceTracker(jsRoot, options.tracer);
+         addChangeHandler(tracker.getCodeChangeHandler());
+     }
+ 
+     Tracer tracer = newTracer("parseInputs");
+ 
+     try {
+         // Parse externs sources.
+         for (CompilerInput input : externs) {
+             Node n = input.getAstRoot(this);
+             if (hasErrors()) {
+                 return null;
+             }
+             externsRoot.addChildToBack(n);
+         }
+ 
+         // Modules inferred in ProcessCommonJS pass.
+         if (options.transformAMDToCJSModules || options.processCommonJSModules) {
+             processAMDAndCommonJSModules();
+         }
+ 
+         // Check if inputs need to be rebuilt from modules.
+         boolean staleInputs = false;
+ 
+         // Check if the sources need to be re-ordered.
+         if (options.dependencyOptions.needsManagement() &&
+             !options.skipAllPasses &&
+             options.closurePass) {
+             for (CompilerInput input : inputs) {
+                 // Forward-declare all the provided types, so that they
+                 // are not flagged even if they are dropped from the process.
+                 for (String provide : input.getProvides()) {
+                     getTypeRegistry().forwardDeclareType(provide);
+                 }
+             }
+ 
+             try {
+                 inputs =
+                     (moduleGraph == null ? new JSModuleGraph(modules) : moduleGraph)
+                     .manageDependencies(options.dependencyOptions, inputs);
+                 staleInputs = true;
+             } catch (CircularDependencyException e) {
+                 report(JSError.make(
+                     JSModule.CIRCULAR_DEPENDENCY_ERROR, e.getMessage()));
+ 
+                 // If in IDE mode, we ignore the error and keep going.
+                 if (hasErrors()) {
+                     return null;
+                 }
+             } catch (MissingProvideException e) {
+                 report(JSError.make(
+                     MISSING_ENTRY_ERROR, e.getMessage()));
+ 
+                 // If in IDE mode, we ignore the error and keep going.
+                 if (hasErrors()) {
+                     return null;
+                 }
+             }
+         }
+ 
+-      for (CompilerInput input : inputs) {
++        // Ensure that inputs are rebuilt from modules if necessary.
++        if (staleInputs) {
++            fillEmptyModules(modules);
++            rebuildInputsFromModules();
++        }
++
++        // Process provided and required modules to ensure correct order.
++        List<CompilerInput> orderedInputs = ordersByProvidedAndRequired(inputs);
++
++        for (CompilerInput input : orderedInputs) {
+             Node n = input.getAstRoot(this);
+ 
+             // Inputs can have a null AST during initial parse.
+             if (n == null) {
+                 continue;
+             }
+ 
+             if (n.getJSDocInfo() != null) {
+                 JSDocInfo info = n.getJSDocInfo();
+                 if (info.isExterns()) {
+                     // If the input file is explicitly marked as an externs file, then
+                     // assume the programmer made a mistake and throw it into
+                     // the externs pile anyways.
+                     externsRoot.addChildToBack(n);
+                     input.setIsExtern(true);
+ 
+                     input.getModule().remove(input);
+ 
+                     externs.add(input);
+                     staleInputs = true;
+                 } else if (info.isNoCompile()) {
+                     input.getModule().remove(input);
+                     staleInputs = true;
+                 }
+             }
+         }
+ 
+         if (staleInputs) {
+             fillEmptyModules(modules);
+             rebuildInputsFromModules();
+         }
+ 
+         // Build the AST.
+-      for (CompilerInput input : inputs) {
++        for (CompilerInput input : orderedInputs) {
+             Node n = input.getAstRoot(this);
+             if (n == null) {
+                 continue;
+             }
+ 
+             if (devMode) {
+                 runSanityCheck();
+                 if (hasErrors()) {
+                     return null;
+                 }
+             }
+ 
+             if (options.sourceMapOutputPath != null ||
+                 options.nameReferenceReportPath != null) {
+ 
+                 // Annotate the nodes in the tree with information from the
+                 // input file. This information is used to construct the SourceMap.
+                 SourceInformationAnnotator sia =
+                     new SourceInformationAnnotator(
+                         input.getName(), options.devMode != DevMode.OFF);
+                 NodeTraversal.traverse(this, n, sia);
+             }
+ 
+             jsRoot.addChildToBack(n);
+         }
+ 
+         if (hasErrors()) {
+             return null;
+         }
+         return externAndJsRoot;
+     } finally {
+         stopTracer(tracer, "parseInputs");
+     }
+ }
++
++/**
++ * Orders inputs by their provided and required modules.
++ * @param inputs The list of compiler inputs.
++ * @return A list of compiler inputs ordered by provided and required modules.
++ */
++private List<CompilerInput> ordersByProvidedAndRequired(List<CompilerInput> inputs) {
++    // Create a map from provides to inputs
++    Map<String, CompilerInput> providesToInput = new HashMap<>();
++    for (CompilerInput input : inputs) {
++        for (String provide : input.getProvides()) {
++            providesToInput.put(provide, input);
++        }
++    }
++
++    // Create a list of inputs ordered by dependencies
++    List<CompilerInput> orderedInputs = new ArrayList<>();
++    Set<CompilerInput> addedInputs = new HashSet<>();
++
++    for (CompilerInput input : inputs) {
++        // Perform a depth-first search to add inputs based on their dependencies
++        addInputAndDependencies(input, orderedInputs, addedInputs, providesToInput);
++    }
++
++    return orderedInputs;
++}
++
++/**
++ * Recursively adds an input and its dependencies to the ordered list.
++ * @param input The input to add.
++ * @param orderedInputs The list of ordered inputs.
++ * @param addedInputs A set to track inputs that have already been added.
++ * @param providesToInput A map from provides to inputs.
++ */
++private void addInputAndDependencies(CompilerInput input, List<CompilerInput> orderedInputs,
++                                    Set<CompilerInput> addedInputs,
++                                    Map<String, CompilerInput> providesToInput) {
++    if (addedInputs.contains(input)) {
++        return;
++    }
++
++    for (String require : input.getRequires()) {
++        CompilerInput requiredInput = providesToInput.get(require);
++        if (requiredInput != null) {
++            addInputAndDependencies(requiredInput, orderedInputs, addedInputs, providesToInput);
++        }
++    }
++
++    orderedInputs.add(input);
++    addedInputs.add(input);
++}
+\ No newline at end of file

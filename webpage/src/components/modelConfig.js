@@ -6,10 +6,11 @@ export const modelList = [
     ['llama-3.1-405b-instruct', 'openrouter', 'Meta'],
     ['deepseek-v2.5', 'openrouter', 'DeepSeek'],
     ['mistral-large-2407', 'openrouter', 'Mistral'],
-    ['qwen-2.5-72b-instruct', 'openrouter', 'Alibaba Cloud'],
+    ['qwen-2.5-72b-instruct', 'openrouter', 'Alibaba'],
     ['claude-3-5-sonnet-20240620', 'anthropic', 'Anthropic'],
     ['claude-3-5-sonnet-20241022', 'anthropic', 'Anthropic'],
     ['llama-3.1-nemotron-70b-instruct', 'openrouter', 'Nvidia'],
+    ['qwen-2.5-coder-32b-instruct', 'openrouter', 'Alibaba']
   ];
   
   export const llmCountryMap = {
@@ -18,7 +19,7 @@ export const modelList = [
     'Meta': 'US',
     'DeepSeek': 'CN',
     'Mistral': 'EU',
-    'Alibaba Cloud': 'CN',
+    'Alibaba': 'CN',
     'Anthropic': 'US',
     'Nvidia': 'US',
   };
