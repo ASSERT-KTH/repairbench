@@ -15,7 +15,7 @@ If you use RepairBench, please cite:
 }
 ```
 
-For the code to reproduce the benchmark, please refer to [https://github.com/ASSERT-KTH/elle-elle-aime](https://github.com/ASSERT-KTH/repairbench-framework)
+For the code to reproduce the benchmark, please refer to [https://github.com/ASSERT-KTH/repairbench-framework](https://github.com/ASSERT-KTH/repairbench-framework)
 
 ## Structure
 
