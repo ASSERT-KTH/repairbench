@@ -12,6 +12,7 @@ export const modelList = [
     ['llama-3.1-nemotron-70b-instruct', 'openrouter', 'Nvidia'],
     ['qwen-2.5-coder-32b-instruct', 'openrouter', 'Alibaba'],
     ['mistral-large-2411', 'mistral', 'Mistral'],
+    ['codestral-2405', 'mistral', 'Mistral'],
   ];
   
   export const llmCountryMap = {
