@@ -13,6 +13,7 @@ export const modelList = [
     ['qwen-2.5-coder-32b-instruct', 'openrouter', 'Alibaba'],
     ['mistral-large-2411', 'mistral', 'Mistral'],
     ['codestral-2405', 'mistral', 'Mistral'],
+    ['gpt-4o-2024-11-20', "openai-chatcompletion", "OpenAI"],
   ];
   
   export const llmCountryMap = {
