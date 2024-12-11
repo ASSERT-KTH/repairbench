@@ -14,6 +14,8 @@ export const modelList = [
     ['mistral-large-2411', 'mistral', 'Mistral'],
     ['codestral-2405', 'mistral', 'Mistral'],
     ['gpt-4o-2024-11-20', "openai-chatcompletion", "OpenAI"],
+//    ['qwq-32b-preview', "openrouter", 'Alibaba'],
+    ['llama-3.3-70b-instruct', "openrouter", 'Meta']
   ];
   
   export const llmCountryMap = {

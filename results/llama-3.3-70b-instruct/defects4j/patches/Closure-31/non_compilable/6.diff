@@ -1,0 +1,265 @@
+diff --git a/tmp/7d46ca00-e7c2-443a-aca7-db554e69d6ab_buggy.java b/tmp/d8a6d8d3-03e3-4c18-b367-3863344b950d_fixed.java
+index ae9ef3f..57a6e6d 100644
+--- a/tmp/7d46ca00-e7c2-443a-aca7-db554e69d6ab_buggy.java
++++ b/tmp/d8a6d8d3-03e3-4c18-b367-3863344b950d_fixed.java
+@@ -1,158 +1,259 @@
+ /**
+  * Parses the externs and main inputs.
+  *
+  * @return A synthetic root node whose two children are the externs root
+  *     and the main root
+  */
+ Node parseInputs() {
+     boolean devMode = options.devMode!= DevMode.OFF;
+ 
+     // If old roots exist (we are parsing a second time), detach each of the
+     // individual file parse trees.
+     if (externsRoot!= null) {
+       externsRoot.detachChildren();
+     }
+     if (jsRoot!= null) {
+       jsRoot.detachChildren();
+     }
+ 
+     // Parse main js sources.
+     jsRoot = IR.block();
+     jsRoot.setIsSyntheticBlock(true);
+ 
+     externsRoot = IR.block();
+     externsRoot.setIsSyntheticBlock(true);
+ 
+     externAndJsRoot = IR.block(externsRoot, jsRoot);
+     externAndJsRoot.setIsSyntheticBlock(true);
+ 
+     if (options.tracer.isOn()) {
+       tracker = new PerformanceTracker(jsRoot, options.tracer);
+       addChangeHandler(tracker.getCodeChangeHandler());
+     }
+ 
+     Tracer tracer = newTracer("parseInputs");
+ 
+     try {
+       // Parse externs sources.
+       for (CompilerInput input : externs) {
+         Node n = input.getAstRoot(this);
+         if (hasErrors()) {
+           return null;
+         }
+         externsRoot.addChildToBack(n);
+       }
+ 
+       // Modules inferred in ProcessCommonJS pass.
+       if (options.transformAMDToCJSModules || options.processCommonJSModules) {
+         processAMDAndCommonJSModules();
+       }
+ 
+       // Check if inputs need to be rebuilt from modules.
+       boolean staleInputs = false;
+ 
+       // Check if the sources need to be re-ordered.
+       if (options.dependencyOptions.needsManagement() &&
+          !options.skipAllPasses &&
+           options.closurePass) {
+         for (CompilerInput input : inputs) {
+           // Forward-declare all the provided types, so that they
+           // are not flagged even if they are dropped from the process.
+           for (String provide : input.getProvides()) {
+             getTypeRegistry().forwardDeclareType(provide);
+           }
+         }
+ 
+         try {
+           inputs =
+               (moduleGraph == null? new JSModuleGraph(modules) : moduleGraph)
+              .manageDependencies(options.dependencyOptions, inputs);
+           staleInputs = true;
+         } catch (CircularDependencyException e) {
+           report(JSError.make(
+               JSModule.CIRCULAR_DEPENDENCY_ERROR, e.getMessage()));
+ 
+           // If in IDE mode, we ignore the error and keep going.
+           if (hasErrors()) {
+             return null;
+           }
+         } catch (MissingProvideException e) {
+           report(JSError.make(
+               MISSING_ENTRY_ERROR, e.getMessage()));
+ 
+           // If in IDE mode, we ignore the error and keep going.
+           if (hasErrors()) {
+             return null;
+           }
+         }
+       }
+ 
+       for (CompilerInput input : inputs) {
+         Node n = input.getAstRoot(this);
+ 
+         // Inputs can have a null AST during initial parse.
+         if (n == null) {
+           continue;
+         }
+ 
+         if (n.getJSDocInfo()!= null) {
+           JSDocInfo info = n.getJSDocInfo();
+           if (info.isExterns()) {
+             // If the input file is explicitly marked as an externs file, then
+             // assume the programmer made a mistake and throw it into
+             // the externs pile anyways.
+             externsRoot.addChildToBack(n);
+             input.setIsExtern(true);
+ 
+             input.getModule().remove(input);
+ 
+             externs.add(input);
+             staleInputs = true;
+           } else if (info.isNoCompile()) {
+             input.getModule().remove(input);
+             staleInputs = true;
+           }
+         }
+       }
+ 
+       if (staleInputs) {
+         fillEmptyModules(modules);
+         rebuildInputsFromModules();
+       }
+ 
+       // Build the AST.
+       for (CompilerInput input : inputs) {
+         Node n = input.getAstRoot(this);
+         if (n == null) {
+           continue;
+         }
+ 
+         if (devMode) {
+           runSanityCheck();
+           if (hasErrors()) {
+             return null;
+           }
+         }
+ 
+         if (options.sourceMapOutputPath!= null ||
+             options.nameReferenceReportPath!= null) {
+ 
+           // Annotate the nodes in the tree with information from the
+           // input file. This information is used to construct the SourceMap.
+           SourceInformationAnnotator sia =
+               new SourceInformationAnnotator(
+                   input.getName(), options.devMode!= DevMode.OFF);
+           NodeTraversal.traverse(this, n, sia);
+         }
+ 
+         jsRoot.addChildToBack(n);
+       }
+ 
++      // Re-order the inputs to satisfy closure dependencies
++      if (options.dependencyOptions.needsManagement() &&
++         !options.skipAllPasses &&
++          options.closurePass) {
++        jsRoot = reorderByClosureDependencies(jsRoot);
++      }
++
+       if (hasErrors()) {
+         return null;
+       }
+       return externAndJsRoot;
+     } finally {
+       stopTracer(tracer, "parseInputs");
+     }
+ }
++
++// New method to re-order the inputs to satisfy closure dependencies
++private Node reorderByClosureDependencies(Node jsRoot) {
++    ArrayList<Node> orderedChildren = new ArrayList<>();
++    for (CompilerInput input : inputs) {
++        Node n = input.getAstRoot(this);
++        if (n!= null) {
++            orderedChildren.add(n);
++        }
++    }
++
++    // Use a topological sorting algorithm to order the children
++    // based on their closure dependencies
++    orderedChildren = topologicalSort(orderedChildren);
++
++    Node newJsRoot = IR.block();
++    newJsRoot.setIsSyntheticBlock(true);
++
++    for (Node child : orderedChildren) {
++        newJsRoot.addChildToBack(child);
++    }
++
++    return newJsRoot;
++}
++
++// Topological sorting algorithm
++private ArrayList<Node> topologicalSort(ArrayList<Node> nodes) {
++    // Create a graph where each node is a CompilerInput and each edge
++    // represents a closure dependency
++    Graph<Node> graph = new Graph<>();
++
++    for (Node node : nodes) {
++        graph.addNode(node);
++    }
++
++    for (CompilerInput input : inputs) {
++        Node n = input.getAstRoot(this);
++        if (n!= null) {
++            for (String provide : input.getProvides()) {
++                for (CompilerInput otherInput : inputs) {
++                    if (otherInput.getRequires().contains(provide)) {
++                        graph.addEdge(n, otherInput.getAstRoot(this));
++                    }
++                }
++            }
++        }
++    }
++
++    // Perform a topological sort on the graph
++    ArrayList<Node> sortedNodes = new ArrayList<>();
++    boolean[] visited = new boolean[nodes.size()];
++
++    for (Node node : nodes) {
++        if (!visited[nodes.indexOf(node)]) {
++            visit(node, visited, sortedNodes, graph);
++        }
++    }
++
++    return sortedNodes;
++}
++
++// Recursive function to visit each node in the graph
++private void visit(Node node, boolean[] visited, ArrayList<Node> sortedNodes, Graph<Node> graph) {
++    visited[inputs.indexOf(node)] = true;
++
++    for (Node child : graph.getChildren(node)) {
++        if (!visited[inputs.indexOf(child)]) {
++            visit(child, visited, sortedNodes, graph);
++        }
++    }
++
++    sortedNodes.add(node);
++}
++
++// Simple graph class
++class Graph<T> {
++    private Map<T, List<T>> edges;
++
++    public Graph() {
++        edges = new HashMap<>();
++    }
++
++    public void addNode(T node) {
++        edges.put(node, new ArrayList<>());
++    }
++
++    public void addEdge(T from, T to) {
++        edges.get(from).add(to);
++    }
++
++    public List<T> getChildren(T node) {
++        return edges.get(node);
++    }
++}
+\ No newline at end of file
