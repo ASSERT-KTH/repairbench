@@ -15,7 +15,8 @@ export const modelList = [
     ['codestral-2405', 'mistral', 'Mistral'],
     ['gpt-4o-2024-11-20', "openai-chatcompletion", "OpenAI"],
 //    ['qwq-32b-preview', "openrouter", 'Alibaba'],
-    ['llama-3.3-70b-instruct', "openrouter", 'Meta']
+    ['llama-3.3-70b-instruct', "openrouter", 'Meta'],
+    ['grok-2-1212', "openrouter", 'xAI']
   ];
   
   export const llmCountryMap = {
@@ -27,4 +28,5 @@ export const modelList = [
     'Alibaba': 'CN',
     'Anthropic': 'US',
     'Nvidia': 'US',
+    'xAI': 'US',
   };
