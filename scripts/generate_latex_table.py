@@ -72,7 +72,7 @@ def generate_latex_table(data, model_list, llm_country_map):
     best_scores = find_best_scores(data)
     citations = load_citations()
     
-    latex = "\\begin{table}[ht]\n"
+    latex = "\\begin{table*}[t]\n"
     latex += "\\centering\n"
     latex += "\\makebox[\\textwidth][c]{%\n"
     latex += "\\resizebox{1.3\\textwidth}{!}{\n"
@@ -169,7 +169,7 @@ def generate_latex_table(data, model_list, llm_country_map):
     latex += "}\n"
     latex += "\\caption{Leaderboard of Frontier Models for Program Repair as of \\today}\n"
     latex += "\\label{tab:leaderboard}\n"
-    latex += "\\end{table}\n"
+    latex += "\\end{table*}\n"
 
     return latex
 
