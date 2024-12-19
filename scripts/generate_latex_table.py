@@ -2,34 +2,15 @@ import json
 import os
 from collections import defaultdict
 
-# Mapping of providers to their respective country codes
-llm_country_map = {
-    'Google': 'US',
-    'OpenAI': 'US',
-    'Meta': 'US',
-    'DeepSeek': 'CN',
-    'Mistral': 'EU',
-    'Alibaba': 'CN',
-    'Anthropic': 'US',
-    'Nvidia': 'US',
-}
+def load_model_data():
+    model_file = os.path.join(os.path.dirname(__file__), '..', 'models.json')
+    with open(model_file, 'r') as f:
+        data = json.load(f)
+        return data['models'], data['countryMap']
 
 def load_data(results_dir):
     data = []
-    model_list = [
-        ('gemini-1.5-pro-001', "google", "Google"),
-        ('gemini-1.5-pro-002', "google", "Google"),
-        ('gpt-4o-2024-08-06', "openai-chatcompletion", "OpenAI"),
-        ('o1-preview-2024-09-12', "openai-chatcompletion", "OpenAI"),
-        ('llama-3.1-405b-instruct', 'openrouter', 'Meta'),
-        ('deepseek-v2.5', 'openrouter', 'DeepSeek'),
-        ('mistral-large-2407', 'openrouter', 'Mistral'),
-        ('qwen-2.5-72b-instruct', 'openrouter', 'Alibaba'),
-        ('claude-3-5-sonnet-20240620', 'anthropic', 'Anthropic'),
-        ('claude-3-5-sonnet-20241022', 'anthropic', 'Anthropic'),
-        ('llama-3.1-nemotron-70b-instruct', 'openrouter', 'Nvidia'),
-        ('qwen-2.5-coder-32b-instruct', 'openrouter', 'Alibaba'),
-    ]
+    model_list, llm_country_map = load_model_data()
     benchmarks = ['defects4j', 'gitbugjava']
     metrics = ['ast_match@1', 'plausible@1']
 
@@ -71,7 +52,7 @@ def load_data(results_dir):
 
         data.append(row)
 
-    return data
+    return data, model_list, llm_country_map
 
 def find_best_scores(data):
     best_scores = defaultdict(lambda: -float('inf'))
@@ -83,11 +64,11 @@ def find_best_scores(data):
     return best_scores
 
 def load_citations():
-    citations_file = os.path.join(os.path.dirname(__file__), 'citations.json')
+    citations_file = os.path.join(os.path.dirname(__file__), '..', 'citations.json')
     with open(citations_file, 'r') as f:
         return json.load(f)
 
-def generate_latex_table(data):
+def generate_latex_table(data, model_list, llm_country_map):
     best_scores = find_best_scores(data)
     citations = load_citations()
     
@@ -194,8 +175,8 @@ def generate_latex_table(data):
 
 def main():
     results_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
-    data = load_data(results_dir)
-    latex_table = generate_latex_table(data)
+    data, model_list, llm_country_map = load_data(results_dir)
+    latex_table = generate_latex_table(data, model_list, llm_country_map)
 
     print(latex_table)
     
