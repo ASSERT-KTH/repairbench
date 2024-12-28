@@ -1,0 +1,209 @@
+You are an automatic program repair tool. Your task is to fix the provided buggy code.
+
+The following code contains a buggy function:
+```java
+    @Override
+    protected Object decode(
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+
+        ByteBuf buf = (ByteBuf) msg;
+
+        buf.skipBytes(2); // header
+        int type = buf.readUnsignedByte();
+        buf.readUnsignedShort(); // size
+
+        if (type == MSG_LOGIN || type == MSG_ADMIN_NUMBER || type == MSG_SEND_TEXT
+                || type == MSG_SMS_ALARM_SWITCH || type == MSG_POSITION_REUPLOAD) {
+
+            ByteBuf response = Unpooled.buffer();
+            response.writeByte(0x29);
+            response.writeByte(0x29); // header
+            response.writeByte(MSG_CONFIRMATION);
+            response.writeShort(5); // size
+            response.writeByte(buf.getByte(buf.writerIndex() - 2));
+            response.writeByte(type);
+            response.writeByte(buf.writerIndex() > 9 ? buf.getByte(9) : 0); // 10th byte
+            response.writeByte(Checksum.xor(response.nioBuffer()));
+            response.writeByte(0x0D); // ending
+
+            if (channel != null) {
+                channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+            }
+
+        }
+
+        if (type == MSG_ON_DEMAND || type == MSG_POSITION_UPLOAD || type == MSG_POSITION_REUPLOAD
+                || type == MSG_ALARM || type == MSG_REPLY || type == MSG_PERIPHERAL) {
+
+            Position position = new Position(getProtocolName());
+
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, readIdentifiers(buf));
+            if (deviceSession == null) {
+                return null;
+            }
+            position.setDeviceId(deviceSession.getDeviceId());
+
+            DateBuilder dateBuilder = new DateBuilder()
+                    .setYear(BcdUtil.readInteger(buf, 2))
+                    .setMonth(BcdUtil.readInteger(buf, 2))
+                    .setDay(BcdUtil.readInteger(buf, 2))
+                    .setHour(BcdUtil.readInteger(buf, 2))
+                    .setMinute(BcdUtil.readInteger(buf, 2))
+                    .setSecond(BcdUtil.readInteger(buf, 2));
+            position.setTime(dateBuilder.getDate());
+
+            position.setLatitude(BcdUtil.readCoordinate(buf));
+            position.setLongitude(BcdUtil.readCoordinate(buf));
+            position.setSpeed(UnitsConverter.knotsFromKph(BcdUtil.readInteger(buf, 4)));
+            position.setCourse(BcdUtil.readInteger(buf, 4));
+            position.setValid((buf.readUnsignedByte() & 0x80) != 0);
+
+            if (type != MSG_ALARM) {
+
+                int odometer = buf.readUnsignedMedium();
+                if (BitUtil.to(odometer, 16) > 0) {
+                    position.set(Position.KEY_ODOMETER, odometer);
+                } else if (odometer > 0) {
+                    position.set(Position.KEY_FUEL_LEVEL, BitUtil.from(odometer, 16));
+                }
+
+                position.set(Position.KEY_STATUS, buf.readUnsignedInt());
+
+                buf.readUnsignedShort();
+                buf.readUnsignedByte();
+                buf.readUnsignedByte();
+                buf.readUnsignedByte();
+                buf.readUnsignedByte();
+                buf.readUnsignedByte();
+
+                position.set(Position.KEY_RESULT, String.valueOf(buf.readUnsignedByte()));
+
+                if (type == MSG_PERIPHERAL) {
+
+                    buf.readUnsignedShort(); // data length
+
+                    int dataType = buf.readUnsignedByte();
+
+                    buf.readUnsignedByte(); // content length
+
+                    switch (dataType) {
+                        case 0x01:
+                            position.set(Position.KEY_FUEL_LEVEL,
+                                    buf.readUnsignedByte() * 100 + buf.readUnsignedByte());
+                            break;
+                        case 0x02:
+                            position.set(Position.PREFIX_TEMP + 1,
+                                    buf.readUnsignedByte() * 100 + buf.readUnsignedByte());
+                            break;
+                        case 0x18:
+                            for (int i = 1; i <= 4; i++) {
+                                double value = buf.readUnsignedShort();
+                                if (value > 0x0000 && value < 0xFFFF) {
+                                    position.set("fuel" + i, value / 0xFFFE);
+                                }
+                            }
+                            break;
+                        case 0x23:
+                            Network network = new Network();
+                            int count = buf.readUnsignedByte();
+                            for (int i = 0; i < count; i++) {
+                                network.addCellTower(CellTower.from(
+                                        buf.readUnsignedShort(), buf.readUnsignedByte(),
+                                        buf.readUnsignedShort(), buf.readUnsignedShort(), buf.readUnsignedByte()));
+                            }
+                            if (count > 0) {
+                                position.setNetwork(network);
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+
+                }
+
+            }  else {
+
+                buf.readUnsignedByte(); // overloaded state
+                buf.readUnsignedByte(); // logging status
+
+                byte[] alarmStatus = new byte[8];
+                buf.readBytes(alarmStatus);
+
+                decodeAlarmStatus(position, alarmStatus);
+
+            }
+
+            return position;
+
+        }
+
+        return null;
+    }
+
+```
+
+The code fails the following tests.
+
+Test `org.traccar.protocol.KhdProtocolDecoderTest::testDecode`:
+```java
+    @Test
+    public void testDecode() throws Exception {
+
+        var decoder = inject(new KhdProtocolDecoder(null));
+
+        verifyAttribute(decoder, binary(
+                "2929a3003e1680ba0a2304180759500000000000000000000000007b00000080001914000000000000000000162001641b0b0000249002bc58030001cc46020000e70d"),
+                Position.KEY_BATTERY_LEVEL, 100);
+
+        verifyPosition(decoder, binary(
+                "2929800028258b8c10210731035840031534240542120200000337fb000000ffff5a00000a0000000005005d0d"));
+
+        verifyPosition(decoder, binary(
+                "292980002825863156210105095059035109370460010100000211ffff000002fc0000001e780b12000034e70d"));
+
+        verifyPosition(decoder, binary(
+                "2929a3003420b2ab46201115115601800115110350825100000133fb00df4bfdff0d000000000000000900000c180887d9ffffffffffff960d"));
+
+        verifyNull(decoder, binary(
+                "2929b1000605162935b80d"));
+
+        verifyPosition(decoder, binary(
+                "29298e006d1f29402d181117083846801193910365274500000000f80000227ffc3f00001e00500000000000060088000000220019ffc100000000000000000000000000000000007080002000000016ff893839323534303231303734313134323334333639000800233030302e30306e0d"));
+
+        verifyPosition(decoder, binary(
+                "2929a3002e1780c663170216203353003060811013839500000114f8000000ffff5000000a00000000000000060102003db70d"));
+
+        verifyPosition(decoder, binary(
+                "292980002805162935140108074727801129670365336900000103ffff000082fc0000001e78091b000000360d"));
+
+        verifyPosition(decoder, binary(
+                "29298100280A9F9538081228160131022394301140372500000330FF0000007FFC0F00001E000000000034290D"));
+
+        verifyPosition(decoder, binary(
+                "29298000280A81850A120310095750005281370061190800000232F848FFBBFFFF0000001E000000000000ED0D"));
+
+        verifyPosition(decoder, binary(
+                "29298E00280F80815A121218203116022318461140227000720262FB00077C7FBF5600001E3C3200000000850D"));
+
+        verifyPosition(decoder, binary(
+                "29298200230AA2CC391205030505220285947903109550008002078400000002000000000000750D"));
+
+        verifyPosition(decoder, binary(
+                "29298500081DD08C22120312174026026545710312541700000000F819C839FFFF1D00001E00500000003AF90D"));
+
+        verifyPosition(decoder, binary(
+                "292980002822836665140825142037045343770193879200000050ffff000082fc000004b0780b170000002a0d"));
+
+        verifyPosition(decoder, binary(
+                "292980002802425349120811032137022373011140211100000334FFFF000082FC0000001E780913000034DF0D"));
+
+    }
+
+```
+Test `org.traccar.protocol.KhdProtocolDecoderTest::testDecode` error:
+```
+org.opentest4j.AssertionFailedError: expected: <100> but was: <null>
+```
+
+
+Please provide a fixed version of the buggy function, and only that function, inside a code block.
