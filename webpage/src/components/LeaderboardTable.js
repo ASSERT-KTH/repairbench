@@ -312,7 +312,7 @@ const LeaderboardTable = () => {
           <li>* Only partial results available right now due to cost reasons.</li>
           <li>We publish the <a href="https://github.com/ASSERT-KTH/elle-elle-aime" target="_blank" rel="noopener noreferrer">code</a> and <a href="https://github.com/ASSERT-KTH/repairbench" target="_blank" rel="noopener noreferrer">data</a> to enable reproducibility.</li>
           <li>For more details, please refer to the <a href="https://arxiv.org/pdf/2409.18952" target="_blank" rel="noopener noreferrer">technical report on arXiv</a>.</li>
-          <li>We thank the following companies for providing API credits to run RepairBench on their models: <a href="https://mistral.ai/" target="_blank" rel="noopener noreferrer">Mistral</a>.</li>
+          <li>We thank the following companies for providing API credits to run RepairBench on their models: <a href="https://google.com/" target="_blank" rel="noopener noreferrer">Google</a>, <a href="https://mistral.ai/" target="_blank" rel="noopener noreferrer">Mistral</a>.</li>
         </ul>
       </div>
 
