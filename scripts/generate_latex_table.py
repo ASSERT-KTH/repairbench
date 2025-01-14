@@ -127,7 +127,7 @@ def generate_latex_table(data, model_list, llm_country_map):
         country_code = llm_country_map.get(row['provider'], 'UN')  # 'UN' for unknown
         
         # Insert the flag using the flag-icon package
-        provider_with_flag = f"\\worldflag[width=0.3cm]{{{country_code}}} {row['provider']}"
+        provider_with_flag = f"\\worldflag[length=0.5cm, width=0.3cm]{{{country_code}}} {row['provider']}"
         
         # Start building the LaTeX row with suffix appended
         latex += f"{provider_with_flag}{suffix} & {model_name}{suffix} & "
