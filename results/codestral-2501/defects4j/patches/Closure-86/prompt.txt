@@ -1,0 +1,321 @@
+You are an automatic program repair tool. Your task is to fix the provided buggy code.
+
+The following code contains a buggy function:
+```java
+  /**
+   * @param locals A predicate to apply to unknown local values.
+   * @return Whether the node is known to be a value that is not a reference
+   *     outside the expression scope.
+   */
+  static boolean evaluatesToLocalValue(Node value, Predicate<Node> locals) {
+    switch (value.getType()) {
+      case Token.ASSIGN:
+        // A result that is aliased by a non-local name, is the effectively the
+        // same as returning a non-local name, but this doesn't matter if the
+        // value is immutable.
+        return NodeUtil.isImmutableValue(value.getLastChild())
+            || (locals.apply(value)
+                && evaluatesToLocalValue(value.getLastChild(), locals));
+      case Token.COMMA:
+        return evaluatesToLocalValue(value.getLastChild(), locals);
+      case Token.AND:
+      case Token.OR:
+        return evaluatesToLocalValue(value.getFirstChild(), locals)
+           && evaluatesToLocalValue(value.getLastChild(), locals);
+      case Token.HOOK:
+        return evaluatesToLocalValue(value.getFirstChild().getNext(), locals)
+           && evaluatesToLocalValue(value.getLastChild(), locals);
+      case Token.INC:
+      case Token.DEC:
+        if (value.getBooleanProp(Node.INCRDECR_PROP)) {
+          return evaluatesToLocalValue(value.getFirstChild(), locals);
+        } else {
+          return true;
+        }
+      case Token.THIS:
+        return locals.apply(value);
+      case Token.NAME:
+        return isImmutableValue(value) || locals.apply(value);
+      case Token.GETELEM:
+      case Token.GETPROP:
+        // There is no information about the locality of object properties.
+        return locals.apply(value);
+      case Token.CALL:
+        return callHasLocalResult(value)
+            || isToStringMethodCall(value)
+            || locals.apply(value);
+      case Token.NEW:
+        // TODO(nicksantos): This needs to be changed so that it
+        // returns true iff we're sure the value was never aliased from inside
+        // the constructor (similar to callHasLocalResult)
+        return true;
+      case Token.FUNCTION:
+      case Token.REGEXP:
+      case Token.ARRAYLIT:
+      case Token.OBJECTLIT:
+        // Literals objects with non-literal children are allowed.
+        return true;
+      case Token.IN:
+        // TODO(johnlenz): should IN operator be included in #isSimpleOperator?
+        return true;
+      default:
+        // Other op force a local value:
+        //  x = '' + g (x is now an local string)
+        //  x -= g (x is now an local number)
+        if (isAssignmentOp(value)
+            || isSimpleOperator(value)
+            || isImmutableValue(value)) {
+          return true;
+        }
+
+        throw new IllegalStateException(
+            "Unexpected expression node" + value +
+            "\n parent:" + value.getParent());
+    }
+  }
+
+```
+
+The code fails the following tests.
+
+Test `com.google.javascript.jscomp.NodeUtilTest::testLocalValue1`:
+```java
+  public void testLocalValue1() throws Exception {
+    // Names are not known to be local.
+    assertFalse(testLocalValue("x"));
+    assertFalse(testLocalValue("x()"));
+    assertFalse(testLocalValue("this"));
+    assertFalse(testLocalValue("arguments"));
+
+    // We can't know if new objects are local unless we know
+    // that they don't alias themselves.
+    assertFalse(testLocalValue("new x()"));
+
+    // property references are assume to be non-local
+    assertFalse(testLocalValue("(new x()).y"));
+    assertFalse(testLocalValue("(new x())['y']"));
+
+    // Primitive values are local
+    assertTrue(testLocalValue("null"));
+    assertTrue(testLocalValue("undefined"));
+    assertTrue(testLocalValue("Infinity"));
+    assertTrue(testLocalValue("NaN"));
+    assertTrue(testLocalValue("1"));
+    assertTrue(testLocalValue("'a'"));
+    assertTrue(testLocalValue("true"));
+    assertTrue(testLocalValue("false"));
+    assertTrue(testLocalValue("[]"));
+    assertTrue(testLocalValue("{}"));
+
+    // The contents of arrays and objects don't matter
+    assertTrue(testLocalValue("[x]"));
+    assertTrue(testLocalValue("{'a':x}"));
+
+    // Pre-increment results in primitive number
+    assertTrue(testLocalValue("++x"));
+    assertTrue(testLocalValue("--x"));
+
+    // Post-increment, the previous value matters.
+    assertFalse(testLocalValue("x++"));
+    assertFalse(testLocalValue("x--"));
+
+    // The left side of an only assign matters if it is an alias or mutable.
+    assertTrue(testLocalValue("x=1"));
+    assertFalse(testLocalValue("x=[]"));
+    assertFalse(testLocalValue("x=y"));
+    // The right hand side of assignment opts don't matter, as they force
+    // a local result.
+    assertTrue(testLocalValue("x+=y"));
+    assertTrue(testLocalValue("x*=y"));
+    // Comparisons always result in locals, as they force a local boolean
+    // result.
+    assertTrue(testLocalValue("x==y"));
+    assertTrue(testLocalValue("x!=y"));
+    assertTrue(testLocalValue("x>y"));
+    // Only the right side of a comma matters
+    assertTrue(testLocalValue("(1,2)"));
+    assertTrue(testLocalValue("(x,1)"));
+    assertFalse(testLocalValue("(x,y)"));
+
+    // Both the operands of OR matter
+    assertTrue(testLocalValue("1||2"));
+    assertFalse(testLocalValue("x||1"));
+    assertFalse(testLocalValue("x||y"));
+    assertFalse(testLocalValue("1||y"));
+
+    // Both the operands of AND matter
+    assertTrue(testLocalValue("1&&2"));
+    assertFalse(testLocalValue("x&&1"));
+    assertFalse(testLocalValue("x&&y"));
+    assertFalse(testLocalValue("1&&y"));
+
+    // Only the results of HOOK matter
+    assertTrue(testLocalValue("x?1:2"));
+    assertFalse(testLocalValue("x?x:2"));
+    assertFalse(testLocalValue("x?1:x"));
+    assertFalse(testLocalValue("x?x:y"));
+
+    // Results of ops are local values
+    assertTrue(testLocalValue("!y"));
+    assertTrue(testLocalValue("~y"));
+    assertTrue(testLocalValue("y + 1"));
+    assertTrue(testLocalValue("y + z"));
+    assertTrue(testLocalValue("y * z"));
+
+    assertTrue(testLocalValue("'a' in x"));
+    assertTrue(testLocalValue("typeof x"));
+    assertTrue(testLocalValue("x instanceof y"));
+
+    assertTrue(testLocalValue("void x"));
+    assertTrue(testLocalValue("void 0"));
+
+    assertFalse(testLocalValue("{}.x"));
+
+    assertTrue(testLocalValue("{}.toString()"));
+    assertTrue(testLocalValue("o.toString()"));
+
+    assertFalse(testLocalValue("o.valueOf()"));
+  }
+
+```
+Test `com.google.javascript.jscomp.NodeUtilTest::testLocalValue1` error:
+```
+junit.framework.AssertionFailedError: expected:<[A]> but was:<[A, f]>;com.google.javascript.jscomp.PureFunctionIdentifierTest::testLocalizedSideEffects9
+```
+
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testLocalizedSideEffects8`:
+```java
+  public void testLocalizedSideEffects8() throws Exception {
+    // Returning a local object that has been modified
+    // is not a global side-effect.
+    checkMarkedCalls("/** @constructor A */ function A() {};" +
+                     "function f() {" +
+                     "  var a = new A; a.foo = 1; return a;" +
+                     "}" +
+                     "f()",
+                     BROKEN_NEW ?
+                         ImmutableList.<String>of("A") :
+                         ImmutableList.<String>of("A", "f"));
+  }
+
+```
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testLocalizedSideEffects8` error:
+```
+junit.framework.AssertionFailedError: expected:<[A]> but was:<[A, f]>;com.google.javascript.jscomp.PureFunctionIdentifierTest::testAnnotationInExterns_new4
+```
+
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testLocalizedSideEffects9`:
+```java
+  public void testLocalizedSideEffects9() throws Exception {
+    // Returning a local object that has been modified
+    // is not a global side-effect.
+    checkMarkedCalls("/** @constructor A */ function A() {this.x = 1};" +
+                     "function f() {" +
+                     "  var a = new A; a.foo = 1; return a;" +
+                     "}" +
+                     "f()",
+                     BROKEN_NEW ?
+                         ImmutableList.<String>of("A") :
+                         ImmutableList.<String>of("A", "f"));
+  }
+
+```
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testLocalizedSideEffects9` error:
+```
+junit.framework.AssertionFailedError: expected:<[externObjSEThis]> but was:<[externObjSEThis, NEW STRING externObjSEThisMethod]>;com.google.javascript.jscomp.PureFunctionIdentifierTest::testAnnotationInExterns_new6
+```
+
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testAnnotationInExterns_new4`:
+```java
+  public void testAnnotationInExterns_new4() throws Exception {
+    // The entire expression containing "externObjSEThisMethod" is considered
+    // side-effect free in this context.
+
+    checkMarkedCalls("new externObjSEThis().externObjSEThisMethod('')",
+        BROKEN_NEW ?
+            ImmutableList.<String>of(
+               "externObjSEThis") :
+            ImmutableList.<String>of(
+               "externObjSEThis", "NEW STRING externObjSEThisMethod"));
+  }
+
+```
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testAnnotationInExterns_new4` error:
+```
+junit.framework.AssertionFailedError: expected:<[externObjSEThis]> but was:<[externObjSEThis, NEW STRING externObjSEThisMethod, f]>;com.google.javascript.jscomp.PureFunctionIdentifierTest::testIssue303b
+```
+
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testAnnotationInExterns_new6`:
+```java
+  public void testAnnotationInExterns_new6() throws Exception {
+    // While "externObjSEThisMethod" has modifies "this"
+    // it does not have global side-effects with "this" is
+    // a known local value.
+    checkMarkedCalls(
+        "function f() {" +
+        "  new externObjSEThis().externObjSEThisMethod('') " +
+        "};" +
+        "f();",
+        BROKEN_NEW ?
+            ImmutableList.<String>of(
+                "externObjSEThis") :
+           ImmutableList.<String>of(
+               "externObjSEThis", "NEW STRING externObjSEThisMethod", "f"));
+  }
+
+```
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testAnnotationInExterns_new6` error:
+```
+junit.framework.AssertionFailedError: expected:<[]> but was:<[NEW STRING setLocation]>;com.google.javascript.jscomp.PureFunctionIdentifierTest::testIssue303
+```
+
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testIssue303b`:
+```java
+  public void testIssue303b() throws Exception {
+    checkMarkedCalls(
+        "/** @constructor */ function F() {" +
+        "  var self = this;" +
+        "  window.setTimeout(function() {" +
+        "    window.location = self.location;" +
+        "  }, 0);" +
+        "}" +
+        "F.prototype.setLocation = function(x) {" +
+        "  this.location = x;" +
+        "};" +
+        "function x() {" +
+        "  (new F()).setLocation('http://www.google.com/');" +
+        "} window['x'] = x;",
+        ImmutableList.<String>of());
+  }
+
+```
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testIssue303b` error:
+```
+junit.framework.AssertionFailedError: expected:<[]> but was:<[NEW STRING setLocation]>
+```
+
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testIssue303`:
+```java
+  public void testIssue303() throws Exception {
+    checkMarkedCalls(
+        "/** @constructor */ function F() {" +
+        "  var self = this;" +
+        "  window.setTimeout(function() {" +
+        "    window.location = self.location;" +
+        "  }, 0);" +
+        "}" +
+        "F.prototype.setLocation = function(x) {" +
+        "  this.location = x;" +
+        "};" +
+        "(new F()).setLocation('http://www.google.com/');",
+        ImmutableList.<String>of());
+  }
+
+```
+Test `com.google.javascript.jscomp.PureFunctionIdentifierTest::testIssue303` error:
+```
+junit.framework.AssertionFailedError: expected:<[]> but was:<[NEW STRING setLocation]>
+```
+
+
+Please provide a fixed version of the buggy function, and only that function, inside a code block.
