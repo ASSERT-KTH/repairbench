@@ -114,11 +114,12 @@ const LeaderboardTable = () => {
     return aValue - bValue;
   };
 
-//  const parseDateString = (dateString) => {
-//    if (!dateString) return new Date(0); // Return earliest possible date if undefined
-//    const [year, month, day] = dateString.split('-');
-//    return new Date(parseInt(year), parseInt(month)-1, parseInt(day));
-//  };
+  // Uncomment this function
+  const parseDateString = (dateString) => {
+    if (!dateString) return new Date(0); // Return earliest possible date if undefined
+    const [year, month, day] = dateString.split('-');
+    return new Date(parseInt(year), parseInt(month)-1, parseInt(day));
+  };
 
   const columns = React.useMemo(() => {
     const bestScores = getBestScores(data);
@@ -178,23 +179,23 @@ const LeaderboardTable = () => {
         ),
         disableSortBy: false,
       },
-      // {
-      //   Header: 'Release Date',
-      //   accessor: 'release_date',
-      //   Cell: ({ value }) => (
-      //     <div className="release-date-cell">
-      //       <div className="release-date-content">
-      //         {value}
-      //       </div>
-      //     </div>
-      //   ),
-      //   sortType: (rowA, rowB, columnId) => {
-      //     const dateA = parseDateString(rowA.values[columnId]);
-      //     const dateB = parseDateString(rowB.values[columnId]);
-      //     return dateA.getTime() - dateB.getTime();
-      //   },
-      //   disableSortBy: false,
-      // },
+      {
+        Header: 'Release Date',
+        accessor: 'release_date',
+        Cell: ({ value }) => (
+          <div className="release-date-cell">
+            <div className="release-date-content">
+              {value}
+            </div>
+          </div>
+        ),
+        sortType: (rowA, rowB, columnId) => {
+          const dateA = parseDateString(rowA.values[columnId]);
+          const dateB = parseDateString(rowB.values[columnId]);
+          return dateA.getTime() - dateB.getTime();
+        },
+        disableSortBy: false,
+      },
       {
         Header: `Total (${bugCounts.total || 0} bugs)`,
         columns: [
