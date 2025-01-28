@@ -1,83 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useTable, useSortBy } from 'react-table';
 import ReactCountryFlag from "react-country-flag";
 import { FaSort, FaSortUp, FaSortDown } from 'react-icons/fa';
 import CitationBox from './CitationBox';
 import Footer from './Footer';
-import { modelList, llmCountryMap } from './modelConfig';
+import { llmCountryMap } from './modelConfig';
+import staticData from '../data/leaderboard-data.json';
 import './LeaderboardTable.css';
 
 const LeaderboardTable = () => {
-  const [data, setData] = useState([]);
-  const [bugCounts, setBugCounts] = useState({});
   const [showExtraColumns, setShowExtraColumns] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-
-  const loadData = async () => {
-    setIsLoading(true);
-    const benchmarks = ['defects4j', 'gitbugjava'];
-    const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost'];
-    let newBugCounts = {};
-    let totalBugs = 0;
-
-    const results = await Promise.all(modelList.map(async ([llm_name, strategy, provider]) => {
-      const row = { name: llm_name, provider, total_cost: null, hasTotalData: false, release_date: null };
-
-      try {
-        const totalResponse = await fetch(`./results/${llm_name}/total.json`);
-        const totalResult = await totalResponse.json();
-        row['total_ast_match@1'] = totalResult['ast_match@1'];
-        row['total_plausible@1'] = totalResult['plausible@1'];
-        row.hasTotalData = true;
-      } catch (error) {
-        console.error(`Failed to load total.json for ${llm_name}:`, error);
-      }
-
-      let allBenchmarksComplete = true;
-      await Promise.all(benchmarks.map(async (benchmark) => {
-        try {
-          const statsResponse = await fetch(`./results/${llm_name}/${benchmark}/statistics_${benchmark}_instruct_${strategy}.json`);
-          const statsResult = await statsResponse.json();
-          metrics.forEach(metric => {
-            row[`${benchmark}_${metric}`] = statsResult[metric];
-          });
-
-          // Update bug count for each benchmark
-          if (!newBugCounts[benchmark]) {
-            newBugCounts[benchmark] = statsResult.num_bugs_with_prompt;
-            totalBugs += statsResult.num_bugs_with_prompt;
-          }
-
-          const costResponse = await fetch(`./results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
-          const costResult = await costResponse.json();
-          row[`${benchmark}_cost`] = costResult.total_cost || null;
-
-          // Load release date
-          const releaseDateResponse = await fetch(`./results/release_dates.json`);
-          const releaseDateData = await releaseDateResponse.json();
-          row['release_date'] = releaseDateData[llm_name];
-        } catch (error) {
-          console.error(`Failed to load data for ${llm_name} - ${benchmark}:`, error);
-          allBenchmarksComplete = false;
-        }
-      }));
-
-      // Only compute total cost if all benchmarks are complete and there's no total.json
-      if (allBenchmarksComplete && row.hasTotalData) {
-        row.total_cost = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_cost`] || 0), 0);
-      }
-
-      return row;
-    }));
-
-    setData(results);
-    setBugCounts({ ...newBugCounts, total: totalBugs });
-    setIsLoading(false);
-  };
-
-  useEffect(() => {
-    loadData();
-  }, []);
+  
+  // Use static data instead of fetching
+  const data = staticData.results;
+  const bugCounts = staticData.bugCounts;
 
   const getBestScores = (data) => {
     const bestScores = {};
@@ -114,7 +50,6 @@ const LeaderboardTable = () => {
     return aValue - bValue;
   };
 
-  // Uncomment this function
   const parseDateString = (dateString) => {
     if (!dateString) return new Date(0); // Return earliest possible date if undefined
     const [year, month, day] = dateString.split('-');
@@ -226,7 +161,7 @@ const LeaderboardTable = () => {
     ];
 
     return showExtraColumns ? [...baseColumns, ...extraColumns] : baseColumns;
-  }, [data, bugCounts, showExtraColumns]);
+  }, [showExtraColumns]); // Remove data and bugCounts from dependencies since they're now static
 
   const {
     getTableProps,
@@ -243,15 +178,10 @@ const LeaderboardTable = () => {
     useSortBy
   );
 
-  // Add touch handling for the toggle bar
   const handleToggleTouch = (e) => {
     e.preventDefault();
     setShowExtraColumns(!showExtraColumns);
   };
-
-  if (isLoading) {
-    return <div role="alert" aria-busy="true" className="loading-container">Loading...</div>;
-  }
 
   return (
     <div className="leaderboard-container">
