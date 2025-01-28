@@ -228,42 +228,50 @@ const LeaderboardTable = () => {
     return showExtraColumns ? [...baseColumns, ...extraColumns] : baseColumns;
   }, [data, bugCounts, showExtraColumns]);
 
-  const { getTableProps, getTableBodyProps, headerGroups, rows, prepareRow } = useTable(
-    { 
-      columns, 
+  const {
+    getTableProps,
+    getTableBodyProps,
+    headerGroups,
+    rows,
+    prepareRow
+  } = useTable(
+    {
+      columns,
       data,
-      initialState: {
-        sortBy: [
-          { id: 'total_plausible@1', desc: true }
-        ]
-      },
-      disableSortRemove: true,
-      disableMultiSort: true
+      initialState: { sortBy: [{ id: 'total_plausible@1', desc: true }] }
     },
     useSortBy
   );
 
+  // Add touch handling for the toggle bar
+  const handleToggleTouch = (e) => {
+    e.preventDefault();
+    setShowExtraColumns(!showExtraColumns);
+  };
+
   if (isLoading) {
-    return <div>Loading...</div>;
+    return <div role="alert" aria-busy="true" className="loading-container">Loading...</div>;
   }
 
   return (
     <div className="leaderboard-container">
       <div className="leaderboard-table-wrapper">
         <div className={`leaderboard-table-container ${showExtraColumns ? 'expanded' : ''}`}>
-          <table {...getTableProps()} className="leaderboard-table">
+          <table {...getTableProps()} className="leaderboard-table" role="table">
             <thead>
               {headerGroups.map((headerGroup, i) => (
-                <tr {...headerGroup.getHeaderGroupProps()}>
+                <tr {...headerGroup.getHeaderGroupProps()} role="row">
                   {headerGroup.headers.map(column => (
                     <th
                       {...column.getHeaderProps(column.getSortByToggleProps())}
                       className={`table-header ${column.canSort ? 'sortable' : ''} ${i === 0 ? 'top-header' : 'sub-header'}`}
+                      role="columnheader"
+                      aria-sort={column.isSorted ? (column.isSortedDesc ? 'descending' : 'ascending') : 'none'}
                     >
                       <div className="header-content">
                         <span className="header-text">{column.render('Header')}</span>
                         {column.canSort && i !== 0 && (
-                          <span className="sort-indicator">
+                          <span className="sort-indicator" aria-hidden="true">
                             {column.isSorted
                               ? column.isSortedDesc
                                 ? <FaSortDown />
@@ -277,13 +285,13 @@ const LeaderboardTable = () => {
                 </tr>
               ))}
             </thead>
-            <tbody {...getTableBodyProps()}>
+            <tbody {...getTableBodyProps()} role="rowgroup">
               {rows.map(row => {
                 prepareRow(row);
                 return (
-                  <tr {...row.getRowProps()}>
+                  <tr {...row.getRowProps()} role="row">
                     {row.cells.map(cell => (
-                      <td {...cell.getCellProps()}>{cell.render('Cell')}</td>
+                      <td {...cell.getCellProps()} role="cell">{cell.render('Cell')}</td>
                     ))}
                   </tr>
                 );
@@ -294,6 +302,10 @@ const LeaderboardTable = () => {
         <div 
           className="toggle-bar" 
           onClick={() => setShowExtraColumns(!showExtraColumns)}
+          onTouchStart={handleToggleTouch}
+          role="button"
+          tabIndex={0}
+          aria-label={showExtraColumns ? "Hide detailed results" : "Show detailed results"}
         >
           <span className="toggle-text">
             {showExtraColumns ? 'Collapse' : 'See more details...'}
@@ -301,7 +313,7 @@ const LeaderboardTable = () => {
         </div>
       </div>
       
-      <div className="methodology-info">
+      <div className="methodology-info" role="complementary">
         <ul>
           <li>All bugs included in RepairBench are single-function bugs, meaning that the reference patch changes only one function</li>
           <li>The prompt is zero-shot, and includes 1) the buggy function, 2) the failing test cases, and 3) the test errors</li>
