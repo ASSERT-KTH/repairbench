@@ -1,0 +1,163 @@
+diff --git a/tmp/0bbe0b2d-30fa-471b-8c13-6e0e8c8e9cae_buggy.java b/tmp/2313e9a6-4d97-4ffd-9f46-7794610c2e2d_fixed.java
+index be9c8a3..53cf4f9 100644
+--- a/tmp/0bbe0b2d-30fa-471b-8c13-6e0e8c8e9cae_buggy.java
++++ b/tmp/2313e9a6-4d97-4ffd-9f46-7794610c2e2d_fixed.java
+@@ -1,94 +1,107 @@
+-    /**
+-     * Counts the number of direct (full) references to an object.
+-     * Specifically we check for references of the following type:
+-     * <pre>
+-     *   x;
+-     *   x.fn();
+-     * </pre>
+-     */
+ private boolean isInlinableObject(List<Reference> refs) {
++  // First, compute the union of property names that are “defined” on this object.
++  // (Either via an object literal assignment or via a property‐assignment.)
++  Set<String> definedProps = new HashSet<>();
++  boolean foundLiteral = false;
++  for (Reference ref : refs) {
++    Node val = ref.getAssignedValue();
++    if (val != null && val.isObjectLit()) {
++      foundLiteral = true;
++      for (Node child = val.getFirstChild(); child != null; child = child.getNext()) {
++        // We do not support ES5 getters/setters.
++        if (child.isGetterDef() || child.isSetterDef()) {
++          return false;
++        }
++        if (child.hasString()) {
++          definedProps.add(child.getString());
++        }
++      }
++    }
++    // Also, if a property is later assigned through a GETPROP (e.g. x.c = c),
++    // add that property name to the set.
++    Node parent = ref.getParent();
++    if (parent.isGetProp()) {
++      Node gp = parent.getParent();
++      boolean isWrite = gp != null && gp.isAssign() && gp.getFirstChild() == parent;
++      if (isWrite) {
++        definedProps.add(parent.getLastChild().getString());
++      }
++    }
++  }
++  
++  // We inline only if there is at least one object-literal assignment.
++  if (!foundLiteral) {
++    return false;
++  }
++  
++  // For GETPROP read accesses, allow only properties that are either defined on the object
++  // or are built in (from Object.prototype). (This is our safeguard against reading an
++  // inherited property that might be non-void.)
++  Set<String> builtinProps = new HashSet<>(Arrays.asList(
++      "toString", "valueOf", "hasOwnProperty", "isPrototypeOf", 
++      "propertyIsEnumerable", "toLocaleString"));
++  
+   boolean ret = false;
+   for (Reference ref : refs) {
+     Node name = ref.getNode();
+     Node parent = ref.getParent();
+     Node gramps = ref.getGrandparent();
+   
+-        // Ignore indirect references, like x.y (except x.y(), since
+-        // the function referenced by y might reference 'this').
+-        //
+     if (parent.isGetProp()) {
+       Preconditions.checkState(parent.getFirstChild() == name);
+-          // A call target maybe using the object as a 'this' value.
+-          if (gramps.isCall()
+-              && gramps.getFirstChild() == parent) {
++      // If we see a call of the form x.y(), then the object might be used as
++      // a “this” value.  Bail out.
++      if (gramps.isCall() && gramps.getFirstChild() == parent) {
+         return false;
+       }
+   
+-          // NOTE(nicksantos): This pass's object-splitting algorithm has
+-          // a blind spot. It assumes that if a property isn't defined on an
+-          // object, then the value is undefined. This is not true, because
+-          // Object.prototype can have arbitrary properties on it.
+-          //
+-          // We short-circuit this problem by bailing out if we see a reference
+-          // to a property that isn't defined on the object literal. This
+-          // isn't a perfect algorithm, but it should catch most cases.
++      // Determine if this GETPROP is being read or written.
++      Node gp = parent.getParent();
++      boolean isWrite = gp != null && gp.isAssign() && gp.getFirstChild() == parent;
++      if (!isWrite) {  // A read access
++        String propName = parent.getLastChild().getString();
++        // If the property isn’t defined in our union—and isn’t one of the allowed
++        // builtins (like "toString")—then we must bail.
++        if (!definedProps.contains(propName) && !builtinProps.contains(propName)) {
++          return false;
++        }
++      }
+       continue;
+     }
+   
+-        // Only rewrite VAR declarations or simple assignment statements
++    // For non-GETPROP references, we only allow VAR declarations or simple
++    // assignments (e.g. “x = {…}”).
+     if (!isVarOrAssignExprLhs(name)) {
+       return false;
+     }
+   
+     Node val = ref.getAssignedValue();
+     if (val == null) {
+-          // A var with no assignment.
+       continue;
+     }
+   
+-        // We're looking for object literal assignments only.
++    // We only inline object literal assignments.
+     if (!val.isObjectLit()) {
+       return false;
+     }
+   
+-        // Make sure that the value is not self-refential. IOW,
+-        // disallow things like x = {b: x.a}.
+-        //
+-        // TODO: Only exclude unorderable self-referential
+-        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+-        // but x = {a: 1, b: x.a} is.
+-        //
+-        // Also, ES5 getters/setters aren't handled by this pass.
+-        for (Node child = val.getFirstChild(); child != null;
+-             child = child.getNext()) {
+-          if (child.isGetterDef() ||
+-              child.isSetterDef()) {
+-            // ES5 get/set not supported.
++    // Finally, ensure that the object literal isn’t self-referential.
++    for (Node child = val.getFirstChild(); child != null; child = child.getNext()) {
++      if (child.isGetterDef() || child.isSetterDef()) {
+         return false;
+       }
+-
+-
+       Node childVal = child.getFirstChild();
+-          // Check if childVal is the parent of any of the passed in
+-          // references, as that is how self-referential assignments
+-          // will happen.
+       for (Reference t : refs) {
+         Node refNode = t.getParent();
+-            while (!NodeUtil.isStatementBlock(refNode)) {
++        while (refNode != null && !NodeUtil.isStatementBlock(refNode)) {
+           if (refNode == childVal) {
+-                // There's a self-referential assignment
+             return false;
+           }
+           refNode = refNode.getParent();
+         }
+       }
+     }
+-
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+     ret = true;
+   }
+   return ret;
+ }
+\ No newline at end of file

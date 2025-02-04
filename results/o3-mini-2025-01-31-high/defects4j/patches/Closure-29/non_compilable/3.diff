@@ -1,0 +1,178 @@
+diff --git a/tmp/802a2bc3-a575-420a-8b18-17f1eab8d8b3_buggy.java b/tmp/231bdea3-c0d2-4005-8526-93af0f47511b_fixed.java
+index be9c8a3..959ada2 100644
+--- a/tmp/802a2bc3-a575-420a-8b18-17f1eab8d8b3_buggy.java
++++ b/tmp/231bdea3-c0d2-4005-8526-93af0f47511b_fixed.java
+@@ -1,94 +1,114 @@
+ /**
+  * Counts the number of direct (full) references to an object.
+  * Specifically we check for references of the following type:
+  * <pre>
+  *   x;
+  *   x.fn();
+  * </pre>
++ *
++ * In addition to checking that every “full” reference is safe, this version also
++ * “collects” the set of property names that are explicitly defined on the object.
++ * If a property is later read, the property must have been defined (or, for an
++ * empty object literal defined “in‐line” as part of a VAR declaration, be one
++ * of a few allowed inherited properties, like "toString").
+  */
+ private boolean isInlinableObject(List<Reference> refs) {
+-      boolean ret = false;
++  // First pass: collect all property names coming from a defining assignment.
++  // Also determine whether we can “allow” a property read if the object literal
++  // was empty in its VAR initializer (and thus does not have its own properties)
++  // in which case we allow reads of a few well–known inherited properties.
++  Set<String> definedProps = new HashSet<>();
++  boolean foundDefinition = false;
++  // Default: disallow inherited properties.
++  boolean allowInherited = false;
++  // Whitelist for inherited properties that we allow only when the literal was
++  // written inline as a var initializer (and was empty).
++  Set<String> inheritedWhitelist = new HashSet<>(Arrays.asList(
++      "toString", "valueOf", "hasOwnProperty", "constructor"));
++  
+   for (Reference ref : refs) {
+     Node name = ref.getNode();
+     Node parent = ref.getParent();
+-        Node gramps = ref.getGrandparent();
+-
+-        // Ignore indirect references, like x.y (except x.y(), since
+-        // the function referenced by y might reference 'this').
+-        //
+-        if (parent.isGetProp()) {
+-          Preconditions.checkState(parent.getFirstChild() == name);
+-          // A call target maybe using the object as a 'this' value.
+-          if (gramps.isCall()
+-              && gramps.getFirstChild() == parent) {
+-            return false;
+-          }
+-
+-          // NOTE(nicksantos): This pass's object-splitting algorithm has
+-          // a blind spot. It assumes that if a property isn't defined on an
+-          // object, then the value is undefined. This is not true, because
+-          // Object.prototype can have arbitrary properties on it.
+-          //
+-          // We short-circuit this problem by bailing out if we see a reference
+-          // to a property that isn't defined on the object literal. This
+-          // isn't a perfect algorithm, but it should catch most cases.
+-          continue;
+-        }
+-
+-        // Only rewrite VAR declarations or simple assignment statements
++    // For non–getProp references, these should be the defining assignments
++    if (!parent.isGetProp()) {
+       if (!isVarOrAssignExprLhs(name)) {
+         return false;
+       }
+-
+       Node val = ref.getAssignedValue();
+       if (val == null) {
+-          // A var with no assignment.
+         continue;
+       }
+-
+-        // We're looking for object literal assignments only.
+       if (!val.isObjectLit()) {
+         return false;
+       }
+-
+-        // Make sure that the value is not self-refential. IOW,
+-        // disallow things like x = {b: x.a}.
+-        //
+-        // TODO: Only exclude unorderable self-referential
+-        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+-        // but x = {a: 1, b: x.a} is.
+-        //
+-        // Also, ES5 getters/setters aren't handled by this pass.
+-        for (Node child = val.getFirstChild(); child != null;
+-             child = child.getNext()) {
+-          if (child.isGetterDef() ||
+-              child.isSetterDef()) {
+-            // ES5 get/set not supported.
++      // If the assignment is part of a VAR declaration initializer then we can
++      // allow certain inherited properties if the literal is empty.
++      if (name.getParent() != null && name.getParent().isVar()) {
++        // When the literal is empty, there are no explicitly defined properties.
++        if (val.getChildCount() == 0) {
++          allowInherited = true;
++        }
++      } else {
++        // For assignments outside of a var declaration,
++        // do not allow inherited (implicit) properties.
++        allowInherited = false;
++      }
++      // Process the properties from the object literal.
++      for (Node prop = val.getFirstChild(); prop != null; prop = prop.getNext()) {
++        if (prop.isGetterDef() || prop.isSetterDef()) {
+           return false;
+         }
+-
+-
+-          Node childVal = child.getFirstChild();
+-          // Check if childVal is the parent of any of the passed in
+-          // references, as that is how self-referential assignments
+-          // will happen.
++        String key = prop.getString();
++        definedProps.add(key);
++        // Check for self-referential assignments.
++        Node childVal = prop.getFirstChild();
+         for (Reference t : refs) {
+           Node refNode = t.getParent();
+-            while (!NodeUtil.isStatementBlock(refNode)) {
++          while (refNode != null && !NodeUtil.isStatementBlock(refNode)) {
+             if (refNode == childVal) {
+-                // There's a self-referential assignment
+               return false;
+             }
+             refNode = refNode.getParent();
+           }
+         }
+       }
++      foundDefinition = true;
++    }
++    // Also, for getProp references that are assignments (e.g. x.foo = ...)
++    // we add the property to our set.
++    if (parent.isGetProp() && ref.getAssignedValue() != null) {
++      // The assumption is that in a getProp assignment the left child is the object.
++      Preconditions.checkState(parent.getFirstChild() == name);
++      String propName = parent.getLastChild().getString();
++      definedProps.add(propName);
++      // (We continue here even for assignments.)
++    }
++  }
+   
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+-        ret = true;
++  // Second pass: check all getProp accesses that are pure reads.
++  // Every property read must have been defined on the object
++  // (or, if none was defined and we allowed inherited properties, it must be in the whitelist).
++  for (Reference ref : refs) {
++    Node parent = ref.getParent();
++    if (parent.isGetProp() && ref.getAssignedValue() == null) {
++      // For a full property access such as x.foo, the object part is 'x'
++      // and the property name is in the last child.
++      String propName = parent.getLastChild().getString();
++      if (!definedProps.contains(propName)) {
++        if (allowInherited && inheritedWhitelist.contains(propName)) {
++          // Add it so that subsequent reads succeed.
++          definedProps.add(propName);
++        } else {
++          return false;
++        }
+       }
+-      return ret;
++      // Also, x.foo() is disallowed if the getProp is the call target.
++      Node gramps = ref.getGrandparent();
++      if (gramps != null && gramps.isCall() && gramps.getFirstChild() == parent) {
++        return false;
++      }
++    }
++  }
++  
++  return foundDefinition;
+ }
+\ No newline at end of file

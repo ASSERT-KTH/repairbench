@@ -1,0 +1,153 @@
+diff --git a/tmp/9e243136-1b5f-47f2-8c6f-1f4cd67796e6_buggy.java b/tmp/f301fc6f-2ade-445f-8655-bcb9ddd65161_fixed.java
+index 41ea16c..c138768 100644
+--- a/tmp/9e243136-1b5f-47f2-8c6f-1f4cd67796e6_buggy.java
++++ b/tmp/f301fc6f-2ade-445f-8655-bcb9ddd65161_fixed.java
+@@ -1,63 +1,118 @@
+-    /**
+-     * Replaces an assignment like x = {...} with t1=a,t2=b,t3=c,true.
+-     * Note that the resulting expression will always evaluate to
+-     * true, as would the x = {...} expression.
+-     */
+ private void replaceAssignmentExpression(Var v, Reference ref,
+                                            Map<String, String> varmap) {
+-      // Compute all of the assignments necessary
++  // Compute all of the assignments necessary.
+   List<Node> nodes = Lists.newArrayList();
+   Node val = ref.getAssignedValue();
+   blacklistVarReferencesInTree(val, v.scope);
+   Preconditions.checkState(val.getType() == Token.OBJECTLIT);
+   Set<String> all = Sets.newLinkedHashSet(varmap.keySet());
+-      for (Node key = val.getFirstChild(); key != null;
+-           key = key.getNext()) {
+-        String var = key.getString();
++  for (Node key = val.getFirstChild(); key != null; key = key.getNext()) {
++    String prop = key.getString();
+     Node value = key.removeFirstChild();
+-        // TODO(user): Copy type information.
++    // Create an assignment for properties that exist in the object literal.
+     nodes.add(
+         new Node(Token.ASSIGN,
+-                   Node.newString(Token.NAME, varmap.get(var)), value));
+-        all.remove(var);
++                 Node.newString(Token.NAME, varmap.get(prop)),
++                 value));
++    all.remove(prop);
+   }
+-
+-      // TODO(user): Better source information.
+-      for (String var : all) {
++  // For properties that are expected (per varmap) but missing in the literal,
++  // assign them to undefined.
++  for (String prop : all) {
+     nodes.add(
+         new Node(Token.ASSIGN,
+-                   Node.newString(Token.NAME, varmap.get(var)),
++                 Node.newString(Token.NAME, varmap.get(prop)),
+                  NodeUtil.newUndefinedNode(null)));
+   }
+ 
+-      Node replacement;
+-        // All assignments evaluate to true, so make sure that the
+-        // expr statement evaluates to true in case it matters.
++  // In a non-var assignment the expression must evaluate to true.
++  // However, when the assignment is used as a var initializer,
++  // its value is ignored. (e.g. "var a = {}" should become just "var a;")
++  //
++  // The AST for a var initializer is a NAME node (with an initializer)
++  // which is a child of a VAR node. In contrast, an assignment expression
++  // like "a = {}" is not nested inside a VAR.
++  //
++  // We detect a var initializer if the parent is either a VAR
++  // or a NAME node whose parent is a VAR.
++  Node assignParent = ref.getParent();
++  boolean isVarInitializer = assignParent.getType() == Token.VAR ||
++      (assignParent.getType() == Token.NAME &&
++       assignParent.getParent() != null &&
++       assignParent.getParent().getType() == Token.VAR);
++
++  if (!isVarInitializer) {
++    // For a normal assignment expression, add a trailing TRUE node
++    // because (x = {...}) always evaluates to true.
+     nodes.add(new Node(Token.TRUE));
++  }
+ 
+-        // Join these using COMMA.  A COMMA node must have 2 children, so we
+-        // create a tree. In the tree the first child be the COMMA to match
+-        // the parser, otherwise tree equality tests fail.
+-        nodes = Lists.reverse(nodes);
++  // Build a replacement expression.  If there’s only one node then we use it directly.
++  Node replacement;
++  if (nodes.isEmpty()) {
++    replacement = NodeUtil.newUndefinedNode(null);
++  } else if (nodes.size() == 1) {
++    replacement = nodes.get(0);
++  } else if (nodes.size() == 2) {
++    // For two nodes, a COMMA node with two children is sufficient.
++    replacement = new Node(Token.COMMA, nodes.get(0), nodes.get(1));
++  } else {
++    // For more than two nodes, construct a binary tree of COMMA nodes.
++    // The original algorithm reverses the list in order to preserve evaluation order.
++    Collections.reverse(nodes);
+     replacement = new Node(Token.COMMA);
+     Node cur = replacement;
+     int i;
+     for (i = 0; i < nodes.size() - 2; i++) {
+       cur.addChildToFront(nodes.get(i));
+       Node t = new Node(Token.COMMA);
+       cur.addChildToFront(t);
+       cur = t;
+     }
+     cur.addChildToFront(nodes.get(i));
+     cur.addChildToFront(nodes.get(i + 1));
++  }
+ 
+-      Node replace = ref.getParent();
+-      replacement.copyInformationFromForTree(replace);
++  if (isVarInitializer) {
++    // In a var declaration like "var a = {}", we want to remove the assignment
++    // altogether and leave just "var a;".  However, if any of the assignments have
++    // side‑effects (for non‑empty object literals) we need to emit them as a separate
++    // expression statement.
++    //
++    // In the AST a var initializer appears as the initializer of a NAME node
++    // that is a child of the VAR node.
++    Node nameNode;
++    if (assignParent.getType() == Token.NAME) {
++      nameNode = assignParent;
++    } else {
++      // Otherwise ref is a child of an ASSIGN node which is itself the initializer of the NAME node.
++      nameNode = assignParent.getParent();
++    }
++    // Remove the initializer (the object literal assignment) from the variable.
++    nameNode.removeChild(ref);
+ 
+-      if (replace.getType() == Token.VAR) {
+-        replace.getParent().replaceChild(
+-            replace, NodeUtil.newExpr(replacement));
++    // If there were any property assignments generated, insert them after the VAR.
++    // (For an empty literal we want nothing extra.)
++    if (!nodes.isEmpty()) {
++      // Check if any of the nodes is an assignment (as opposed to a dangling 'true'
++      // that we wouldn’t have added in a var initializer, but we check defensively).
++      boolean hasSideEffects = false;
++      for (Node n : nodes) {
++        if (n.getType() == Token.ASSIGN) {
++          hasSideEffects = true;
++          break;
++        }
++      }
++      if (hasSideEffects) {
++        // Insert the side-effects as an expression statement immediately after the VAR.
++        Node varNode = nameNode.getParent();  // the VAR node
++        varNode.getParent().addChildAfter(NodeUtil.newExpr(replacement), varNode);
++      }
++    }
+   } else {
+-        replace.getParent().replaceChild(replace, replacement);
++    // For a normal assignment expression, simply replace the whole expression.
++    Node exprParent = assignParent.getParent();
++    replacement.copyInformationFromForTree(assignParent);
++    exprParent.replaceChild(assignParent, replacement);
+   }
+ }
+\ No newline at end of file

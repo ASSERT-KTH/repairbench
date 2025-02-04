@@ -1,0 +1,194 @@
+diff --git a/tmp/f03e20cb-ca3c-4b36-8e60-e05f99dfa244_buggy.java b/tmp/7d04c6a8-ec96-44e2-b7e3-494eccb61fdf_fixed.java
+index 233a867..5d8df05 100644
+--- a/tmp/f03e20cb-ca3c-4b36-8e60-e05f99dfa244_buggy.java
++++ b/tmp/7d04c6a8-ec96-44e2-b7e3-494eccb61fdf_fixed.java
+@@ -1,73 +1,148 @@
+-  /**
+-   * Determines whether a function can be inlined at a particular call site.
+-   * There are several criteria that the function and reference must hold in
+-   * order for the functions to be inlined:
+-   * 1) If a call's arguments have side effects,
+-   * the corresponding argument in the function must only be referenced once.
+-   * For instance, this will not be inlined:
+-   * <pre>
+-   *     function foo(a) { return a + a }
+-   *     x = foo(i++);
+-   * </pre>
+-   */
+-  private CanInlineResult canInlineReferenceDirectly(
+-      Node callNode, Node fnNode) {
++private CanInlineResult canInlineReferenceDirectly(Node callNode, Node fnNode) {
++  // If the function can’t even be replaced by a direct call, then don’t inline.
+   if (!isDirectCallNodeReplacementPossible(fnNode)) {
+     return CanInlineResult.NO;
+   }
+ 
+   Node block = fnNode.getLastChild();
+ 
+-
+-    // CALL NODE: [ NAME, ARG1, ARG2, ... ]
++  // CALL NODE is of the form: [ NAME, ARG1, ARG2, ... ]
+   Node cArg = callNode.getFirstChild().getNext();
+ 
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
++  // For calls via “call” (or “apply”) the first argument is the this–object,
++  // which isn’t declared in the called function’s parameter list.
+   if (!callNode.getFirstChild().isName()) {
+     if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
++      // TODO(johnlenz): Support replacing “this” with an explicit value.
+       if (cArg == null || !cArg.isThis()) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
+     } else {
+-        // ".apply" call should be filtered before this.
++      // “.apply” calls should have been filtered earlier.
+       Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+     }
+   }
+ 
+-    // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+-    Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+-    while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
+-        if (cArg != null) {
+-
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
++  // For each formal parameter (from the function’s parameter list)
++  // match it against the corresponding call argument.
++  Node fnParams = NodeUtil.getFunctionParameters(fnNode);
++  Node fnParam = fnParams.getFirstChild();
++  while (fnParam != null && cArg != null) {
++    // First, if the call argument is “mutable” (i.e. may have side effects if evaluated more than once)
++    // then the parameter must be referenced at most once in the function body.
+     if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
++        && NodeUtil.getNameReferenceCount(block, fnParam.getString()) > 1) {
+       return CanInlineResult.NO;
+     }
+-        }
+ 
+-        // Move to the next name.
++    // Second, even when the argument is “simple” (a name or literal), inlining directly
++    // will substitute the call–argument at the point of the formal parameter’s use.
++    // In a normal call the argument is evaluated *before* entering the function. So if the
++    // parameter occurs “late” (for example, as the right–hand operand of a binary operator)
++    // then inlining would reorder evaluation (this can be observed if the argument’s value
++    // can be changed by side effects in code appearing before its use).
++    // We check that the first occurrence of the parameter in the function body is “safe”
++    // for direct substitution.
++    if (!isParameterUsageSafe(fnNode, fnParam.getString(), cArg)) {
++      return CanInlineResult.NO;
++    }
+     fnParam = fnParam.getNext();
++    cArg = cArg.getNext();
+   }
+ 
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+-      if (cArg != null) {
++  // For any extra call arguments (i.e. those that don’t correspond
++  // to a declared parameter) we require that they be side–effect free.
++  while (cArg != null) {
+     if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+       return CanInlineResult.NO;
+     }
+     cArg = cArg.getNext();
+   }
+-    }
+-
+   return CanInlineResult.YES;
+ }
++
++/**
++ * Returns true if the direct “inlining” of a call–argument for the formal parameter
++ * is safe from an evaluation–order point of view. In a normal function call all
++ * arguments are evaluated before any function–body code runs. Direct substitution,
++ * however, would insert the call–argument expression inside the function body.
++ *
++ * For example, consider
++ *    function foo(a) { return modifiyX() + a; }
++ *    foo(x);
++ *
++ * In the call the value of x is computed before modifiyX() is executed.
++ * Directly inlining foo would yield:
++ *    modifiyX() + x;
++ * which evaluates x after modifiyX(), possibly changing the result if modifiyX() alters x.
++ * We therefore walk the function’s body (block) to find the first occurrence of the
++ * parameter “a” and examine its surrounding context. (We allow direct substitution
++ * when the parameter occurs as an argument to a call or as the “object” of a property access,
++ * or in an assignment’s left–side.)
++ */
++private boolean isParameterUsageSafe(Node fnNode, String paramName, Node callArg) {
++  Node block = fnNode.getLastChild();
++  Node usage = findFirstParameterUsage(block, paramName);
++  if (usage == null) {
++    // If the parameter isn’t used at all, there is no risk.
++    return true;
++  }
++  Node parent = usage.getParent();
++  switch (parent.getType()) {
++    case Token.CALL:
++      // When used as an argument inside a call the substitution is safe.
++      return true;
++    case Token.GETPROP:
++    case Token.GETELEM:
++      // For property accesses, if the parameter is the receiver (first child), it’s safe.
++      return parent.getFirstChild() == usage;
++    case Token.ASSIGN:
++      // In an assignment like a.x = 2, if the parameter is the object (left–side) it’s safe.
++      // Otherwise (if used on the right), we allow direct inlining only if the call–argument
++      // is trivial (a name or literal).
++      if (parent.getFirstChild() == usage) {
++        return true;
++      }
++      return isTrivial(callArg);
++    default:
++      // For binary operators (such as “+” or the comma operator), the left operand is evaluated
++      // before the right. So if the parameter appears as any operand other than the first,
++      // then any side effects in the first operand would occur before the inlined call–argument is evaluated.
++      if (parent.getChildCount() > 0 && parent.getChildAtIndex(0) != usage) {
++        // If the first operand may have side effects, then reordering is dangerous.
++        if (NodeUtil.mayHaveSideEffects(parent.getChildAtIndex(0), compiler)) {
++          return false;
++        } else {
++          // If the first operand is side–effect free, then a trivial call–argument (name or literal)
++          // is acceptable.
++          return isTrivial(callArg);
++        }
++      }
++      return true;
++  }
++}
++
++private boolean isTrivial(Node n) {
++  return n.isName() || n.isLiteral();
++}
++
++/**
++ * Recursively traverses the given AST (in evaluation order) to find the first occurrence
++ * of a NAME node whose string equals the specified parameter name. Returns null if not found.
++ */
++private Node findFirstParameterUsage(Node root, String paramName) {
++  if (root == null) {
++    return null;
++  }
++  if (root.isName() && paramName.equals(root.getString())) {
++    return root;
++  }
++  for (Node child = root.getFirstChild(); child != null; child = child.getNext()) {
++    Node found = findFirstParameterUsage(child, paramName);
++    if (found != null) {
++      return found;
++    }
++  }
++  return null;
++}
+\ No newline at end of file

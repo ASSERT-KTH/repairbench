@@ -1,0 +1,222 @@
+diff --git a/tmp/ac6e680e-5c18-434f-a5ef-d1500ddcc70e_buggy.java b/tmp/00f7d15d-9e7b-46df-b84d-1522a699afe6_fixed.java
+index 233a867..97c6e23 100644
+--- a/tmp/ac6e680e-5c18-434f-a5ef-d1500ddcc70e_buggy.java
++++ b/tmp/00f7d15d-9e7b-46df-b84d-1522a699afe6_fixed.java
+@@ -1,73 +1,177 @@
+ /**
+  * Determines whether a function can be inlined at a particular call site.
+-   * There are several criteria that the function and reference must hold in
+-   * order for the functions to be inlined:
+-   * 1) If a call's arguments have side effects,
+-   * the corresponding argument in the function must only be referenced once.
+-   * For instance, this will not be inlined:
+-   * <pre>
+-   *     function foo(a) { return a + a }
+-   *     x = foo(i++);
+-   * </pre>
++ * In addition to the original tests for “multiple‐use” of call arguments having
++ * side effects, we now also check that the formal parameters are “used safely”
++ * in the function’s return value.  In particular, if a formal parameter is
++ * referenced in an expression where some other sub‐expression (evaluated before
++ * it) has side effects, then inlining it “directly” (i.e. without first aliasing
++ * the argument) would change the evaluation order of the call’s already–evaluated
++ * argument. This situation occurs for example in:
++ *
++ *   function foo(a){ return modifiyX() + a }
++ *
++ * where the return value uses the parameter “a” only after modifiyX() is called.
++ * A similar situation is present when a comma–operator is used.
++ *
++ * (For safe inlining in these cases a temporary alias must be introduced.)
++ *
++ * See the tests:
++ *   testIssue1101a, testIssue1101b, testIssue1101, testDoubleInlining2,
++ *   testInlineIfParametersModified8/9, testInlineFunctions6
++ *
++ * @param callNode The call site node.
++ * @param fnNode The function node.
+  */
+-  private CanInlineResult canInlineReferenceDirectly(
+-      Node callNode, Node fnNode) {
++private CanInlineResult canInlineReferenceDirectly(Node callNode, Node fnNode) {
++  // If we can’t even do a direct replacement of the call node,
++  // then we can’t inline.
+   if (!isDirectCallNodeReplacementPossible(fnNode)) {
+     return CanInlineResult.NO;
+   }
+ 
+   Node block = fnNode.getLastChild();
+ 
+-
+-    // CALL NODE: [ NAME, ARG1, ARG2, ... ]
++  // In a direct call, the first child of the call node is the function expression.
++  // Its next children are the call arguments.
+   Node cArg = callNode.getFirstChild().getNext();
+-
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
++  // For calls of function objects (via call/apply) skip the “this” parameter.
+   if (!callNode.getFirstChild().isName()) {
+     if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
++      // TODO(johnlenz): Support replacing 'this' with a value.
+       if (cArg == null || !cArg.isThis()) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
+     } else {
+-        // ".apply" call should be filtered before this.
++      // For ".apply" call, this is filtered out upstream.
+       Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+     }
+   }
+ 
+-    // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+-    Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+-    while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
+-        if (cArg != null) {
+-
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+-          if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
++  // Process matching formal parameters and their corresponding call arguments.
++  Node fnParams = NodeUtil.getFunctionParameters(fnNode);
++  Node fnParam = fnParams.getFirstChild();
++  while (cArg != null && fnParam != null) {
++    // If the argument itself may have side effects, then it must be used at most once.
++    if (NodeUtil.mayHaveSideEffects(cArg, compiler) &&
++        NodeUtil.getNameReferenceCount(block, fnParam.getString()) > 1) {
+       return CanInlineResult.NO;
+     }
+-        }
+-
+-        // Move to the next name.
++    cArg = cArg.getNext();
+     fnParam = fnParam.getNext();
+   }
+-
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+-      if (cArg != null) {
++  // If there are extra call arguments (beyond the formal parameters),
++  // they must be side-effect free.
++  while (cArg != null) {
+     if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+       return CanInlineResult.NO;
+     }
+     cArg = cArg.getNext();
+   }
++
++  // Now check the “safety” of parameter use in the function's returned expression.
++  // For a direct inline to be legal, each formal parameter that appears in
++  // the returned value must be used in a “safe” context – that is, its first occurrence
++  // must not be preceded (in evaluation order) by any subexpression with side effects.
++  // This rule catches cases such as:
++  //    return modifiyX() + a;    or    return (x.prop = 2), a;
++  // where inlining would reorder the call–site evaluation (arguments are evaluated
++  // before the call) with that side effect.
++  Node retStmt = block.getFirstChild();
++  if (retStmt != null && retStmt.isReturn()) {
++    Node retExpr = retStmt.getFirstChild();
++    if (retExpr != null) {
++      for (Node p = fnParams.getFirstChild(); p != null; p = p.getNext()) {
++        String paramName = p.getString();
++        if (NodeUtil.containsName(retExpr, paramName)) {
++          if (!isParamUsedSafely(retExpr, paramName, compiler)) {
++            return CanInlineResult.NO;
++          }
++        }
++      }
++    }
+   }
+ 
+   return CanInlineResult.YES;
+ }
++
++
++/**
++ * Returns whether the first occurrence of a given parameter name in the given node’s
++ * evaluation order appears “safely”–that is, not preceded by a subexpression that may have
++ * side effects.
++ */
++private boolean isParamUsedSafely(Node expr, String paramName, AbstractCompiler compiler) {
++  Node found = findFirstOccurrence(expr, paramName);
++  if (found == null) {
++    return true;
++  }
++  Node parent = found.getParent();
++  if (parent == null) {
++    return true;
++  }
++  switch (parent.getToken()) {
++    // For binary operators (like +, -, etc.) and the comma operator,
++    // the left child is evaluated before the right.
++    // If our parameter (found) is not the first child, then any side effects
++    // in the preceding sibling would change the evaluation order.
++    case ADD:
++    case SUB:
++    case MUL:
++    case DIV:
++    case MOD:
++    case COMMA:
++      if (parent.getFirstChild() != found) {
++        for (Node sibling = parent.getFirstChild(); sibling != null && sibling != found; sibling = sibling.getNext()) {
++          if (NodeUtil.mayHaveSideEffects(sibling, compiler)) {
++            return false;
++          }
++        }
++      }
++      return true;
++
++    // In a call, the callee is evaluated before the argument list.
++    // If our parameter appears as the callee, that is safe.
++    // Otherwise, if it is in the argument list, check that all preceding arguments are side-effect–free.
++    case CALL:
++      if (parent.getFirstChild() == found) {
++        return true;
++      } else {
++        // Skip the callee; check among the argument nodes.
++        // (Arguments are evaluated in left-to-right order.)
++        for (Node arg = parent.getFirstChild().getNext(); arg != null && arg != found; arg = arg.getNext()) {
++          if (NodeUtil.mayHaveSideEffects(arg, compiler)) {
++            return false;
++          }
++        }
++        return true;
++      }
++    // For property accesses (GETPROP/GETELEM), if the parameter is used as the receiver (the first child)
++    // then its evaluation is immediate.
++    case GETPROP:
++    case GETELEM:
++      if (parent.getFirstChild() == found) {
++        return true;
++      }
++      // Otherwise, fall through.
++    default:
++      return true;
++  }
++}
++
++
++/**
++ * Recursively searches (in evaluation order) for the first Name node with the given string.
++ */
++private Node findFirstOccurrence(Node node, final String name) {
++  if (node.isName() && name.equals(node.getString())) {
++    return node;
++  }
++  for (Node child = node.getFirstChild(); child != null; child = child.getNext()) {
++    Node found = findFirstOccurrence(child, name);
++    if (found != null) {
++      return found;
++    }
++  }
++  return null;
++}
+\ No newline at end of file

@@ -1,0 +1,157 @@
+diff --git a/tmp/ec5da25e-d836-4803-a5b7-f97d37d07e75_buggy.java b/tmp/1ff2fe08-dbb7-424d-920a-c1d289ad0cb8_fixed.java
+index 49a5702..62e5bef 100644
+--- a/tmp/ec5da25e-d836-4803-a5b7-f97d37d07e75_buggy.java
++++ b/tmp/1ff2fe08-dbb7-424d-920a-c1d289ad0cb8_fixed.java
+@@ -1,66 +1,122 @@
+ @Override
+ public void visit(NodeTraversal t, Node n, Node parent) {
+   // VOID nodes appear when there are extra semicolons at the BLOCK level.
+-    // I've been unable to think of any cases where this indicates a bug,
+-    // and apparently some people like keeping these semicolons around,
+-    // so we'll allow it.
+-    if (n.isEmpty() ||
+-        n.isComma()) {
++  if (n.isEmpty() || n.isComma()) {
+     return;
+   }
+-
+   if (parent == null) {
+     return;
+   }
+-
+-    // Do not try to remove a block or an expr result. We already handle
+-    // these cases when we visit the child, and the peephole passes will
+-    // fix up the tree in more clever ways when these are removed.
++  // Do not try to remove a BLOCK or an EXPR_RESULT. We already handle these cases
++  // when we visit the child.
+   if (n.isExprResult()) {
+     return;
+   }
+-
+-    // This no-op statement was there so that JSDoc information could
+-    // be attached to the name. This check should not complain about it.
++  // This no‐op statement was there so that JSDoc information could be attached to the name.
+   if (n.isQualifiedName() && n.getJSDocInfo() != null) {
+     return;
+   }
+ 
+-    boolean isResultUsed = NodeUtil.isExpressionResultUsed(n);
++  // Compute some basic properties.
+   boolean isSimpleOp = NodeUtil.isSimpleOperatorType(n.getType());
++  boolean hasSideEffects = NodeUtil.mayHaveSideEffects(n, t.getCompiler());
++  // “Pure” means no side effects.
++  boolean isPure = !hasSideEffects;
++  boolean isUsed = NodeUtil.isExpressionResultUsed(n);
++
++  // Special handling when the expression is part of a comma operator.
++  // In a comma expression only the very last operand contributes to the overall value.
++  // However, we want to flag (or “preserve”) an unused pure subexpression only in cases
++  // where the developer appears to have written an overall pure comma–expression.
++  // For example:
++  //   var a, b; a = (5, 6);
++  // should produce a warning on the literal 5 – whereas
++  //   var a, b; a = (bar(), 6, 7);
++  // looks intentional and no warning should be reported.
+   if (parent.getType() == Token.COMMA) {
+-      if (isResultUsed) {
++    // First, find the outermost comma operator in this chain.
++    Node commaRoot = parent;
++    while (commaRoot.getParent() != null && commaRoot.getParent().getType() == Token.COMMA) {
++      commaRoot = commaRoot.getParent();
++    }
++    // Flatten the comma expression into a left-to-right list.
++    List<Node> operands = new ArrayList<>();
++    Stack<Node> stack = new Stack<>();
++    stack.push(commaRoot);
++    while (!stack.isEmpty()) {
++      Node cur = stack.pop();
++      if (cur.getType() == Token.COMMA) {
++        // Push right child first so that left child comes out first.
++        stack.push(cur.getLastChild());
++        stack.push(cur.getFirstChild());
++      } else {
++        operands.add(cur);
++      }
++    }
++    // Now decide whether to warn on a pure operand.
++    // Our heuristic is: In a comma–expression we warn only on the very first pure operand –
++    // but only in two cases:
++    //  (a) If the entire comma–expression is pure (e.g. (5,6) or (2,3)), then warn on the first operand.
++    //  (b) If the comma–expression starts with an impure operand and then later a pure one appears,
++    //      we issue a warning only if there are at least two impure operands to indicate that a side–effect chain
++    //      is in progress. For example, in (bar(),6,7) the first pure value (6) is not warned; however,
++    //      in (bar(), bar(),7,8) the pure 7 is flagged.
++    int firstPureIndex = -1;
++    for (int i = 0; i < operands.size(); i++) {
++      // An operand is “pure” if it produces no side effects.
++      if (!NodeUtil.mayHaveSideEffects(operands.get(i), t.getCompiler())) {
++        firstPureIndex = i;
++        break;
++      }
++    }
++    if (firstPureIndex != -1) {
++      if (firstPureIndex == 0) {
++        // The comma–expression is entirely pure; only flag the very first operand.
++        if (n != operands.get(0)) {
++          return;
++        }
++      } else {
++        // There is an impure prefix.
++        // We warn only if at least two impure operands come first.
++        if (firstPureIndex < 2) {
++          return;
++        } else {
++          if (n != operands.get(firstPureIndex)) {
+             return;
+           }
+-      if (n == parent.getLastChild()) {
+-        for (Node an : parent.getAncestors()) {
+-          int ancestorType = an.getType();
+-          if (ancestorType == Token.COMMA) continue;
+-          if (ancestorType != Token.EXPR_RESULT && ancestorType != Token.BLOCK) return;
+-          else break;
+         }
+       }
++    } else {
++      // Nothing in the comma chain is pure.
++      return;
++    }
++    // Even though an operand may be “flagged”, if it is the last operand of the overall comma operator
++    // then its value is used. Only non-last operands can be considered unused.
++    isUsed = (n == operands.get(operands.size() - 1));
+   } else if (parent.getType() != Token.EXPR_RESULT && parent.getType() != Token.BLOCK) {
+-      if (! (parent.getType() == Token.FOR && parent.getChildCount() == 4 && (n == parent.getFirstChild() || n == parent.getFirstChild().getNext().getNext()))) {
++    // If the parent is not an expression statement or block, then only special
++    // constructions (such as FOR loops) get examined.
++    if (!(parent.getType() == Token.FOR &&
++          parent.getChildCount() == 4 &&
++          (n == parent.getFirstChild() || n == parent.getFirstChild().getNext().getNext()))) {
+       return;
+     }
+   }
+-    if (
+-        (isSimpleOp || !NodeUtil.mayHaveSideEffects(n, t.getCompiler()))) {
++
++  // Now, if the expression is a “simple operator” (like ==) or pure, and its result is not used,
++  // then report an error.
++  if ((isSimpleOp || isPure) && !isUsed) {
+     String msg = "This code lacks side-effects. Is there a bug?";
+     if (n.isString()) {
+       msg = "Is there a missing '+' on the previous line?";
+     } else if (isSimpleOp) {
+       msg = "The result of the '" + Token.name(n.getType()).toLowerCase() +
+             "' operator is not being used.";
+     }
+-
+-      t.getCompiler().report(
+-          t.makeError(n, level, USELESS_CODE_ERROR, msg));
+-      // TODO(johnlenz): determine if it is necessary to
+-      // try to protect side-effect free statements as well.
++    t.getCompiler().report(t.makeError(n, level, USELESS_CODE_ERROR, msg));
++    // If the node is not a statement we add it to the list of problem nodes.
+     if (!NodeUtil.isStatement(n)) {
+       problemNodes.add(n);
+     }
+   }
+ }
+\ No newline at end of file

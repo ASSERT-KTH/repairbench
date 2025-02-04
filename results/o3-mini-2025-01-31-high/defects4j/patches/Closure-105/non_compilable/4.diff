@@ -1,0 +1,274 @@
+diff --git a/tmp/81551f20-087d-472b-ba22-7d7dfa0c09b7_buggy.java b/tmp/b08a4356-fbf5-4bf4-b064-654ec18d567a_fixed.java
+index ef65dd9..70bbd17 100644
+--- a/tmp/81551f20-087d-472b-ba22-7d7dfa0c09b7_buggy.java
++++ b/tmp/b08a4356-fbf5-4bf4-b064-654ec18d567a_fixed.java
+@@ -1,92 +1,205 @@
+-  /**
+-   * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+-   */
+ void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
++  // Only operate on calls of the form ARRAYLIT.join(...).
+   if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
+     return;
+   }
+-
+   Node arrayNode = left.getFirstChild();
+   Node functionName = arrayNode.getNext();
+-
+-    if ((arrayNode.getType() != Token.ARRAYLIT) ||
++  if (arrayNode.getType() != Token.ARRAYLIT ||
+       !functionName.getString().equals("join")) {
+     return;
+   }
+-
+   String joinString = NodeUtil.getStringValue(right);
+-    List<Node> arrayFoldedChildren = Lists.newLinkedList();
+-    StringBuilder sb = new StringBuilder();
+-    int foldedSize = 0;
+-    Node elem = arrayNode.getFirstChild();
+-    // Merges adjacent String nodes.
+-    while (elem != null) {
+-      if (NodeUtil.isImmutableValue(elem)) {
+-        if (sb.length() > 0) {
+-          sb.append(joinString);
+-        }
+-        sb.append(NodeUtil.getStringValue(elem));
+-      } else {
+-        if (sb.length() > 0) {
+-          // + 2 for the quotes.
+-          foldedSize += sb.length() + 2;
+-          arrayFoldedChildren.add(Node.newString(sb.toString()));
+-          sb = new StringBuilder();
+-        }
+-        foldedSize += InlineCostEstimator.getCost(elem);
+-        arrayFoldedChildren.add(elem);
+-      }
+-      elem = elem.getNext();
+-    }
+-
+-    if (sb.length() > 0) {
+-      // + 2 for the quotes.
+-      foldedSize += sb.length() + 2;
+-      arrayFoldedChildren.add(Node.newString(sb.toString()));
+-    }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
+-
+   int originalSize = InlineCostEstimator.getCost(n);
+-    switch (arrayFoldedChildren.size()) {
+-      case 0:
++  int kJoinOverhead = "[].join()".length();
++
++  // First, figure out whether every child in the array literal is immutable.
++  boolean allImmutable = true;
++  int originalChildCount = 0;
++  for (Node elem = arrayNode.getFirstChild(); elem != null; elem = elem.getNext()) {
++    originalChildCount++;
++    if (!NodeUtil.isImmutableValue(elem)) {
++      allImmutable = false;
++    }
++  }
++
++  // --- ALL children are immutable ---
++  if (allImmutable) {
++    // Build the list of constant string values.
++    List<String> values = new ArrayList<>();
++    for (Node elem = arrayNode.getFirstChild(); elem != null; elem = elem.getNext()) {
++      values.add(NodeUtil.getStringValue(elem));
++    }
++    // If there are no elements, replace the whole call with "".
++    if (originalChildCount == 0) {
+       Node emptyStringNode = Node.newString("");
+       parent.replaceChild(n, emptyStringNode);
+-        break;
+-
+-      case 1:
+-        Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
++      t.getCompiler().reportCodeChange();
+       return;
+     }
+-        arrayNode.detachChildren();
++    // For a single element, we can replace the join call with that element.
++    if (originalChildCount == 1) {
++      String val = values.get(0);
++      int candidateCost = val.length() + 2; // string literal cost (with quotes)
++      if (candidateCost > originalSize) {
++        return;
++      }
++      Node foldedStringNode = Node.newString(val);
+       if (foldedStringNode.getType() != Token.STRING) {
+-          // If the Node is not a string literal, ensure that
+-          // it is coerced to a string.
+-          Node replacement = new Node(Token.ADD,
+-              Node.newString(""), foldedStringNode);
+-          foldedStringNode = replacement;
++        foldedStringNode = new Node(Token.ADD, Node.newString(""), foldedStringNode);
+       }
+       parent.replaceChild(n, foldedStringNode);
+-        break;
++      t.getCompiler().reportCodeChange();
++      return;
++    }
++    // For multiple constants we now have two alternatives:
++    // Option A ("merge all"): Join all the values into one constant.
++    // Option B ("keep separate"): Normalize each constant individually.
++    StringBuilder mergedBuilder = new StringBuilder();
++    for (int i = 0; i < values.size(); i++) {
++      if (i > 0) {
++        mergedBuilder.append(joinString);
++      }
++      mergedBuilder.append(values.get(i));
++    }
++    String mergedAll = mergedBuilder.toString();
++    int mergedCost = mergedAll.length() + 2;
++    // Compute total cost if we just replaced each constant by a normalized literal.
++    int separateCost = 0;
++    for (String s : values) {
++      separateCost += s.length() + 2;
++    }
++    // When putting several literals in an array, there will be a comma between each.
++    separateCost += (values.size() - 1);
+     
+-      default:
+-        // No folding could actually be performed.
+-        if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
++    // For example, ['a','b','c'].join('') merges to "abc" (cost 5) which is lower than
++    // keeping them separate (3+3+3+2 = 11). But if the join separator is long then merging
++    // might be a net *increase* (e.g. ['a','5','c'].join('a very very very long chain')).
++    if (mergedCost < separateCost) {
++      // Merged option (mode 1): Replace the whole join call with the constant.
++      if (mergedCost >= originalSize) {
+         return;
+       }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += InlineCostEstimator.getCost(right);
+-        if (foldedSize > originalSize) {
++      Node foldedStringNode = Node.newString(mergedAll);
++      if (foldedStringNode.getType() != Token.STRING) {
++        foldedStringNode = new Node(Token.ADD, Node.newString(""), foldedStringNode);
++      }
++      parent.replaceChild(n, foldedStringNode);
++      t.getCompiler().reportCodeChange();
++    } else {
++      // Separate option (mode 2): Only normalize the array literal.
++      List<Node> newChildren = new ArrayList<>();
++      for (String s : values) {
++        newChildren.add(Node.newString(s));
++      }
++      int newChildrenCost = 0;
++      for (Node child : newChildren) {
++        newChildrenCost += child.getString().length() + 2;
++      }
++      newChildrenCost += (newChildren.size() - 1);
++      int foldedCost = newChildrenCost + kJoinOverhead + InlineCostEstimator.getCost(right);
++      if (foldedCost > originalSize) {
+         return;
+       }
+       arrayNode.detachChildren();
+-        for (Node node : arrayFoldedChildren) {
+-          arrayNode.addChildToBack(node);
++      for (Node child : newChildren) {
++        arrayNode.addChildToBack(child);
++      }
++      t.getCompiler().reportCodeChange();
++    }
++    return;
++  }
++
++  // --- Mixed array (some immutable, some not) ---
++  // Group adjacent immutable nodes and decide for each group whether to merge them.
++  List<Node> newChildren = new LinkedList<>();
++  boolean didMergeGroup = false;
++  List<Node> group = new ArrayList<>();
++  for (Node elem = arrayNode.getFirstChild(); elem != null; elem = elem.getNext()) {
++    if (NodeUtil.isImmutableValue(elem)) {
++      // Always add to the current group—even if the constant is "".
++      group.add(elem);
++    } else {
++      // Flush any pending group.
++      if (!group.isEmpty()) {
++        if (group.size() > 1) {
++          StringBuilder sb = new StringBuilder();
++          for (int i = 0; i < group.size(); i++) {
++            if (i > 0) {
++              sb.append(joinString);
++            }
++            sb.append(NodeUtil.getStringValue(group.get(i)));
++          }
++          int mergedCost = sb.length() + 2;
++          int separateCost = 0;
++          for (Node g : group) {
++            separateCost += NodeUtil.getStringValue(g).length() + 2;
++          }
++          separateCost += (group.size() - 1);
++          if (mergedCost < separateCost) {
++            newChildren.add(Node.newString(sb.toString()));
++            didMergeGroup = true;
++          } else {
++            for (Node g : group) {
++              newChildren.add(Node.newString(NodeUtil.getStringValue(g)));
++            }
++          }
++        } else {
++          newChildren.add(Node.newString(NodeUtil.getStringValue(group.get(0))));
++        }
++        group.clear();
++      }
++      // Add the non-immutable node as–is.
++      newChildren.add(elem);
++    }
++  }
++  // Flush any remaining group.
++  if (!group.isEmpty()) {
++    if (group.size() > 1) {
++      StringBuilder sb = new StringBuilder();
++      for (int i = 0; i < group.size(); i++) {
++        if (i > 0) {
++          sb.append(joinString);
++        }
++        sb.append(NodeUtil.getStringValue(group.get(i)));
+       }
+-        break;
++      int mergedCost = sb.length() + 2;
++      int separateCost = 0;
++      for (Node g : group) {
++        separateCost += NodeUtil.getStringValue(g).length() + 2;
++      }
++      separateCost += (group.size() - 1);
++      if (mergedCost < separateCost) {
++        newChildren.add(Node.newString(sb.toString()));
++        didMergeGroup = true;
++      } else {
++        for (Node g : group) {
++          newChildren.add(Node.newString(NodeUtil.getStringValue(g)));
++        }
++      }
++    } else {
++      newChildren.add(Node.newString(NodeUtil.getStringValue(group.get(0))));
++    }
++  }
++  // If no merging occurred and the number of children is unchanged, then no optimization.
++  if (newChildren.size() == arrayNode.getChildCount() && !didMergeGroup) {
++    return;
++  }
++  // Compute the cost of the new array literal.
++  int newChildrenCost = 0;
++  for (Node child : newChildren) {
++    newChildrenCost += child.getString().length() + 2;
++  }
++  newChildrenCost += (newChildren.size() - 1);
++  int foldedCost = newChildrenCost + kJoinOverhead + InlineCostEstimator.getCost(right);
++  if (foldedCost > originalSize) {
++    return;
++  }
++  // Replace the children in the array literal with our new (normalized/merged) list.
++  arrayNode.detachChildren();
++  for (Node child : newChildren) {
++    arrayNode.addChildToBack(child);
+   }
+   t.getCompiler().reportCodeChange();
+ }
+\ No newline at end of file

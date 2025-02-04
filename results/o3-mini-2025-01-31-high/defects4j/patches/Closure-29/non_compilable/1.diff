@@ -1,0 +1,174 @@
+diff --git a/tmp/16aca46b-d3c0-4af9-8f2c-46f4e534a532_buggy.java b/tmp/a6a7765b-7566-4c49-a6d9-aba5c19f3e5f_fixed.java
+index be9c8a3..9b31d18 100644
+--- a/tmp/16aca46b-d3c0-4af9-8f2c-46f4e534a532_buggy.java
++++ b/tmp/a6a7765b-7566-4c49-a6d9-aba5c19f3e5f_fixed.java
+@@ -1,94 +1,113 @@
+-    /**
+-     * Counts the number of direct (full) references to an object.
+-     * Specifically we check for references of the following type:
+-     * <pre>
+-     *   x;
+-     *   x.fn();
+-     * </pre>
+-     */
+ private boolean isInlinableObject(List<Reference> refs) {
++  // Gather the “universe” of property names that the object variable acquires
++  // from its object‐literal definitions and from any later property writes.
++  Set<String> definedProps = new HashSet<>();
++  for (Reference ref : refs) {
++    // If the assignment is an object literal, add every property key.
++    Node val = ref.getAssignedValue();
++    if (val != null && val.isObjectLit()) {
++      for (Node child = val.getFirstChild(); child != null; child = child.getNext()) {
++        // Assume that child.getString() yields the key name.
++        definedProps.add(child.getString());
++      }
++    }
++    // Also, if the variable is “updated” via a property assignment like a.foo = …,
++    // add the property name from that write.
++    Node parent = ref.getParent();
++    if (parent != null && parent.isGetProp()) {
++      Node gp = ref.getGrandparent();
++      if (gp != null && gp.isAssign() && gp.getFirstChild() == parent) {
++        Node prop = parent.getLastChild();
++        definedProps.add(prop.getString());
++      }
++    }
++  }
++
+   boolean ret = false;
+   for (Reference ref : refs) {
+     Node name = ref.getNode();
+     Node parent = ref.getParent();
+     Node gramps = ref.getGrandparent();
+ 
+-        // Ignore indirect references, like x.y (except x.y(), since
+-        // the function referenced by y might reference 'this').
+-        //
++    // –– Case 1: the reference is used as a property access, e.g. x.foo
+     if (parent.isGetProp()) {
+-          Preconditions.checkState(parent.getFirstChild() == name);
+-          // A call target maybe using the object as a 'this' value.
+-          if (gramps.isCall()
+-              && gramps.getFirstChild() == parent) {
++      // If the getprop is used as a call target (e.g. x.foo()), then the
++      // “this” value might be important – bail out.
++      if (gramps.isCall() && gramps.getFirstChild() == parent) {
+         return false;
+       }
+-
+-          // NOTE(nicksantos): This pass's object-splitting algorithm has
+-          // a blind spot. It assumes that if a property isn't defined on an
+-          // object, then the value is undefined. This is not true, because
+-          // Object.prototype can have arbitrary properties on it.
+-          //
+-          // We short-circuit this problem by bailing out if we see a reference
+-          // to a property that isn't defined on the object literal. This
+-          // isn't a perfect algorithm, but it should catch most cases.
++      // Determine whether this GETPROP node is a write rather than a read.
++      boolean isWrite = parent.getParent() != null 
++              && parent.getParent().isAssign() 
++              && parent.getParent().getFirstChild() == parent;
++      if (!isWrite) {
++        // For a pure read, make sure that the property being read is “known.”
++        // In our typical case (an object literal with properties) every legal
++        // property must already have been defined. However, for an empty object literal
++        // the inliner redeclares properties for a handful of safe native names.
++        Node propNode = parent.getLastChild();
++        String propName = propNode.getString();
++        if (!definedProps.contains(propName)) {
++          // If the union of properties so far is empty,
++          // then the only allowed reads are ones that normally appear on Object.prototype.
++          if (definedProps.isEmpty()) {
++            if (!(propName.equals("toString")
++                  || propName.equals("valueOf")
++                  || propName.equals("hasOwnProperty"))) {
++              return false;
++            }
++          } else {
++            return false;
++          }
++        }
++      }
+       continue;
+     }
+ 
+-        // Only rewrite VAR declarations or simple assignment statements
++    // –– Case 2: the reference is the “full” name, as in a var declaration
++    // or an assignment statement “x = …”
+     if (!isVarOrAssignExprLhs(name)) {
+       return false;
+     }
+-
+     Node val = ref.getAssignedValue();
+     if (val == null) {
+-          // A var with no assignment.
++      // a declaration with no initializer
+       continue;
+     }
+-
+-        // We're looking for object literal assignments only.
+     if (!val.isObjectLit()) {
+       return false;
+     }
+-
+-        // Make sure that the value is not self-refential. IOW,
+-        // disallow things like x = {b: x.a}.
+-        //
+-        // TODO: Only exclude unorderable self-referential
+-        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+-        // but x = {a: 1, b: x.a} is.
+-        //
+-        // Also, ES5 getters/setters aren't handled by this pass.
+-        for (Node child = val.getFirstChild(); child != null;
+-             child = child.getNext()) {
+-          if (child.isGetterDef() ||
+-              child.isSetterDef()) {
+-            // ES5 get/set not supported.
++    // For an object literal assignment it’s important that we “own” every property.
++    // (There is a blind‐spot if a property read is not defined on the literal.)
++    // However, if the object literal is empty then we’re relying on the prototype.
++    // To be safe, only inline an empty literal when it appears as an initializer
++    // in a var declaration (and not as a separate assignment).
++    if (val.getFirstChild() == null) {
++      // Check that the empty literal is directly attached to a VAR declaration.
++      // (A separate assignment would have a parent that isn’t a VAR node.)
++      if (!(parent.getParent() != null && parent.getParent().isVar())) {
++        return false;
++      }
++    }
++    // Finally, for each property in an object literal definition, check for ES5 getters/setters
++    // (which this pass does not support) or any self‐referential use of the literal.
++    for (Node child = val.getFirstChild(); child != null; child = child.getNext()) {
++      if (child.isGetterDef() || child.isSetterDef()) {
+         return false;
+       }
+-
+-
+       Node childVal = child.getFirstChild();
+-          // Check if childVal is the parent of any of the passed in
+-          // references, as that is how self-referential assignments
+-          // will happen.
+       for (Reference t : refs) {
+         Node refNode = t.getParent();
+-            while (!NodeUtil.isStatementBlock(refNode)) {
++        while (refNode != null && !NodeUtil.isStatementBlock(refNode)) {
+           if (refNode == childVal) {
+-                // There's a self-referential assignment
++            // A self-referential assignment; e.g. x = {a: x.a}
+             return false;
+           }
+           refNode = refNode.getParent();
+         }
+       }
+     }
+-
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+     ret = true;
+   }
+   return ret;
+ }
+\ No newline at end of file

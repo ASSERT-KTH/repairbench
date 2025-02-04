@@ -1,0 +1,168 @@
+diff --git a/tmp/8ae607a1-4d8a-4278-8472-bd0fe365fef0_buggy.java b/tmp/39944ae1-7e55-448b-a415-b31149e3a45f_fixed.java
+index 233a867..cba196b 100644
+--- a/tmp/8ae607a1-4d8a-4278-8472-bd0fe365fef0_buggy.java
++++ b/tmp/39944ae1-7e55-448b-a415-b31149e3a45f_fixed.java
+@@ -1,73 +1,133 @@
+ /**
+  * Determines whether a function can be inlined at a particular call site.
+  * There are several criteria that the function and reference must hold in
+  * order for the functions to be inlined:
+-   * 1) If a call's arguments have side effects,
+-   * the corresponding argument in the function must only be referenced once.
++ * 1) If a call's arguments have side effects, the corresponding argument in 
++ *    the function must only be referenced once and “used in place” so that the
++ *    original caller’s evaluation order isn’t disturbed.
+  * For instance, this will not be inlined:
+  * <pre>
+  *     function foo(a) { return a + a }
+  *     x = foo(i++);
+  * </pre>
+  */
+-  private CanInlineResult canInlineReferenceDirectly(
+-      Node callNode, Node fnNode) {
++private CanInlineResult canInlineReferenceDirectly(Node callNode, Node fnNode) {
++  // First, check that the general requirements of a direct call inlining
++  // are met.
+   if (!isDirectCallNodeReplacementPossible(fnNode)) {
+     return CanInlineResult.NO;
+   }
+ 
++  // The function body. (Expected to be a BLOCK node.)
+   Node block = fnNode.getLastChild();
+ 
+-
++  // Adjust the call arguments.
+   // CALL NODE: [ NAME, ARG1, ARG2, ... ]
+   Node cArg = callNode.getFirstChild().getNext();
+-
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
++  // For calls like foo.call(...), the first argument is the "this" value.
+   if (!callNode.getFirstChild().isName()) {
+     if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
++      // TODO(johnlenz): Support replacing "this" with an appropriate value.
+       if (cArg == null || !cArg.isThis()) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
+     } else {
+-        // ".apply" call should be filtered before this.
++      // ".apply" calls should have been filtered out already.
+       Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+     }
+   }
+ 
+   // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+   Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+-    while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
+-        if (cArg != null) {
+ 
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+-          if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
++  // We now iterate in lock‐step over the formal parameters and the call arguments.
++  // While the basic side‐effect check (evaluated more than once) is still in place,
++  // we also perform an “ordering” test.
++  // The idea is that in a standard call, all arguments are evaluated before
++  // the function body runs. When inlined directly, a parameter’s value is
++  // substituted at its occurrence in the body.  That means that if the first
++  // occurrence of a parameter does not appear “up‐front” (that is, at the
++  // beginning of an expression) then the caller’s evaluation order is not maintained.
++  while (fnParam != null && cArg != null) {
++    // 1. If the argument might produce side effects (or is mutable)
++    //    and its corresponding formal is referenced more than once,
++    //    then inlining is unsafe.
++    if ((NodeUtil.mayHaveSideEffects(cArg, compiler)
++         || NodeUtil.mayEffectMutableState(cArg, compiler))
++        && NodeUtil.getNameReferenceCount(block, fnParam.getString()) > 1) {
+       return CanInlineResult.NO;
+     }
++
++    // 2. Check that the lone substitution won’t disturb evaluation order.
++    // In a function call, the argument is evaluated up front.
++    // But when inlined, the call argument “appears” only where the formal is used.
++    // We locate the first occurrence of the formal parameter inside the function’s body
++    // and then require that it appear in a “safe” syntactic position.
++    // For example, if the first occurrence is the left‐hand operand of a binary operator,
++    // then the argument will be evaluated immediately. However, if it appears as the
++    // right operand, then some side‐effect (from other sub‐expressions, say) may come first.
++    Node firstRef = NodeUtil.getFirstReference(block, fnParam.getString());
++    if (firstRef != null) {
++      boolean safePosition = false;
++      Node parent = firstRef.getParent();
++      int parentType = parent.getType();
++      switch (parentType) {
++        // For property gets and element accesses, the object expression is evaluated first.
++        case Token.GETPROP:
++        case Token.GETELEM:
++          safePosition = (parent.getFirstChild() == firstRef);
++          break;
++        // For most binary operators the left operand is evaluated first.
++        // So to be “inlined‐in‐place” the parameter must be the left child.
++        case Token.ADD:
++        case Token.SUB:
++        case Token.MUL:
++        case Token.DIV:
++        case Token.COMMA:
++          safePosition = (parent.getFirstChild() == firstRef);
++          break;
++        case Token.CALL:
++          // In a call, if the parameter appears as the call’s function then it is used immediately.
++          // Otherwise, if it is the (only) argument – it will be evaluated when the call is made.
++          if (firstRef == parent.getFirstChild()) {
++            safePosition = true;
++          } else {
++            // Otherwise, if the parameter is not the very first argument, then its evaluation would
++            // occur later than the other arguments.  We consider that unsafe.
++            int index = 0;
++            for (Node n = parent.getFirstChild(); n != null; n = n.getNext()) {
++              if (n == firstRef) {
++                break;
++              }
++              index++;
++            }
++            safePosition = (index == 1 && parent.getChildCount() == 2);
++          }
++          break;
++        default:
++          safePosition = false;
++      }
++      // For safety the parameter’s substitution must occur in a "front‐loaded" position.
++      // There is one small exception: if the call argument is a literal value
++      // (number, string, boolean, or null) then its evaluation order is irrelevant.
++      if (!safePosition) {
++        if (cArg.isName() || !cArg.isLiteral()) {
++          return CanInlineResult.NO;
++        }
++      }
+     }
+ 
+-        // Move to the next name.
++    // Advance to the next parameter/argument pair.
+     fnParam = fnParam.getNext();
++    cArg = cArg.getNext();
+   }
+ 
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+-      if (cArg != null) {
+-        if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
++  // If there is a mismatch between the number of parameters and call arguments, then
++  // direct inlining is not possible.
++  if (fnParam != null || cArg != null) {
+     return CanInlineResult.NO;
+   }
+-        cArg = cArg.getNext();
+-      }
+-    }
+ 
+   return CanInlineResult.YES;
+ }
+\ No newline at end of file

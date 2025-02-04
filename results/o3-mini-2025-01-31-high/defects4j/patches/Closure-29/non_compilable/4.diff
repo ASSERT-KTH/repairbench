@@ -1,0 +1,160 @@
+diff --git a/tmp/b40d9196-c12d-4c62-bc37-a8c7ee1d7e12_buggy.java b/tmp/d3486dc7-2353-4219-ac59-cc7ec23852e9_fixed.java
+index be9c8a3..c01e244 100644
+--- a/tmp/b40d9196-c12d-4c62-bc37-a8c7ee1d7e12_buggy.java
++++ b/tmp/d3486dc7-2353-4219-ac59-cc7ec23852e9_fixed.java
+@@ -1,94 +1,107 @@
+ /**
+  * Counts the number of direct (full) references to an object.
+  * Specifically we check for references of the following type:
+  * <pre>
+  *   x;
+  *   x.fn();
+  * </pre>
++ *
++ * In order for the object literal to be “inlinable” all non‐full
++ * (i.e. GETPROP) references must only access properties that are either
++ * defined by the full assignment or (in a few very specific cases)
++ * are taken from Object.prototype.
++ *
++ * Also, if more than one full assignment exists the union of property
++ * names must be “compatible”. (For example, if a property is read but 
++ * has never been written to, we bail out unless it is one of a few 
++ * well–known prototype properties.)
+  */
+ private boolean isInlinableObject(List<Reference> refs) {
+-      boolean ret = false;
++  // When inlining an object literal, we gather the “known” property names.
++  // For a full assignment, these are the literal’s own keys; and for a property-
++  // assignment (like x.foo = …) the property name is added as soon as we see a write.
++  Set<String> inlinedKeys = new HashSet<>();
++  boolean foundFullAssignment = false;
++
+   for (Reference ref : refs) {
+     Node name = ref.getNode();
+     Node parent = ref.getParent();
+     Node gramps = ref.getGrandparent();
+ 
+-        // Ignore indirect references, like x.y (except x.y(), since
+-        // the function referenced by y might reference 'this').
+-        //
+     if (parent.isGetProp()) {
++      // The GETPROP references (indirect accesses) are not “full”
++      // references.  They are safe only if the property being accessed
++      // is one that we have already “seen” (or, for a read, is one of a few
++      // allowed properties on Object.prototype).
+       Preconditions.checkState(parent.getFirstChild() == name);
+-          // A call target maybe using the object as a 'this' value.
+-          if (gramps.isCall()
+-              && gramps.getFirstChild() == parent) {
++
++      // If the GETPROP is used as the call’s target, then the object may be used
++      // as the "this" value, and we can’t split it up.
++      if (gramps.isCall() && gramps.getFirstChild() == parent) {
+         return false;
+       }
+ 
+-          // NOTE(nicksantos): This pass's object-splitting algorithm has
+-          // a blind spot. It assumes that if a property isn't defined on an
+-          // object, then the value is undefined. This is not true, because
+-          // Object.prototype can have arbitrary properties on it.
+-          //
+-          // We short-circuit this problem by bailing out if we see a reference
+-          // to a property that isn't defined on the object literal. This
+-          // isn't a perfect algorithm, but it should catch most cases.
++      // Determine which property is being accessed.
++      String prop = parent.getLastChild().getString();
++
++      // For property assignments (writes), ref.getAssignedValue() is non-null.
++      if (ref.getAssignedValue() != null) {
++        inlinedKeys.add(prop);
++      } else {
++        // For property reads, the property must have been seen already,
++        // or else it must be one of a few safe built‐ins.
++        if (!inlinedKeys.contains(prop)) {
++          if (!("toString".equals(prop) || "valueOf".equals(prop) ||
++                "hasOwnProperty".equals(prop))) {
++            return false;
++          }
++        }
++      }
+       continue;
+     }
+ 
+-        // Only rewrite VAR declarations or simple assignment statements
++    // Only allow full references that are either variable declarations
++    // or simple assignment statements.
+     if (!isVarOrAssignExprLhs(name)) {
+       return false;
+     }
+-
+     Node val = ref.getAssignedValue();
+     if (val == null) {
+-          // A var with no assignment.
++      // A declaration with no assignment is safe.
+       continue;
+     }
+-
+-        // We're looking for object literal assignments only.
++    // For full assignments we only accept object literal initializers.
+     if (!val.isObjectLit()) {
+       return false;
+     }
+-
+-        // Make sure that the value is not self-refential. IOW,
+-        // disallow things like x = {b: x.a}.
+-        //
+-        // TODO: Only exclude unorderable self-referential
+-        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+-        // but x = {a: 1, b: x.a} is.
+-        //
+-        // Also, ES5 getters/setters aren't handled by this pass.
+-        for (Node child = val.getFirstChild(); child != null;
+-             child = child.getNext()) {
+-          if (child.isGetterDef() ||
+-              child.isSetterDef()) {
+-            // ES5 get/set not supported.
++    // As a safety–valve we do not inline an “empty” object literal if it comes
++    // from an ordinary assignment. (In practice many safe inlinable objects come
++    // from VAR declarations whose initializer is an object literal.)
++    if (val.getFirstChild() == null && !parent.isVar()) {
+       return false;
+     }
+-
+-
++    // Check for banned features – for example ES5 getters/setters or self–referral.
++    for (Node child = val.getFirstChild(); child != null; child = child.getNext()) {
++      if (child.isGetterDef() || child.isSetterDef()) {
++        return false;
++      }
++      // Record this property as “present” in the object.
++      String key = child.getString();
++      inlinedKeys.add(key);
+       Node childVal = child.getFirstChild();
+-          // Check if childVal is the parent of any of the passed in
+-          // references, as that is how self-referential assignments
+-          // will happen.
++      // If any of the references somehow occur inside the value
++      // for an initializer (a self reference), bail out.
+       for (Reference t : refs) {
+         Node refNode = t.getParent();
+         while (!NodeUtil.isStatementBlock(refNode)) {
+           if (refNode == childVal) {
+-                // There's a self-referential assignment
+             return false;
+           }
+           refNode = refNode.getParent();
+         }
+       }
+     }
+-
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+-        ret = true;
++    foundFullAssignment = true;
+   }
+-      return ret;
++  return foundFullAssignment;
+ }
+\ No newline at end of file

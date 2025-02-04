@@ -1,0 +1,139 @@
+diff --git a/tmp/2d0695a1-c0d9-430f-9142-74585d6866c3_buggy.java b/tmp/5b3296ae-d973-4a2d-b869-c7bddc5e26d5_fixed.java
+index 7374e5f..d2a852f 100644
+--- a/tmp/2d0695a1-c0d9-430f-9142-74585d6866c3_buggy.java
++++ b/tmp/5b3296ae-d973-4a2d-b869-c7bddc5e26d5_fixed.java
+@@ -1,61 +1,121 @@
+-    private Object decodeLocationNew(
+-            Channel channel, SocketAddress remoteAddress, String sentence) {
++private Object decodeLocationNew(Channel channel, SocketAddress remoteAddress, String sentence) {
+ 
+     Parser parser = new Parser(PATTERN_NEW, sentence);
+     if (!parser.matches()) {
+         return null;
+     }
+ 
+     String imei = parser.next();
+     DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+     if (deviceSession == null) {
+         return null;
+     }
+ 
++    // The next two tokens are used for message tracking:
+     String index = parser.next();
++    // Skip the “command” token – it differentiates message formats.
++    String command = parser.next();
+ 
+     Position position = new Position(getProtocolName());
+     position.setDeviceId(deviceSession.getDeviceId());
+ 
+-        position.set(Position.KEY_ALARM, decodeAlarm(parser.nextInt()));
++    // If the command indicates a result message (ex: B03), report the result and finish.
++    if (command.startsWith("B")) {
++        String result = parser.next();
++        position.set(Position.KEY_RESULT, result);
++        DateFormat dateFormat = new SimpleDateFormat("yyMMddHHmmss");
++        dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
++        String response = index + ",A03," + dateFormat.format(new Date());
++        sendResponse(channel, remoteAddress, imei, response);
++        return position;
++    }
++
++    // Certain commands (such as D05) indicate that no position should be created.
++    if (command.equals("D05")) {
++        return null;
++    }
++
++    // Parse the alarm field. It may be empty – assume 0 in that case.
++    String alarmToken = parser.next();
++    int alarmCode = 0;
++    if (!alarmToken.isEmpty()) {
++        try {
++            alarmCode = Integer.parseInt(alarmToken);
++        } catch (NumberFormatException e) {
++            // If parsing fails, leave alarmCode as 0.
++        }
++    }
++    position.set(Position.KEY_ALARM, decodeAlarm(alarmCode));
+ 
+     position.setDeviceTime(parser.nextDateTime());
+ 
+     Network network = new Network();
+-        network.addCellTower(CellTower.from(
+-                parser.nextInt(), parser.nextInt(), parser.nextHexInt(), parser.nextHexInt()));
+-
+-        position.set(Position.KEY_BATTERY, parser.nextDouble());
++    // Next token might be a cell tower field (if it contains "|" characters)
++    String token = parser.next();
++    if (token.contains("|")) {
++        String[] cellParts = token.split("\\|");
++        if (cellParts.length >= 4) {
++            int mcc = Integer.parseInt(cellParts[0]);
++            int mnc = Integer.parseInt(cellParts[1]);
++            int lac = Integer.parseInt(cellParts[2], 16);
++            int cid = Integer.parseInt(cellParts[3], 16);
++            network.addCellTower(CellTower.from(mcc, mnc, lac, cid));
++        }
++        // For messages in the A03 format the next three fields give battery info.
++        double battery = parser.nextDouble();
++        position.set(Position.KEY_BATTERY, battery);
+         position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt());
+         position.set(Position.KEY_STATUS, parser.nextHexInt());
+ 
+-        if (parser.hasNext(5)) {
+-
++        // In A03 messages, after the status a spurious odometer field is sent.
++        // Then follow 5 fields: valid flag, speed, satellites, latitude and longitude.
++        if (command.equals("A03") && parser.hasNext(6)) {
++            // Skip the odometer.
++            parser.next();
+             position.setValid(parser.next().equals("A"));
+             position.setFixTime(position.getDeviceTime());
++            // Note: the sending party sends speed first then satellite count.
++            position.set(Position.KEY_SPEED, UnitsConverter.knotsFromKph(parser.nextInt()));
+             position.set(Position.KEY_SATELLITES, parser.nextInt());
+-            position.setSpeed(UnitsConverter.knotsFromKph(parser.nextInt()));
+             position.setLatitude(parser.nextDouble());
+             position.setLongitude(parser.nextDouble());
+-
+         } else {
+-
++            // If there aren’t enough tokens for GPS fix, assume the remaining field
++            // contains wifi access point definitions.
+             String[] points = parser.next().split("\\|");
+             for (String point : points) {
+                 String[] wifi = point.split(":");
+                 String mac = wifi[0].replaceAll("(..)", "$1:");
+                 network.addWifiAccessPoint(WifiAccessPoint.from(
+                         mac.substring(0, mac.length() - 1), Integer.parseInt(wifi[1])));
+             }
++        }
++    } else {
++        // For A01 (and A00) messages the token just read is the validity flag.
++        position.setValid(token.equals("A"));
++        position.setFixTime(position.getDeviceTime());
++        position.setLatitude(parser.nextDouble());
++        position.setLongitude(parser.nextDouble());
+ 
++        // For some A01 messages an extra driver unique id is sent later.
++        // Look through any remaining tokens for one that is a 6-digit hex string.
++        if (command.equals("A01")) {
++            while (parser.hasNext()) {
++                String t = parser.next();
++                if (t.length() == 6 && t.matches("[0-9A-Fa-f]+")) {
++                    long driverId = Long.parseLong(t, 16);
++                    position.set(Position.KEY_DRIVER_UNIQUE_ID, String.valueOf(driverId));
++                }
++            }
++        }
+     }
+ 
+     position.setNetwork(network);
+ 
+     DateFormat dateFormat = new SimpleDateFormat("yyMMddHHmmss");
+     dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+     String response = index + ",A03," + dateFormat.format(new Date());
+     sendResponse(channel, remoteAddress, imei, response);
+ 
+     return position;
+ }
+\ No newline at end of file

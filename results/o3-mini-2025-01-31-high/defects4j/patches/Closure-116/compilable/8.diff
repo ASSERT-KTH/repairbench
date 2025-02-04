@@ -1,0 +1,168 @@
+diff --git a/tmp/f6c446f4-dfb3-4635-98d8-3e3a08464e69_buggy.java b/tmp/a330067e-405d-4915-9962-13a48a26a32f_fixed.java
+index 233a867..0309f6a 100644
+--- a/tmp/f6c446f4-dfb3-4635-98d8-3e3a08464e69_buggy.java
++++ b/tmp/a330067e-405d-4915-9962-13a48a26a32f_fixed.java
+@@ -1,73 +1,127 @@
+ /**
+  * Determines whether a function can be inlined at a particular call site.
+-   * There are several criteria that the function and reference must hold in
+-   * order for the functions to be inlined:
+-   * 1) If a call's arguments have side effects,
+-   * the corresponding argument in the function must only be referenced once.
+-   * For instance, this will not be inlined:
+-   * <pre>
+-   *     function foo(a) { return a + a }
+-   *     x = foo(i++);
+-   * </pre>
++ * Inlining “directly” (without first moving a call‐argument into a temporary)
++ * is only safe if every reference to a formal parameter in the function body
++ * will see the same value as was computed at the call site. In particular, if
++ * a call‐argument is not an immutable value and the function body (before the
++ * parameter’s first “use”) might perform side‐effects that could “delay”
++ * the evaluation of that argument, then direct inlining is unsafe.
++ *
++ * To capture this we do two things for each paired parameter and call‐argument:
++ * (1) If the call–argument may affect mutable state and the formal parameter is
++ *     referenced more than once then inlining is disallowed.
++ * (2) And if the function body has side–effects then, unless the argument is
++ *     immutable or the only occurrences of the parameter are “written to”
++ *     (for instance, when used as the target in a property–assignment), then
++ *     direct inlining is disallowed.
++ *
++ * Extra arguments (that don’t correspond to a parameter) must be side–effect free.
+  */
+-  private CanInlineResult canInlineReferenceDirectly(
+-      Node callNode, Node fnNode) {
++private CanInlineResult canInlineReferenceDirectly(Node callNode, Node fnNode) {
+   if (!isDirectCallNodeReplacementPossible(fnNode)) {
+     return CanInlineResult.NO;
+   }
+ 
+   Node block = fnNode.getLastChild();
+ 
+-
+-    // CALL NODE: [ NAME, ARG1, ARG2, ... ]
++  // CALL NODE is structured as: [ callee, arg1, arg2, ... ]
+   Node cArg = callNode.getFirstChild().getNext();
+ 
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
++  // Functions called via call/apply have a this–object as first parameter,
++  // but that “this” is not part of the callee’s parameter list.
+   if (!callNode.getFirstChild().isName()) {
+     if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
++      // TODO(johnlenz): Support replacing the this–object with a computed value.
+       if (cArg == null || !cArg.isThis()) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
+     } else {
+-        // ".apply" call should be filtered before this.
++      // ".apply" calls should have been filtered out already.
+       Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+     }
+   }
+ 
+-    // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
++  // Get formal parameters. (They are children of the LP node.)
+   Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+-    while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
+-        if (cArg != null) {
+ 
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
++  // Process each pair of formal parameter and call argument.
++  // (If there are extra arguments they must be side–effect free.)
++  while (fnParam != null || cArg != null) {
++    if (fnParam != null && cArg != null) {
++      // (a) When the function body might perform side–effects,
++      // then the value produced by the call–argument must be “frozen”
++      // (that is, immutable) or else must be used only in write–contexts.
++      if (NodeUtil.mayHaveSideEffects(block, compiler)
++           && !NodeUtil.isImmutableValue(cArg)
++           && !isOnlyWritten(block, fnParam.getString())) {
++        return CanInlineResult.NO;
++      }
++
++      // (b) Even if there are no interfering side–effects,
++      // if the call–argument has mutable state that might be re–evaluated,
++      // then it must not be used more than once.
+       if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
++           && NodeUtil.getNameReferenceCount(block, fnParam.getString()) > 1) {
+         return CanInlineResult.NO;
+       }
+-        }
+ 
+-        // Move to the next name.
+       fnParam = fnParam.getNext();
+-      }
+-
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+-      if (cArg != null) {
++      cArg = cArg.getNext();
++    } else if (cArg != null) {
++      // Extra call–arguments (with no matching formal parameter)
++      // must be side–effect free.
+       if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
++    } else {
++      // Formal parameters without a corresponding call argument are okay.
++      fnParam = fnParam.getNext();
+     }
+   }
+ 
+   return CanInlineResult.YES;
+ }
++
++/**
++ * Returns true if every reference to the parameter (by name) in the given
++ * AST (typically the function body) is used only on the left–hand side of
++ * an assignment. (That is, the parameter is only “modified” and never read.)
++ * This is important for direct inlining of arguments that are not immutable:
++ * if the formal parameter isn’t read, then delaying the evaluation until
++ * the assignment site is safe.
++ */
++private boolean isOnlyWritten(Node root, final String param) {
++  return isOnlyWrittenHelper(root, param);
++}
++
++/**
++ * Helper: traverses the subtree rooted at n and returns false immediately if
++ * any read–usage (non–LHS) of a name matching param is encountered.
++ */
++private boolean isOnlyWrittenHelper(Node n, String param) {
++  if (n == null) {
++    return true;
++  }
++
++  // If this is a name node matching "param" then check its usage.
++  if (n.isName() && param.equals(n.getString())) {
++    Node parent = n.getParent();
++    // Consider the occurrence safe if it is the target (first child) of an assignment.
++    if (parent != null && parent.isAssign() && parent.getFirstChild() == n) {
++      // safe usage (write–only)
++    } else {
++      // Any other occurrence counts as a read.
++      return false;
++    }
++  }
++
++  // Recursively check all children in evaluation order.
++  for (Node child = n.getFirstChild(); child != null; child = child.getNext()) {
++    if (!isOnlyWrittenHelper(child, param)) {
++      return false;
++    }
++  }
++  return true;
++}
+\ No newline at end of file

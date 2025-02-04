@@ -1,0 +1,96 @@
+diff --git a/tmp/43a872f3-275d-449a-8938-c17282071696_buggy.java b/tmp/d6189773-9e09-4729-9d15-629178a5fe12_fixed.java
+index 9353941..4f2474f 100644
+--- a/tmp/43a872f3-275d-449a-8938-c17282071696_buggy.java
++++ b/tmp/d6189773-9e09-4729-9d15-629178a5fe12_fixed.java
+@@ -1,30 +1,70 @@
++private VariableLiveness isVariableReadBeforeKill(Node n, String variable) {
++  // Delegate to the overloaded helper with the “ignoreSelf” flag false.
++  return isVariableReadBeforeKill(n, variable, false);
++}
++
+ /**
+-   * Give an expression and a variable. It returns READ, if the first
+-   * reference of that variable is a read. It returns KILL, if the first
+-   * reference of that variable is an assignment. It returns MAY_LIVE otherwise.
++ * This helper method does the real work. The extra flag “ignoreSelf” tells the
++ * method to ignore “self‐references” (reads of the same variable that occur in
++ * the right‐hand side of an assignment to that variable). This is needed because
++ * in an assignment like “x = f(x)” the “x” on the LHS is not (yet) killing the old value—
++ * any occurrence of “x” in the RHS should not count as a “read” (making the assignment live)
++ * when deciding whether the assignment’s computed value is used.
+  */
+-  private VariableLiveness isVariableReadBeforeKill(
+-      Node n, String variable) {
++private VariableLiveness isVariableReadBeforeKill(Node n, String variable, boolean ignoreSelf) {
++  if (n == null) {
++    return VariableLiveness.MAYBE_LIVE;
++  }
++
++  // If this node is a name that matches our variable…
+   if (NodeUtil.isName(n) && variable.equals(n.getString())) {
+-      if (NodeUtil.isLhs(n, n.getParent())) {
+-        // The expression to which the assignment is made is evaluated before
+-        // the RHS is evaluated (normal left to right evaluation) but the KILL
+-        // occurs after the RHS is evaluated.
++    // When we are in “ignoreSelf” mode (i.e. scanning an assignment’s RHS for self–references),
++    // we do not want a self–reference to count as a READ.
++    if (ignoreSelf) {
++      return VariableLiveness.MAYBE_LIVE;
++    }
++    // In normal mode, if the name appears as the LHS of an assignment,
++    // we want to delay reporting a kill so that any “real” read later in the overall expression
++    // (outside the assignment’s “self‐referential” part) can make the overall value live.
++    if (NodeUtil.isLhs(n, n.getParent()) 
++          && n.getParent() != null 
++          && n.getParent().getType() == Token.ASSIGN 
++          && n == n.getParent().getFirstChild()) {
++      return VariableLiveness.MAYBE_LIVE;
++    }
++    // Otherwise, if not on the LHS then it’s a genuine read.
++    return NodeUtil.isLhs(n, n.getParent()) ? VariableLiveness.KILL : VariableLiveness.READ;
++  }
++
++  // Special handling for an assignment that writes to our variable.
++  // (E.g. for “x = ...”, if the right‐hand side uses “x” in a self–reference, we want to treat
++  // the assignment as dead—so later we can remove the “x=” part.)
++  if (n.getType() == Token.ASSIGN && n.getFirstChild() != null 
++      && NodeUtil.isName(n.getFirstChild()) 
++      && variable.equals(n.getFirstChild().getString())) {
++    // Scan the RHS in “ignoreSelf” mode so that any occurrence of the variable there is not counted.
++    VariableLiveness rhsState = isVariableReadBeforeKill(n.getLastChild(), variable, true);
++    // If the RHS (ignoring self–reads) still produces any non‐neutral effect, we interpret
++    // that as a “kill” by this assignment.
++    if (rhsState != VariableLiveness.MAYBE_LIVE) {
+       return VariableLiveness.KILL;
+-      } else {
+-        return VariableLiveness.READ;
+     }
++    // Otherwise fall through to combine all children.
+   }
+ 
+-    // Expressions are evaluated left-right, depth first.
+-    for (Node child = n.getFirstChild();
+-        child != null; child = child.getNext()) {
+-      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // Not a FUNCTION
+-        VariableLiveness state = isVariableReadBeforeKill(child, variable);
+-        if (state != VariableLiveness.MAYBE_LIVE) {
+-          return state;
++  // Instead of returning as soon as a non-neutral child is seen,
++  // iterate over all children in evaluation order and “combine” the results.
++  // (A READ later in the order “overrides” a KILL earlier.)
++  VariableLiveness result = VariableLiveness.MAYBE_LIVE;
++  for (Node child = n.getFirstChild(); child != null; child = child.getNext()) {
++    VariableLiveness childState = isVariableReadBeforeKill(child, variable, ignoreSelf);
++    if (childState == VariableLiveness.READ) {
++      return VariableLiveness.READ;  // READ wins over any KILL.
++    } else if (childState == VariableLiveness.KILL) {
++      result = VariableLiveness.KILL;
++      // Do not short‐circuit here because a later READ (in a short‐circuited operator, for example)
++      // might flip the overall result.
+     }
+   }
+-    }
+-    return VariableLiveness.MAYBE_LIVE;
++  return result;
+ }
+\ No newline at end of file

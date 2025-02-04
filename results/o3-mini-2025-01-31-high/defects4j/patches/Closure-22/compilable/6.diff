@@ -1,0 +1,133 @@
+diff --git a/tmp/da1ad8b3-f4e5-4940-a502-6d745f888f2c_buggy.java b/tmp/5c7f9333-9ee9-41f4-a476-50d1883670c4_fixed.java
+index 7f61a8c..3e964a8 100644
+--- a/tmp/da1ad8b3-f4e5-4940-a502-6d745f888f2c_buggy.java
++++ b/tmp/5c7f9333-9ee9-41f4-a476-50d1883670c4_fixed.java
+@@ -1,73 +1,103 @@
+ @Override
+ public void visit(NodeTraversal t, Node n, Node parent) {
+   // VOID nodes appear when there are extra semicolons at the BLOCK level.
+   // I've been unable to think of any cases where this indicates a bug,
+   // and apparently some people like keeping these semicolons around,
+   // so we'll allow it.
+-    if (n.isEmpty() ||
+-        n.isComma()) {
++  if (n.isEmpty() || n.isComma()) {
+     return;
+   }
+-
+   if (parent == null) {
+     return;
+   }
+ 
+-    // Do not try to remove a block or an expr result. We already handle
+-    // these cases when we visit the child, and the peephole passes will
+-    // fix up the tree in more clever ways when these are removed.
++  // When an expression is inside a comma operator, its “result” is only
++  // used if it is the last operand. However, not all comma‐expressions are
++  // suspicious. In particular, when a comma expression is used to sequence
++  // assignments (or pure value–producing expressions) for an overall value,
++  // it is often intentional. By contrast, if a comma expression mixes a non‐assignment
++  // side–effect (like a function call) with a pure operand, then the discarded
++  // pure value is often a mistake.
++  //
++  // Here we adjust the behavior for nodes whose direct parent is a COMMA:
+   if (parent.getType() == Token.COMMA) {
+-      Node gramps = parent.getParent();
+-      if (gramps.isCall() && parent == gramps.getFirstChild()) {
+-        if (n == parent.getFirstChild() && parent.getChildCount() == 2 && n.getNext().isName() && "eval".equals(n.getNext().getString())) {
++    Node commaParent = parent.getParent();
++    // We consider the comma-expression “in an assignment context” if its immediate
++    // parent is, for example, an assignment, a VAR initializer, or a NAME node.
++    boolean inAssignmentContext = commaParent != null &&
++        (commaParent.getType() == Token.ASSIGN ||
++         commaParent.getType() == Token.VAR ||
++         commaParent.getType() == Token.NAME);
++    // Scan all children of the comma operator to see if any non-assignment expression
++    // may have side effects.
++    boolean hasNonAssignmentSideEffect = false;
++    for (Node c = parent.getFirstChild(); c != null; c = c.getNext()) {
++      // When checking, ignore operands that are assignments.
++      if (c.getType() != Token.ASSIGN && NodeUtil.mayHaveSideEffects(c, t.getCompiler())) {
++        hasNonAssignmentSideEffect = true;
++        break;
++      }
++    }
++    // In an assignment/initializer, if the comma expression is entirely “pure”
++    // (or only contains assignments) then we do not warn on any of its parts.
++    if (inAssignmentContext && !hasNonAssignmentSideEffect) {
+       return;
+     }
+-    }
+-
+-    // This no-op statement was there so that JSDoc information could
+-    // be attached to the name. This check should not complain about it.
++    // In non–assignment contexts (say, as a function argument) we want to warn only
++    // for non–last operands. Also, for the last operand we require that an ancestor
++    // is an EXPR_RESULT or BLOCK; otherwise the value is being used.
++    if (!inAssignmentContext) {
+       if (n == parent.getLastChild()) {
+         for (Node an : parent.getAncestors()) {
+           int ancestorType = an.getType();
+-          if (ancestorType == Token.COMMA)
++          if (ancestorType == Token.COMMA) {
+             continue;
+-          if (ancestorType != Token.EXPR_RESULT && ancestorType != Token.BLOCK)
++          }
++          if (ancestorType != Token.EXPR_RESULT && ancestorType != Token.BLOCK) {
+             return;
+-          else
++          } else {
+             break;
+           }
+         }
++      }
++      // For non–last children in non–assignment comma expressions we always check.
++    }
++    // In assignment contexts that mix a non-assignment side–effect (say, a call) with
++    // a pure intermediate operand, we allow the warning to go through.
+   } else if (parent.getType() != Token.EXPR_RESULT && parent.getType() != Token.BLOCK) {
+-      if (parent.getType() == Token.FOR && parent.getChildCount() == 4 && (n == parent.getFirstChild() ||
++    // Allow a couple of FOR-loop sub–expressions.
++    if (parent.getType() == Token.FOR && parent.getChildCount() == 4 &&
++       (n == parent.getFirstChild() ||
+         n == parent.getFirstChild().getNext().getNext())) {
++      // Allowed.
+     } else {
+       return;
+     }
+   }
+ 
++  // Now check whether the expression n has a “used” value or it is a side-effect
++  // free “useless” expression that may indicate a bug.
+   boolean isResultUsed = NodeUtil.isExpressionResultUsed(n);
+   boolean isSimpleOp = NodeUtil.isSimpleOperatorType(n.getType());
+-    if (!isResultUsed &&
+-        (isSimpleOp || !NodeUtil.mayHaveSideEffects(n, t.getCompiler()))) {
++  if (!isResultUsed && (isSimpleOp || !NodeUtil.mayHaveSideEffects(n, t.getCompiler()))) {
++    // Do not report for a qualified name that carries JSDoc,
++    // or if the expression node is itself a statement.
+     if (n.isQualifiedName() && n.getJSDocInfo() != null) {
+       return;
+     } else if (n.isExprResult()) {
+       return;
+     }
+     String msg = "This code lacks side-effects. Is there a bug?";
+     if (n.isString()) {
+       msg = "Is there a missing '+' on the previous line?";
+     } else if (isSimpleOp) {
+       msg = "The result of the '" + Token.name(n.getType()).toLowerCase() +
+             "' operator is not being used.";
+     }
+-
+-      t.getCompiler().report(
+-          t.makeError(n, level, USELESS_CODE_ERROR, msg));
+-      // TODO(johnlenz): determine if it is necessary to
+-      // try to protect side-effect free statements as well.
++    t.getCompiler().report(t.makeError(n, level, USELESS_CODE_ERROR, msg));
++    // Protect non-statement nodes.
+     if (!NodeUtil.isStatement(n)) {
+       problemNodes.add(n);
+     }
+   }
+ }
+\ No newline at end of file
