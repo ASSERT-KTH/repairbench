@@ -1,0 +1,173 @@
+You are an automatic program repair tool. Your task is to fix the provided buggy code.
+
+The following code contains a buggy function:
+```java
+  /**
+   * Computes the follow() node of a given node and its parent. There is a side
+   * effect when calling this function. If this function computed an edge that
+   * exists a FINALLY, it'll attempt to connect the fromNode to the outer
+   * FINALLY according to the finallyMap.
+   *
+   * @param fromNode The original source node since {@code node} is changed
+   *        during recursion.
+   * @param node The node that follow() should compute.
+   */
+  private static Node computeFollowNode(
+      Node fromNode, Node node, ControlFlowAnalysis cfa) {
+    /*
+     * This is the case where:
+     *
+     * 1. Parent is null implies that we are transferring control to the end of
+     * the script.
+     *
+     * 2. Parent is a function implies that we are transferring control back to
+     * the caller of the function.
+     *
+     * 3. If the node is a return statement, we should also transfer control
+     * back to the caller of the function.
+     *
+     * 4. If the node is root then we have reached the end of what we have been
+     * asked to traverse.
+     *
+     * In all cases we should transfer control to a "symbolic return" node.
+     * This will make life easier for DFAs.
+     */
+    Node parent = node.getParent();
+    if (parent == null || parent.isFunction() ||
+        (cfa != null && node == cfa.root)) {
+      return null;
+    }
+
+    // If we are just before a IF/WHILE/DO/FOR:
+    switch (parent.getType()) {
+      // The follow() of any of the path from IF would be what follows IF.
+      case Token.IF:
+        return computeFollowNode(fromNode, parent, cfa);
+      case Token.CASE:
+      case Token.DEFAULT_CASE:
+        // After the body of a CASE, the control goes to the body of the next
+        // case, without having to go to the case condition.
+        if (parent.getNext() != null) {
+          if (parent.getNext().isCase()) {
+            return parent.getNext().getFirstChild().getNext();
+          } else if (parent.getNext().isDefaultCase()) {
+            return parent.getNext().getFirstChild();
+          } else {
+            Preconditions.checkState(false, "Not reachable");
+          }
+        } else {
+          return computeFollowNode(fromNode, parent, cfa);
+        }
+        break;
+      case Token.FOR:
+        if (NodeUtil.isForIn(parent)) {
+          return parent;
+        } else {
+          return parent.getFirstChild().getNext().getNext();
+        }
+      case Token.WHILE:
+      case Token.DO:
+        return parent;
+      case Token.TRY:
+        // If we are coming out of the TRY block...
+        if (parent.getFirstChild() == node) {
+          if (NodeUtil.hasFinally(parent)) { // and have FINALLY block.
+            return computeFallThrough(parent.getLastChild());
+          } else { // and have no FINALLY.
+            return computeFollowNode(fromNode, parent, cfa);
+          }
+        // CATCH block.
+        } else if (NodeUtil.getCatchBlock(parent) == node){
+          if (NodeUtil.hasFinally(parent)) { // and have FINALLY block.
+            return computeFallThrough(node.getNext());
+          } else {
+            return computeFollowNode(fromNode, parent, cfa);
+          }
+        // If we are coming out of the FINALLY block...
+        } else if (parent.getLastChild() == node){
+          if (cfa != null) {
+            for (Node finallyNode : cfa.finallyMap.get(parent)) {
+              cfa.createEdge(fromNode, Branch.UNCOND, finallyNode);
+            }
+          }
+          return computeFollowNode(fromNode, parent, cfa);
+        }
+    }
+
+    // Now that we are done with the special cases follow should be its
+    // immediate sibling, unless its sibling is a function
+    Node nextSibling = node.getNext();
+
+    // Skip function declarations because control doesn't get pass into it.
+    while (nextSibling != null && nextSibling.isFunction()) {
+      nextSibling = nextSibling.getNext();
+    }
+
+    if (nextSibling != null) {
+      return computeFallThrough(nextSibling);
+    } else {
+      // If there are no more siblings, control is transferred up the AST.
+      return computeFollowNode(fromNode, parent, cfa);
+    }
+  }
+
+```
+
+The code fails the following tests.
+
+Test `com.google.javascript.jscomp.CheckMissingReturnTest::testIssue779`:
+```java
+  public void testIssue779() {
+    testNotMissing(
+        "var a = f(); try { alert(); if (a > 0) return 1; }" +
+        "finally { a = 5; } return 2;");
+  }
+
+```
+Test `com.google.javascript.jscomp.CheckMissingReturnTest::testIssue779` error:
+```
+junit.framework.AssertionFailedError: No cross edges found;com.google.javascript.jscomp.ControlFlowAnalysisTest::testDeepNestedBreakwithFinally
+```
+
+Test `com.google.javascript.jscomp.ControlFlowAnalysisTest::testDeepNestedFinally`:
+```java
+  public void testDeepNestedFinally() {
+    String src = "try{try{try{throw 1}" +
+        "finally{1;var a}}finally{2;if(a);}}finally{3;a()}";
+    ControlFlowGraph<Node> cfg = createCfg(src);
+    assertCrossEdge(cfg, Token.THROW, Token.BLOCK, Branch.ON_EX);
+    assertCrossEdge(cfg, Token.VAR, Token.BLOCK, Branch.UNCOND);
+    assertCrossEdge(cfg, Token.IF, Token.BLOCK, Branch.ON_EX);
+  }
+
+```
+Test `com.google.javascript.jscomp.ControlFlowAnalysisTest::testDeepNestedFinally` error:
+```
+junit.framework.AssertionFailedError: No cross edges found
+```
+
+Test `com.google.javascript.jscomp.ControlFlowAnalysisTest::testDeepNestedBreakwithFinally`:
+```java
+  public void testDeepNestedBreakwithFinally() {
+    String src = "X:while(1){try{while(2){try{var a;break X;}" +
+        "finally{}}}finally{}}";
+    ControlFlowGraph<Node> cfg = createCfg(src);
+    assertDownEdge(cfg, Token.WHILE, Token.BLOCK, Branch.ON_TRUE);
+    assertDownEdge(cfg, Token.BLOCK, Token.TRY, Branch.UNCOND);
+    assertDownEdge(cfg, Token.BLOCK, Token.VAR, Branch.UNCOND);
+    // BREAK to FINALLY.
+    assertCrossEdge(cfg, Token.BREAK, Token.BLOCK, Branch.UNCOND);
+    // FINALLY to FINALLY.
+    assertCrossEdge(cfg, Token.BLOCK, Token.BLOCK, Branch.ON_EX);
+    assertCrossEdge(cfg, Token.WHILE, Token.BLOCK, Branch.ON_FALSE);
+    assertReturnEdge(cfg, Token.BLOCK);
+  }
+
+```
+Test `com.google.javascript.jscomp.ControlFlowAnalysisTest::testDeepNestedBreakwithFinally` error:
+```
+junit.framework.AssertionFailedError: No cross edges found
+```
+
+
+Please provide a fixed version of the buggy function, and only that function, inside a code block.
