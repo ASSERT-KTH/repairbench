@@ -40,6 +40,11 @@ const LeaderboardTable = () => {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
   };
 
+  const formatNumber = (value) => {
+    if (value === undefined || value === null) return 'N/A';
+    return new Intl.NumberFormat('en-US').format(value);
+  };
+
   const sortNumeric = (rowA, rowB, columnId) => {
     const a = rowA.values[columnId];
     const b = rowB.values[columnId];
@@ -89,6 +94,20 @@ const LeaderboardTable = () => {
       disableSortBy: false,
     });
 
+    const createTokenColumn = (header, accessor) => ({
+      Header: header,
+      accessor: accessor,
+      Cell: ({ value }) => (
+        <div className="cell-content">
+          <span>
+            {formatNumber(value)}
+          </span>
+        </div>
+      ),
+      sortType: sortNumeric,
+      disableSortBy: false,
+    });
+
     const baseColumns = [
       {
         Header: 'Organization',
@@ -130,24 +149,24 @@ const LeaderboardTable = () => {
           return dateA.getTime() - dateB.getTime();
         },
         disableSortBy: false,
-      },
-      {
-        Header: `Total (${bugCounts.total || 0} bugs)`,
-        columns: [
-          createColumn('Plausible @1', 'total_plausible@1'),
-          createColumn('AST Match @1', 'total_ast_match@1'),
-          createCostColumn('Cost', 'total_cost'), // Cost column without bold
-        ],
       }
     ];
 
-    const extraColumns = [
+    const detailColumns = [
       {
         Header: `Defects4J v2 (${bugCounts.defects4j || 0} bugs)`,
         columns: [
           createColumn('Plausible @1', 'defects4j_plausible@1'),
           createColumn('AST Match @1', 'defects4j_ast_match@1'),
-          createCostColumn('Cost', 'defects4j_cost'), // Cost column without bold
+          createCostColumn('Cost', 'defects4j_cost'),
+          {
+            Header: 'Token Usage',
+            columns: [
+              createTokenColumn('Input', 'defects4j_prompt_tokens'),
+              createTokenColumn('Output', 'defects4j_completion_tokens'),
+              createTokenColumn('Total', 'defects4j_total_tokens'),
+            ],
+          },
         ],
       },
       {
@@ -155,12 +174,37 @@ const LeaderboardTable = () => {
         columns: [
           createColumn('Plausible @1', 'gitbugjava_plausible@1'),
           createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
-          createCostColumn('Cost', 'gitbugjava_cost'), // Cost column without bol
+          createCostColumn('Cost', 'gitbugjava_cost'),
+          {
+            Header: 'Token Usage',
+            columns: [
+              createTokenColumn('Input', 'gitbugjava_prompt_tokens'),
+              createTokenColumn('Output', 'gitbugjava_completion_tokens'),
+              createTokenColumn('Total', 'gitbugjava_total_tokens'),
+            ],
+          },
         ],
       }
     ];
 
-    return showExtraColumns ? [...baseColumns, ...extraColumns] : baseColumns;
+    const totalColumns = [{
+      Header: `Total (${bugCounts.total || 0} bugs)`,
+      columns: [
+        createColumn('Plausible @1', 'total_plausible@1'),
+        createColumn('AST Match @1', 'total_ast_match@1'),
+        createCostColumn('Cost', 'total_cost'),
+        ...(showExtraColumns ? [{
+          Header: 'Token Usage',
+          columns: [
+            createTokenColumn('Input', 'total_prompt_tokens'),
+            createTokenColumn('Output', 'total_completion_tokens'),
+            createTokenColumn('Total', 'total_tokens'),
+          ],
+        }] : []),
+      ],
+    }];
+
+    return [...baseColumns, ...(showExtraColumns ? detailColumns : []), ...totalColumns];
   }, [showExtraColumns]); // Remove data and bugCounts from dependencies since they're now static
 
   const {

@@ -9,7 +9,7 @@ function parseModelList() {
 
 async function generateStaticData() {
   const benchmarks = ['defects4j', 'gitbugjava'];
-  const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost'];
+  const metrics = ['exact_match@1', 'ast_match@1', 'plausible@1', 'cost', 'prompt_tokens', 'completion_tokens', 'total_tokens'];
   let bugCounts = {};
   let totalBugs = 0;
   let results = [];
@@ -22,7 +22,16 @@ async function generateStaticData() {
     const releaseDates = JSON.parse(fs.readFileSync(path.join(__dirname, '../../results/release_dates.json'), 'utf8'));
 
     for (const [llm_name, strategy, provider] of modelList) {
-      const row = { name: llm_name, provider, total_cost: null, hasTotalData: false, release_date: null };
+      const row = { 
+        name: llm_name, 
+        provider, 
+        total_cost: null,
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        total_tokens: 0,
+        hasTotalData: false, 
+        release_date: null 
+      };
 
       try {
         // Try to read total.json
@@ -39,12 +48,14 @@ async function generateStaticData() {
         // Process each benchmark
         for (const benchmark of benchmarks) {
           const statsPath = path.join(__dirname, `../../results/${llm_name}/${benchmark}/statistics_${benchmark}_instruct_${strategy}.json`);
-          const costPath = path.join(__dirname, `../../results/${llm_name}/${benchmark}/costs_${benchmark}_instruct_${strategy}.json`);
+          const usagePath = path.join(__dirname, `../../results/${llm_name}/${benchmark}/usage_${benchmark}_instruct_${strategy}.json`);
 
           if (fs.existsSync(statsPath)) {
             const statsResult = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
             metrics.forEach(metric => {
-              row[`${benchmark}_${metric}`] = statsResult[metric];
+              if (metric !== 'cost' && !metric.includes('tokens')) {
+                row[`${benchmark}_${metric}`] = statsResult[metric];
+              }
             });
 
             // Update bug count for each benchmark
@@ -56,9 +67,12 @@ async function generateStaticData() {
             allBenchmarksComplete = false;
           }
 
-          if (fs.existsSync(costPath)) {
-            const costResult = JSON.parse(fs.readFileSync(costPath, 'utf8'));
-            row[`${benchmark}_cost`] = costResult.total_cost || null;
+          if (fs.existsSync(usagePath)) {
+            const usageResult = JSON.parse(fs.readFileSync(usagePath, 'utf8'));
+            row[`${benchmark}_cost`] = usageResult.total_cost || null;
+            row[`${benchmark}_prompt_tokens`] = usageResult.prompt_tokens || 0;
+            row[`${benchmark}_completion_tokens`] = usageResult.completion_tokens || 0;
+            row[`${benchmark}_total_tokens`] = usageResult.total_tokens || 0;
           } else {
             allBenchmarksComplete = false;
           }
@@ -67,9 +81,12 @@ async function generateStaticData() {
         // Set release date
         row['release_date'] = releaseDates[llm_name];
 
-        // Only compute total cost if all benchmarks are complete and there's no total.json
+        // Only compute totals if all benchmarks are complete and there's no total.json
         if (allBenchmarksComplete && row.hasTotalData) {
           row.total_cost = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_cost`] || 0), 0);
+          row.total_prompt_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_prompt_tokens`] || 0), 0);
+          row.total_completion_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_completion_tokens`] || 0), 0);
+          row.total_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_total_tokens`] || 0), 0);
         }
 
       } catch (error) {
