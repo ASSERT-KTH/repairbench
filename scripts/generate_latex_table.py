@@ -94,7 +94,7 @@ def generate_latex_table(data, model_list, llm_country_map):
     latex = "\\begin{table*}[t]\n"
     latex += "\\centering\n"
     latex += "\\makebox[\\textwidth][c]{%\n"
-    latex += "\\resizebox{1.6\\textwidth}{!}{\n"  # Increased from 1.3 to 1.6 to accommodate more columns
+    latex += "\\resizebox{1.3\\textwidth}{!}{\n"  # Reduced back to 1.3 since token columns are removed
     latex += "\\large\n"
     latex += "\\begin{tabular}{@{}ll "
 
@@ -102,20 +102,17 @@ def generate_latex_table(data, model_list, llm_country_map):
     s_columns = [
         "S[table-format=2.1, detect-weight=true]",  # Plausible@1
         "S[table-format=2.1, detect-weight=true]",  # AST Match@1
-        "S[table-format=4.2, detect-weight=true]",  # Cost
-        "S[table-format=7.0, detect-weight=true]",  # Input tokens
-        "S[table-format=7.0, detect-weight=true]",  # Output tokens
-        "S[table-format=7.0, detect-weight=true]",  # Total tokens
+        "S[table-format=4.2, detect-weight=true]"   # Cost
     ] * 3  # For each benchmark section and total
     s_columns.append("c")  # For Ref. column
     latex += ' '.join(s_columns) + "@{}}\n"
     
     latex += "\\toprule\n"
-    latex += "\\multirow{3}{*}{\\textbf{Organization}} & \\multirow{3}{*}{\\textbf{Model}} & \\multicolumn{6}{c}{Defects4J v2 (484 bugs)} & \\multicolumn{6}{c}{GitBug-Java (90 bugs)} & \\multicolumn{6}{c}{\\textbf{Total (574 bugs)}} & \\multirow{3}{*}{Ref.} \\\\\n"
-    latex += "\\cmidrule(lr){3-8} \\cmidrule(lr){9-14} \\cmidrule(l){15-20}\n"
-    latex += " & & \\multicolumn{2}{c}{Score} & {Cost} & \\multicolumn{3}{c}{Tokens (K)} & \\multicolumn{2}{c}{Score} & {Cost} & \\multicolumn{3}{c}{Tokens (K)} & \\multicolumn{2}{c}{Score} & {Cost} & \\multicolumn{3}{c}{Tokens (K)} & \\\\\n"
-    latex += "\\cmidrule(lr){3-4} \\cmidrule(lr){5-5} \\cmidrule(lr){6-8} \\cmidrule(lr){9-10} \\cmidrule(lr){11-11} \\cmidrule(lr){12-14} \\cmidrule(lr){15-16} \\cmidrule(lr){17-17} \\cmidrule(l){18-20}\n"
-    latex += " & & {Plausible} & {AST} & {\\$} & {In} & {Out} & {Total} & {Plausible} & {AST} & {\\$} & {In} & {Out} & {Total} & {\\textbf{Plausible}} & {\\textbf{AST}} & {\\textbf{\\$}} & {\\textbf{In}} & {\\textbf{Out}} & {\\textbf{Total}} & \\\\\n"
+    latex += "\\multirow{3}{*}{\\textbf{Organization}} & \\multirow{3}{*}{\\textbf{Model}} & \\multicolumn{3}{c}{Defects4J v2 (484 bugs)} & \\multicolumn{3}{c}{GitBug-Java (90 bugs)} & \\multicolumn{3}{c}{\\textbf{Total (574 bugs)}} & \\multirow{3}{*}{Ref.} \\\\\n"
+    latex += "\\cmidrule(lr){3-5} \\cmidrule(lr){6-8} \\cmidrule(l){9-11}\n"
+    latex += " & & \\multicolumn{2}{c}{Score} & {Cost} & \\multicolumn{2}{c}{Score} & {Cost} & \\multicolumn{2}{c}{Score} & {\\textbf{Cost}} & \\\\\n"
+    latex += "\\cmidrule(lr){3-4} \\cmidrule(lr){5-5} \\cmidrule(lr){6-7} \\cmidrule(lr){8-8} \\cmidrule(lr){9-10} \\cmidrule(lr){11-11}\n"
+    latex += " & & {Plausible} & {AST} & {\\$} & {Plausible} & {AST} & {\\$} & {\\textbf{Plausible}} & {\\textbf{AST}} & {\\textbf{\\$}} & \\\\\n"
     latex += "\\midrule\n"
 
     partial_footnote_needed = False
@@ -159,25 +156,16 @@ def generate_latex_table(data, model_list, llm_country_map):
             else:
                 cell = f"\\multicolumn{{1}}{{c}}{{---}}"
             latex += f"{cell} & "
-
-            # Add token counts (divided by 1000 for K representation)
-            for token_type in ['prompt', 'completion', 'total']:
-                tokens = row[f'{benchmark}_{token_type}_tokens']
-                if tokens is not None:
-                    cell = f"{tokens/1000:.0f}"
-                else:
-                    cell = f"\\multicolumn{{1}}{{c}}{{---}}"
-                latex += f"{cell} & "
-
+        
         # Add citation
         latex += f"\\citep{{{citation_key}}}" if citation_key else "---"
         latex += " \\\\\n"
 
     latex += "\\bottomrule\n"
     latex += "\\addlinespace\n"
-    latex += f"\\multicolumn{{21}}{{l}}{{\\textsuperscript{{1}}Models are sorted by the total Plausible@1 score. Token counts are shown in thousands (K).}} \\\\\n"
+    latex += f"\\multicolumn{{12}}{{l}}{{\\textsuperscript{{1}}Models are sorted by the total Plausible@1 score.}} \\\\\n"
     if partial_footnote_needed:
-        latex += f"\\multicolumn{{21}}{{l}}{{\\textsuperscript{{2}}Only partial results available right now due to cost reasons.}} \\\\\n"
+        latex += f"\\multicolumn{{12}}{{l}}{{\\textsuperscript{{2}}Only partial results available right now due to cost reasons.}} \\\\\n"
     latex += "\\addlinespace\n"
     latex += "\\end{tabular}\n"
     latex += "}\n"

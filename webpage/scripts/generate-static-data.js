@@ -26,9 +26,9 @@ async function generateStaticData() {
         name: llm_name, 
         provider, 
         total_cost: null,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tokens: 0,
+        total_prompt_tokens: 'N/A',
+        total_completion_tokens: 'N/A',
+        total_tokens: 'N/A',
         hasTotalData: false, 
         release_date: null 
       };
@@ -70,9 +70,9 @@ async function generateStaticData() {
           if (fs.existsSync(usagePath)) {
             const usageResult = JSON.parse(fs.readFileSync(usagePath, 'utf8'));
             row[`${benchmark}_cost`] = usageResult.total_cost || null;
-            row[`${benchmark}_prompt_tokens`] = usageResult.prompt_tokens || 0;
-            row[`${benchmark}_completion_tokens`] = usageResult.completion_tokens || 0;
-            row[`${benchmark}_total_tokens`] = usageResult.total_tokens || 0;
+            row[`${benchmark}_prompt_tokens`] = usageResult.prompt_tokens || 'N/A';
+            row[`${benchmark}_completion_tokens`] = usageResult.completion_tokens || 'N/A';
+            row[`${benchmark}_total_tokens`] = usageResult.total_tokens || 'N/A';
           } else {
             allBenchmarksComplete = false;
           }
@@ -84,9 +84,9 @@ async function generateStaticData() {
         // Only compute totals if all benchmarks are complete and there's no total.json
         if (allBenchmarksComplete && row.hasTotalData) {
           row.total_cost = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_cost`] || 0), 0);
-          row.total_prompt_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_prompt_tokens`] || 0), 0);
-          row.total_completion_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_completion_tokens`] || 0), 0);
-          row.total_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_total_tokens`] || 0), 0);
+          row.total_prompt_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_prompt_tokens`] !== 'N/A' ? row[`${benchmark}_prompt_tokens`] : 0), 0);
+          row.total_completion_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_completion_tokens`] !== 'N/A' ? row[`${benchmark}_completion_tokens`] : 0), 0);
+          row.total_tokens = benchmarks.reduce((sum, benchmark) => sum + (row[`${benchmark}_total_tokens`] !== 'N/A' ? row[`${benchmark}_total_tokens`] : 0), 0);
         }
 
       } catch (error) {
