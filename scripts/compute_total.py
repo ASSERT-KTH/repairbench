@@ -26,6 +26,10 @@ def main():
             total_patches = 0
             total_ast_match_patches = 0
             total_plausible_patches = 0
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            total_tokens = 0
+            total_cost = 0
             number_bugs_with_ast_match_candidates = 0
             number_bugs_with_plausible_candidates = 0
             bugs_with_ast_match_candidates = []
@@ -35,11 +39,13 @@ def main():
             benchmarks = ["defects4j", "gitbugjava"]
             for benchmark in benchmarks:
                 benchmark = pathlib.Path(model, benchmark)
-                # Check if a statistics*.json file exists
+                # Check if statistics and usage files exist
                 if not any(benchmark.glob("statistics*.json")):
                     raise Exception(f"No statistics*.json file found for {benchmark}")
+                if not any(benchmark.glob("usage*.json")):
+                    raise Exception(f"No usage*.json file found for {benchmark}")
     
-                # Read the found file
+                # Read statistics file
                 statistics_file = list(benchmark.glob("statistics*.json"))[0]
                 with open(statistics_file, "r") as f:
                     data = json.load(f)
@@ -51,6 +57,16 @@ def main():
                 number_bugs_with_plausible_candidates += data["num_bugs_with_plausible_candidates"]
                 bugs_with_ast_match_candidates += data["bugs_with_ast_match_candidates"]
                 bugs_with_plausible_candidates += data["bugs_with_plausible_candidates"]
+
+                # Read usage file
+                usage_file = list(benchmark.glob("usage*.json"))[0]
+                with open(usage_file, "r") as f:
+                    usage_data = json.load(f)
+                
+                total_prompt_tokens += usage_data.get("prompt_tokens", 0)
+                total_completion_tokens += usage_data.get("completion_tokens", 0)
+                total_tokens += usage_data.get("total_tokens", 0)
+                total_cost += usage_data.get("total_cost", 0)
     
             # Write total values to a file
             totals = {
@@ -63,6 +79,10 @@ def main():
                 "plausible@1": round(pass_at_k(total_patches, total_plausible_patches, 1), 3),
                 "bugs_with_ast_match_candidates": bugs_with_ast_match_candidates,
                 "bugs_with_plausible_candidates": bugs_with_plausible_candidates,
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_tokens,
+                "cost": total_cost
             }
 
             with open(f"{model}/total.json", "w") as f:

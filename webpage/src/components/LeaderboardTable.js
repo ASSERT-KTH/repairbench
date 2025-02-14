@@ -40,6 +40,16 @@ const LeaderboardTable = () => {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
   };
 
+  const formatNumber = (value) => {
+    if (value === undefined || value === null) return 'N/A';
+    return (value / 1_000_000).toFixed(1) + 'M';
+  };
+
+  const formatTokens = (input, output) => {
+    if (input === undefined || input === null || output === undefined || output === null) return 'N/A';
+    return `${formatNumber(input)} + ${formatNumber(output)}`;
+  };
+
   const sortNumeric = (rowA, rowB, columnId) => {
     const a = rowA.values[columnId];
     const b = rowB.values[columnId];
@@ -89,6 +99,28 @@ const LeaderboardTable = () => {
       disableSortBy: false,
     });
 
+    const createTokenColumn = (header, inputAccessor, outputAccessor, id) => ({
+      Header: header,
+      accessor: row => {
+        const inputTokens = row[inputAccessor];
+        const outputTokens = row[outputAccessor];
+        if (inputTokens === undefined || inputTokens === null || outputTokens === undefined || outputTokens === null || inputTokens === 'N/A' || outputTokens === 'N/A') {
+          return 'N/A';
+        }
+        return formatTokens(inputTokens, outputTokens);
+      },
+      id: id,
+      Cell: ({ value }) => (
+        <div className="cell-content">
+          <span>
+            {value}
+          </span>
+        </div>
+      ),
+      sortType: sortNumeric,
+      disableSortBy: false,
+    });
+
     const baseColumns = [
       {
         Header: 'Organization',
@@ -130,24 +162,17 @@ const LeaderboardTable = () => {
           return dateA.getTime() - dateB.getTime();
         },
         disableSortBy: false,
-      },
-      {
-        Header: `Total (${bugCounts.total || 0} bugs)`,
-        columns: [
-          createColumn('Plausible @1', 'total_plausible@1'),
-          createColumn('AST Match @1', 'total_ast_match@1'),
-          createCostColumn('Cost', 'total_cost'), // Cost column without bold
-        ],
       }
     ];
 
-    const extraColumns = [
+    const detailColumns = [
       {
         Header: `Defects4J v2 (${bugCounts.defects4j || 0} bugs)`,
         columns: [
           createColumn('Plausible @1', 'defects4j_plausible@1'),
           createColumn('AST Match @1', 'defects4j_ast_match@1'),
-          createCostColumn('Cost', 'defects4j_cost'), // Cost column without bold
+          createCostColumn('Cost', 'defects4j_cost'),
+          createTokenColumn('Tokens', 'defects4j_prompt_tokens', 'defects4j_completion_tokens', 'defects4j_tokens'),
         ],
       },
       {
@@ -155,12 +180,25 @@ const LeaderboardTable = () => {
         columns: [
           createColumn('Plausible @1', 'gitbugjava_plausible@1'),
           createColumn('AST Match @1', 'gitbugjava_ast_match@1'),
-          createCostColumn('Cost', 'gitbugjava_cost'), // Cost column without bol
+          createCostColumn('Cost', 'gitbugjava_cost'),
+          createTokenColumn('Tokens', 'gitbugjava_prompt_tokens', 'gitbugjava_completion_tokens', 'gitbugjava_tokens'),
         ],
       }
     ];
 
-    return showExtraColumns ? [...baseColumns, ...extraColumns] : baseColumns;
+    const totalColumns = [{
+      Header: `Total (${bugCounts.total || 0} bugs)`,
+      columns: [
+        createColumn('Plausible @1', 'total_plausible@1'),
+        createColumn('AST Match @1', 'total_ast_match@1'),
+        createCostColumn('Cost', 'total_cost'),
+        ...(showExtraColumns ? [
+          createTokenColumn('Tokens', 'total_prompt_tokens', 'total_completion_tokens', 'total_tokens')
+        ] : []),
+      ],
+    }];
+
+    return [...baseColumns, ...(showExtraColumns ? detailColumns : []), ...totalColumns];
   }, [showExtraColumns]); // Remove data and bugCounts from dependencies since they're now static
 
   const {
@@ -251,6 +289,7 @@ const LeaderboardTable = () => {
           <li>Plausible means that the generated patch passes all the tests in the test suite</li>
           <li>pass@1 values are estimated from 10 non-deterministic generations with temperature of 1.0</li>
           <li>Costs are calculated according to the pricing model of the model's organization. If the model is open-weights and not hosted by the model's organization, the pricing is calculated according to the provider chosen by the authors.</li>
+          <li>The token count is according to the tokenizer of each model. Some providers allow generating answers in batch. For those, the input tokens are only counted once instead of 10 times.</li>
           <li>Leaderboard is sorted, by default, by the total plausible@1 metric</li>
           <li>* Only partial results available right now due to cost reasons.</li>
           <li>We publish the <a href="https://github.com/ASSERT-KTH/elle-elle-aime" target="_blank" rel="noopener noreferrer">code</a> and <a href="https://github.com/ASSERT-KTH/repairbench" target="_blank" rel="noopener noreferrer">data</a> to enable reproducibility.</li>
