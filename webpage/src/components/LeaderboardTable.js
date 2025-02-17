@@ -60,6 +60,21 @@ const LeaderboardTable = () => {
     return aValue - bValue;
   };
 
+  const sortTokenColumn = (rowA, rowB, columnId) => {
+    const a = rowA.values[columnId];
+    const b = rowB.values[columnId];
+
+    if (a === 'N/A' || b === 'N/A') return a === 'N/A' ? 1 : -1;
+
+    const [aInput, aOutput] = a.split(' + ').map(val => parseFloat(val.replace('M', '')));
+    const [bInput, bOutput] = b.split(' + ').map(val => parseFloat(val.replace('M', '')));
+
+    const aValue = aInput + aOutput;
+    const bValue = bInput + bOutput;
+
+    return aValue - bValue;
+  };
+
   const parseDateString = (dateString) => {
     if (!dateString) return new Date(0); // Return earliest possible date if undefined
     const [year, month, day] = dateString.split('-');
@@ -117,7 +132,7 @@ const LeaderboardTable = () => {
           </span>
         </div>
       ),
-      sortType: sortNumeric,
+      sortType: sortTokenColumn,
       disableSortBy: false,
     });
 
