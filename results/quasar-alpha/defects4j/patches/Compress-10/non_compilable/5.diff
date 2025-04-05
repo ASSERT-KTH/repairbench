@@ -1,0 +1,111 @@
+diff --git a/tmp/bf39a9b3-3124-477f-b33f-2a6f442be145_buggy.java b/tmp/53d58242-85ad-464d-b99a-a5952e18af7d_fixed.java
+index 85e6a42..e3be674 100644
+--- a/tmp/bf39a9b3-3124-477f-b33f-2a6f442be145_buggy.java
++++ b/tmp/53d58242-85ad-464d-b99a-a5952e18af7d_fixed.java
+@@ -1,50 +1,105 @@
+ /**
+  * Walks through all recorded entries and adds the data available
+  * from the local file header.
+  *
+  * <p>Also records the offsets for the data to read from the
+  * entries.</p>
+  */
+ private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                         entriesWithoutUTF8Flag)
+     throws IOException {
+     // changing the name of a ZipArchiveEntry is going to change
+     // the hashcode - see COMPRESS-164
+     // Map needs to be reconstructed in order to keep central
+     // directory order
+     for (ZipArchiveEntry ze : entries.keySet()) {
+         OffsetEntry offsetEntry = entries.get(ze);
+         long offset = offsetEntry.headerOffset;
+         archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+         byte[] b = new byte[SHORT];
+         archive.readFully(b);
+         int fileNameLen = ZipShort.getValue(b);
+         archive.readFully(b);
+         int extraFieldLen = ZipShort.getValue(b);
+         int lenToSkip = fileNameLen;
+         while (lenToSkip > 0) {
+             int skipped = archive.skipBytes(lenToSkip);
+             if (skipped <= 0) {
+                 throw new RuntimeException("failed to skip file name in"
+                                            + " local file header");
+             }
+             lenToSkip -= skipped;
+         }
+         byte[] localExtraData = new byte[extraFieldLen];
+         archive.readFully(localExtraData);
+         ze.setExtra(localExtraData);
++
+         offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+             + SHORT + SHORT + fileNameLen + extraFieldLen;
+ 
+         if (entriesWithoutUTF8Flag.containsKey(ze)) {
+             String orig = ze.getName();
+             NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+             ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                      nc.comment);
+             if (!orig.equals(ze.getName())) {
+                 nameMap.remove(orig);
+                 nameMap.put(ze.getName(), ze);
+             }
+         }
++
++        // fix: if entry uses data descriptor and size wasn't known before, get/patch sizes from data itself
++        if ((ze.getGeneralPurposeBit().usesDataDescriptor())
++            && (ze.getCompressedSize() == ZipArchiveEntry.SIZE_UNKNOWN
++                || ze.getSize() == ZipArchiveEntry.SIZE_UNKNOWN)) {
++
++            // Save file pointer to restore later
++            long dataStart = offsetEntry.dataOffset;
++
++            // skip over data: we must read size from data descriptor after compressed data
++            archive.seek(dataStart);
++            long skippedData = 0;
++            final int method = ze.getMethod();
++            if (method == ZipMethod.DEFLATED.getCode()) {
++                // We don't know the compressed size upfront, decompress dummy
++                // We shouldn't decompress here just to get descriptor
++                // Instead, locate descriptor signature directly
++
++                // For WinZip created archives, sometimes the compressed size is stored in the central directory only
++                
++                // Heuristic: search for data descriptor signature (optional) after some reasonable amount
++                // For a proper implementation, we'd parse the stream when reading entries instead
++                // Here, since this is metadata pass, we cannot robustly parse descriptor
++                // So, skip fixing up sizes here - leave as unknown.
++                continue;
++            } else {
++                if (ze.getCompressedSize() != ZipArchiveEntry.SIZE_UNKNOWN) {
++                    skippedData = ze.getCompressedSize();
++                } else {
++                    continue; // cannot skip reliably
++                }
++            }
++            archive.seek(dataStart + skippedData);
++
++            byte[] dd = new byte[16]; // max size of data descriptor with ZIP64
++            archive.readFully(dd, 0, 4);
++            int sig = ZipLong.getValue(dd);
++            int descriptorOffset = 0;
++            if (sig == ZipLong.DD_SIG) {
++                // standard signature
++                descriptorOffset += 4;
++            } else {
++                // no signature, rewind
++                archive.seek(archive.getFilePointer() - 4);
++            }
++
++            archive.readFully(dd, descriptorOffset, 12);
++            long crc = ZipLong.getValue(dd, descriptorOffset);
++            long cSize = ZipLong.getValue(dd, descriptorOffset + 4);
++            long size = ZipLong.getValue(dd, descriptorOffset + 8);
++            ze.setCrc(crc);
++            ze.setCompressedSize(cSize);
++            ze.setSize(size);
++        }
+     }
+ }
+\ No newline at end of file
