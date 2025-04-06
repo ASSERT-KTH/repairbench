@@ -1,0 +1,225 @@
+diff --git a/tmp/41ef54dd-d786-40df-a6c5-c94486825ad2_buggy.java b/tmp/4e7f8681-6ffc-49d6-951e-3dfa5360e1c7_fixed.java
+index cd6f89c..e9093b3 100644
+--- a/tmp/41ef54dd-d786-40df-a6c5-c94486825ad2_buggy.java
++++ b/tmp/4e7f8681-6ffc-49d6-951e-3dfa5360e1c7_fixed.java
+@@ -1,102 +1,189 @@
+     private Object decodeEri(Channel channel, SocketAddress remoteAddress, String sentence) {
+         Parser parser = new Parser(PATTERN_ERI, sentence);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, parser.next());
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         long mask = parser.nextHexLong();
+ 
+         LinkedList<Position> positions = new LinkedList<>();
+ 
+-        Integer power = parser.nextInt();
++        Integer power = parser.nextInt(); // Optional power
+ 
+-        Parser itemParser = new Parser(PATTERN_LOCATION, parser.next());
++        // Parse location block
++        String locationBlock = parser.next();
++        if (locationBlock != null && !locationBlock.isEmpty()) {
++            Parser itemParser = new Parser(PATTERN_LOCATION, locationBlock);
+             while (itemParser.find()) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+-
+-            decodeLocation(position, itemParser);
+-
++                decodeLocation(position, itemParser); // Sets fixTime etc.
+                 positions.add(position);
+             }
++        }
+ 
+-        Position position = positions.getLast();
++        Position position;
++        if (positions.isEmpty()) {
++            // If no positions parsed from location block, create a base one
++            position = new Position(getProtocolName());
++            position.setDeviceId(deviceSession.getDeviceId());
++            // Time might be set later by decodeDeviceTime
++            positions.add(position);
++        } else {
++            position = positions.getLast(); // Use the last position for subsequent data
++        }
+ 
+-        skipLocation(parser);
++        // Location block already consumed by parser.next() above
+ 
+         if (power != null) {
+             position.set(Position.KEY_POWER, power * 0.001);
+         }
+ 
+-        if (parser.hasNextAny(12)) {
+-
++        // Check for optional fields block that follows location block
++        // Odometer
++        if (parser.hasNext()) {
+             position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000);
++        }
++
++        // Hours
++        if (parser.hasNext()) {
+             position.set(Position.KEY_HOURS, parseHours(parser.next()));
++        }
++
++        // ADCs
++        if (parser.hasNext()) {
+             position.set(Position.PREFIX_ADC + 1, parser.next());
++        }
++        if (parser.hasNext()) {
+             position.set(Position.PREFIX_ADC + 2, parser.next());
++        }
++        if (parser.hasNext()) {
+             position.set(Position.PREFIX_ADC + 3, parser.next());
++        }
++
++        // Input/Output
+         if (parser.hasNext(2)) {
+             position.set(Position.KEY_INPUT, parser.nextHexInt());
+             position.set(Position.KEY_OUTPUT, parser.nextHexInt());
+         }
+-            if (parser.hasNext(4)) {
++
++        // Battery Level
++        if (parser.hasNext()) {
+             position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt());
+-                decodeStatus(position, parser);
+         }
+ 
++        // Status / Digital Fuel Level (if mask bit 0 is set)
++        String statusValue = null;
++        if (parser.hasNext()) {
++            statusValue = parser.next(); // Consume Status/Fuel field
++            if (BitUtil.check(mask, 0)) {
++                // If mask bit 0 is set, this field represents digital fuel level (hex)
++                try {
++                    position.set(Position.KEY_FUEL_LEVEL, Integer.parseInt(statusValue, 16));
++                } catch (NumberFormatException e) {
++                    // Ignore if not a valid hex number, might be just status
++                }
++            }
++            // Always try to decode standard status bits from this field too
++            if (statusValue != null && statusValue.matches("[0-9a-fA-F]+")) {
++                 try {
++                     position.set(Position.KEY_STATUS, Integer.parseInt(statusValue, 16));
++                     // Potentially call a more detailed status decoding helper if needed
++                 } catch (NumberFormatException e) {/*ignore*/}
++            }
++        }
++
++        // Extended Data (check if field exists and is not the timestamp)
++        String extendedDataContent = null;
++        // Check if next field exists and is not a 14-digit timestamp
++        if (parser.hasNext() && !parser.peek().matches("^\\d{14}$")) {
++            extendedDataContent = parser.next(); // Consume only if it's not the timestamp
++        }
++
++        // Process Extended Data only if mask is non-zero and content exists
++        if (mask != 0 && extendedDataContent != null && !extendedDataContent.isEmpty()) {
++            String[] data = extendedDataContent.split(",");
+             int index = 0;
+-            String[] data = parser.next().split(",");
+ 
+-            index += 1; // device type
++            // Assume first field is device type - skip it
++            if (index < data.length) {
++                 index++;
++            }
+ 
++            // Skip digital fuel data index placeholder if mask bit 0 was set
++            // Assumes extended data structure accounts for this, even if value read from status field
+             if (BitUtil.check(mask, 0)) {
+-                index += 1; // digital fuel sensor data
++                if (index < data.length) {
++                    index++;
++                }
+             }
+ 
++            // Temperature Sensors (mask bit 1)
+             if (BitUtil.check(mask, 1)) {
+-                int deviceCount = Integer.parseInt(data[index++]);
++                if (index < data.length) { // Check if count field exists
++                    try {
++                        int deviceCount = Integer.parseInt(data[index++]); // Consume count
+                         for (int i = 1; i <= deviceCount; i++) {
+-                    index += 1; // id
+-                    index += 1; // type
+-                    if (!data[index++].isEmpty()) {
+-                        position.set(Position.PREFIX_TEMP + i, (short) Integer.parseInt(data[index - 1], 16) * 0.0625);
++                            if (index < data.length && !data[index].isEmpty()) { // Check if value field exists
++                                position.set(Position.PREFIX_TEMP + i, Integer.parseInt(data[index], 16) * 0.0625);
+                             }
++                            index++; // Consume the value field
++                        }
++                    } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {/*ignore*/}
+                 }
+             }
+ 
++            // CAN Data (mask bit 2) - Skip placeholder
+             if (BitUtil.check(mask, 2)) {
+-                index += 1; // can data
++                if (index < data.length) {
++                    index++;
++                }
+             }
+ 
++            // Analog Fuel Sensors (mask bits 3 or 4)
+             if (BitUtil.check(mask, 3) || BitUtil.check(mask, 4)) {
+-                int deviceCount = Integer.parseInt(data[index++]);
++                 if (index < data.length) { // Check if count field exists
++                     try {
++                         int deviceCount = Integer.parseInt(data[index++]); // Consume count
+                          for (int i = 1; i <= deviceCount; i++) {
+-                    index += 1; // type
++                             // Skip type field placeholder
++                             if (index < data.length) {
++                                 index++;
++                             }
++                             // Read level if mask bit 3
+                              if (BitUtil.check(mask, 3)) {
+-                        position.set(Position.KEY_FUEL_LEVEL, Double.parseDouble(data[index++]));
++                                 if (index < data.length && !data[index].isEmpty()) {
++                                     position.set(Position.KEY_FUEL_LEVEL, Double.parseDouble(data[index]));
+                                  }
++                                 index++; // Consume level field
++                             }
++                             // Skip volume if mask bit 4
+                              if (BitUtil.check(mask, 4)) {
+-                        index += 1; // volume
++                                  if (index < data.length) {
++                                      index++;
+                                   }
+                              }
+                          }
+-
++                     } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {/*ignore*/}
+                  }
+-
+-        if (parser.hasNext()) {
+-            position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt());
+             }
++        } // end if (mask != 0 && extendedDataContent != null)
+ 
++        // Device Time (should be the next field now)
+         decodeDeviceTime(position, parser);
+-        if (ignoreFixTime) {
++
++        // Final cleanup and return
++        if (ignoreFixTime && positions.size() > 1) {
++            // Keep only the last position which has all the combined data
++            position = positions.getLast();
+             positions.clear();
+             positions.add(position);
+         }
+ 
+-        return positions;
++        return positions; // Return the list (might contain one or more positions)
+     }
+\ No newline at end of file

@@ -1,0 +1,175 @@
+diff --git a/tmp/5af46676-4381-488c-9a3b-e3ce55313ce2_buggy.java b/tmp/396b410e-42b0-4510-bd3d-c758c784ebcb_fixed.java
+index 3652aad..13e70a2 100644
+--- a/tmp/5af46676-4381-488c-9a3b-e3ce55313ce2_buggy.java
++++ b/tmp/396b410e-42b0-4510-bd3d-c758c784ebcb_fixed.java
+@@ -1,86 +1,137 @@
+     /**
+      * Defines a typed variable. The defining node will be annotated with the
+      * variable's type of {@link JSTypeNative#UNKNOWN_TYPE} if its type is
+      * inferred.
+      *
+-     * Slots may be any variable or any qualified name in the global scope.
++     * Slots may be any variable or any qualified name.
+      *
+      * @param n the defining NAME or GETPROP node.
+      * @param parent the {@code n}'s parent.
+      * @param type the variable's type. It may be {@code null} if
+      *     {@code inferred} is {@code true}.
+      */
+     void defineSlot(Node n, Node parent, JSType type, boolean inferred) {
+       Preconditions.checkArgument(inferred || type != null);
+ 
+-      // Only allow declarations of NAMEs and qualfied names.
++      // Only allow declarations of NAMEs and qualified names.
++      // Check the structure is valid.
+       boolean shouldDeclareOnGlobalThis = false;
+-      if (n.getType() == Token.NAME) {
++      if (n.isName()) {
+         Preconditions.checkArgument(
+-            parent.getType() == Token.FUNCTION ||
+-            parent.getType() == Token.VAR ||
+-            parent.getType() == Token.LP ||
+-            parent.getType() == Token.CATCH);
++            parent.isFunction() ||
++            parent.isVar() ||
++            parent.isParamList() || // Use isParamList for function parameters (formerly LP)
++            parent.isCatch());
+         shouldDeclareOnGlobalThis = scope.isGlobal() &&
+-            (parent.getType() == Token.VAR ||
+-             parent.getType() == Token.FUNCTION);
++            (parent.isVar() ||
++             parent.isFunction());
+       } else {
+         Preconditions.checkArgument(
+-            n.getType() == Token.GETPROP &&
+-            (parent.getType() == Token.ASSIGN ||
+-             parent.getType() == Token.EXPR_RESULT));
++            n.isGetProp() && // Use Node predicate
++            (parent.isAssign() ||
++             parent.isExprResult()));
+       }
+       String variableName = n.getQualifiedName();
+-      Preconditions.checkArgument(!variableName.isEmpty());
++      // Make sure variableName is not null or empty, which can happen for
++      // some invalid code structures or complex GETPROPs.
++      Preconditions.checkArgument(variableName != null && !variableName.isEmpty(), "VariableName is empty or null for node %s", n);
+ 
+-      // If n is a property, then we should really declare it in the
+-      // scope where the root object appears. This helps out people
+-      // who declare "global" names in an anonymous namespace.
+-      Scope scopeToDeclareIn = scope;
+ 
+-        // don't try to declare in the global scope if there's
+-        // already a symbol there with this name.
++      // If n is a property (GETPROP), determine the scope in which to declare it.
++      // Typically, this is the scope where the root object of the property chain is defined.
++      // For example, if 'a' is global, 'a.b.c = 1' inside a function should declare
++      // 'a.b.c' in the global scope.
++      Scope scopeToDeclareIn = scope; // Default to the current scope.
++      if (n.isGetProp()) {
++        Node rootNode = n;
++        // Traverse down the property chain to find the root, e.g., 'a' in 'a.b.c'.
++        while (rootNode.isGetProp()) {
++          rootNode = rootNode.getFirstChild();
++        }
+ 
+-      // declared in closest scope?
++        // If the root is a simple variable name (e.g., 'a' in 'a.b.c = 1').
++        if (rootNode.isName()) {
++          String rootVarName = rootNode.getString();
++          // Find the variable in the current scope chain.
++          Var rootVar = scope.getVar(rootVarName);
++          if (rootVar != null) {
++            Scope definingScope = rootVar.getScope();
++            if (definingScope != null) {
++              // Declare the property in the scope where the base variable is defined.
++              scopeToDeclareIn = definingScope;
++            }
++            // If definingScope is null (e.g., perhaps for built-ins or externs
++            // defined without a clear scope pointer?), we fall back to declaring
++            // in the current scope, which matches the original behavior in
++            // ambiguous cases.
++          }
++          // If the root variable itself is not found (e.g., 'undeclared.prop = 1'),
++          // declare the property in the current scope. This matches the original
++          // behavior and allows handling of potentially undeclared variables.
++        }
++        // If the root is not a name (e.g., 'this.prop', '(getObj()).prop', 'arr[0].prop'),
++        // then declaring the property in the current scope ('scope') is generally
++        // the most sensible approach.
++      }
++
++      // Check if the variable name is already declared in the target scope.
+       if (scopeToDeclareIn.isDeclared(variableName, false)) {
++        // If it is declared, it might be an error (redeclaration) or
++        // a harmless assignment. The validator handles this determination.
+         Var oldVar = scopeToDeclareIn.getVar(variableName);
+         validator.expectUndeclaredVariable(
+             sourceName, n, parent, oldVar, variableName, type);
+       } else {
++        // If it's not declared in the target scope, declare it now.
+         if (!inferred) {
++          // Associate the declared type with the node if it wasn't inferred.
+           setDeferredType(n, type);
+         }
+         CompilerInput input = compiler.getInput(sourceName);
++        // It's possible that input is null if the sourceName is unknown (e.g., synthetic code).
+         scopeToDeclareIn.declare(variableName, n, type, input, inferred);
+ 
++        // If 'n' was a NAME declared at the top level of the global scope
++        // (e.g., var x = 1; or function x() {}), also define it on the GlobalThis object type
++        // for accurate modeling of the global object.
+         if (shouldDeclareOnGlobalThis) {
+           ObjectType globalThis =
+               typeRegistry.getNativeObjectType(JSTypeNative.GLOBAL_THIS);
+-          boolean isExtern = input.isExtern();
++          // Input can be null, indicating the source file is unknown.
++          // Treat this as non-extern in that case.
++          boolean isExtern = (input != null && input.isExtern());
+           if (inferred) {
+-            globalThis.defineInferredProperty(variableName,
+-                type == null ?
+-                    getNativeType(JSTypeNative.NO_TYPE) :
+-                    type,
+-                isExtern);
++             // Use NO_TYPE if type is null for inferred properties on GlobalThis,
++             // consistent with the original code's apparent behavior.
++            JSType typeToDeclare = type == null ? getNativeType(JSTypeNative.NO_TYPE) : type;
++            globalThis.defineInferredProperty(variableName, typeToDeclare, isExtern);
+           } else {
++            // If not inferred, type should not be null based on the initial precondition.
++            Preconditions.checkNotNull(type);
+             globalThis.defineDeclaredProperty(variableName, type, isExtern);
+           }
+         }
+ 
+-        // If we're in the global scope, also declare var.prototype
+-        // in the scope chain.
++        // Handle '.prototype' property specifically. If we just declared a function type
++        // (constructor or interface) in the *global* scope, we should also implicitly
++        // declare its '.prototype' property in the global scope.
+         if (scopeToDeclareIn.isGlobal() && type instanceof FunctionType) {
+           FunctionType fnType = (FunctionType) type;
+           if (fnType.isConstructor() || fnType.isInterface()) {
+             FunctionType superClassCtor = fnType.getSuperClassConstructor();
+-            scopeToDeclareIn.declare(variableName + ".prototype", n,
+-                fnType.getPrototype(), compiler.getInput(sourceName),
+-                /* declared iff there's an explicit supertype */
+-                superClassCtor == null ||
++            // Determine if the prototype itself should be marked as "declared".
++            // This seems to depend on whether an explicit superclass other than Object is involved.
++            boolean prototypeMarkedDeclared = !(superClassCtor == null ||
+                 superClassCtor.getInstanceType().equals(
+                     getNativeType(OBJECT_TYPE)));
++
++            // Declare "FunctionName.prototype" in the global scope.
++            // Use the same CompilerInput as the function declaration.
++            // There's no specific AST node for the prototype property itself, so pass null.
++            scopeToDeclareIn.declare(variableName + ".prototype", null,
++                fnType.getPrototype(), input,
++                prototypeMarkedDeclared);
+           }
+         }
+       }
+     }
+\ No newline at end of file

@@ -1,0 +1,347 @@
+diff --git a/tmp/736430e3-c14d-4153-8f4e-18c416c62e98_buggy.java b/tmp/ea12ba5e-465e-45ea-ac29-d8d2a6ebd398_fixed.java
+index e4fca3c..d6572e6 100644
+--- a/tmp/736430e3-c14d-4153-8f4e-18c416c62e98_buggy.java
++++ b/tmp/ea12ba5e-465e-45ea-ac29-d8d2a6ebd398_fixed.java
+@@ -1,239 +1,316 @@
++import com.google.javascript.rhino.IR;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.jscomp.NodeUtil;
++import static com.google.javascript.jscomp.AstFactory.type; // Assuming AstFactory is available for type comparison if needed
++import static com.google.javascript.jscomp.NodeUtil.isLowerPrecedenceInExpression; // Import static method
++import static com.google.javascript.rhino.jstype.JSTypeNative.NUMBER_TYPE; // Example import, adjust as needed
++import static com.google.javascript.jscomp.parsing.ParserRunner.createParser; // Example import, adjust as needed
++
++// Stub methods and constants assumed to be defined elsewhere in the class or project
++abstract class AbstractPeepholeOptimization {
++    // Assume compiler instance is available
++    com.google.javascript.jscomp.AbstractCompiler compiler;
++    boolean late = false; // Example value, adjust as needed
++    static final int OR_PRECEDENCE = NodeUtil.precedence(com.google.javascript.rhino.Token.OR);
++    static final int AND_PRECEDENCE = NodeUtil.precedence(com.google.javascript.rhino.Token.AND);
++    abstract protected void reportCodeChange();
++    abstract boolean areNodesEqualForInlining(Node n1, Node n2);
++    abstract boolean mayEffectMutableState(Node n);
++    abstract boolean isFoldableExpressBlock(Node n);
++    abstract Node getBlockExpression(Node n);
++    abstract boolean isPropertyAssignmentInExpression(Node n);
++    abstract void tryRemoveRepeatedStatements(Node n);
++    abstract boolean consumesDanglingElse(Node n);
++    abstract boolean isReturnExpressBlock(Node n);
++    abstract Node getBlockReturnExpression(Node n);
++    abstract boolean isVarBlock(Node n);
++    abstract Node getBlockVar(Node n);
++}
++
++
++class PeepholeSubstituteAlternateSyntax extends AbstractPeepholeOptimization { // Example class structure
++
++    // Assume compiler is initialized in the constructor or elsewhere
++    PeepholeSubstituteAlternateSyntax(com.google.javascript.jscomp.AbstractCompiler compiler) {
++        this.compiler = compiler;
++    }
++
+   /**
+    * Try turning IF nodes into smaller HOOKs
+    *
+    * Returns the replacement for n or the original if no replacement was
+    * necessary.
+    */
+   private Node tryMinimizeIf(Node n) {
+ 
+     Node parent = n.getParent();
++    if (parent == null) {
++      // Cannot replace the top-level node.
++      return n;
++    }
++
+ 
+     Node cond = n.getFirstChild();
+ 
+     /* If the condition is a literal, we'll let other
+      * optimizations try to remove useless code.
+      */
+     if (NodeUtil.isLiteralValue(cond, true)) {
+       return n;
+     }
+ 
+     Node thenBranch = cond.getNext();
+     Node elseBranch = thenBranch.getNext();
+ 
+     if (elseBranch == null) {
+       if (isFoldableExpressBlock(thenBranch)) {
+         Node expr = getBlockExpression(thenBranch);
+         if (!late && isPropertyAssignmentInExpression(expr)) {
+           // Keep opportunities for CollapseProperties such as
+           // a.longIdentifier || a.longIdentifier = ... -> var a = ...;
+           // until CollapseProperties has been run.
+           return n;
+         }
+ 
+         if (cond.isNot()) {
+           // if(!x)bar(); -> x||bar();
++          Node exprValue = expr.getFirstChild();
+           if (isLowerPrecedenceInExpression(cond, OR_PRECEDENCE) &&
+-              isLowerPrecedenceInExpression(expr.getFirstChild(),
++              isLowerPrecedenceInExpression(exprValue,
+                   OR_PRECEDENCE)) {
+             // It's not okay to add two sets of parentheses.
+             return n;
+           }
+ 
+           Node or = IR.or(
+               cond.removeFirstChild(),
+               expr.removeFirstChild()).srcref(n);
+           Node newExpr = NodeUtil.newExpr(or);
+           parent.replaceChild(n, newExpr);
+           reportCodeChange();
+ 
+           return newExpr;
+         }
+ 
+         // if(x)foo(); -> x&&foo();
++        Node exprValue = expr.getFirstChild();
+         if (isLowerPrecedenceInExpression(cond, AND_PRECEDENCE) &&
+-            isLowerPrecedenceInExpression(expr.getFirstChild(),
++            isLowerPrecedenceInExpression(exprValue,
+                 AND_PRECEDENCE)) {
+           // One additional set of parentheses is worth the change even if
+           // there is no immediate code size win. However, two extra pair of
+           // {}, we would have to think twice. (unless we know for sure the
+           // we can further optimize its parent.
+           return n;
+         }
+ 
+         n.removeChild(cond);
+         Node and = IR.and(cond, expr.removeFirstChild()).srcref(n);
+         Node newExpr = NodeUtil.newExpr(and);
+         parent.replaceChild(n, newExpr);
+         reportCodeChange();
+ 
+         return newExpr;
+       } else {
+ 
+         // Try to combine two IF-ELSE
+         if (NodeUtil.isStatementBlock(thenBranch) &&
+             thenBranch.hasOneChild()) {
+           Node innerIf = thenBranch.getFirstChild();
+ 
+           if (innerIf.isIf()) {
+             Node innerCond = innerIf.getFirstChild();
+             Node innerThenBranch = innerCond.getNext();
+             Node innerElseBranch = innerThenBranch.getNext();
+ 
+             if (innerElseBranch == null &&
+                  !(isLowerPrecedenceInExpression(cond, AND_PRECEDENCE) &&
+                    isLowerPrecedenceInExpression(innerCond, AND_PRECEDENCE))) {
+               n.detachChildren();
+               n.addChildToBack(
+                   IR.and(
+                       cond,
+                       innerCond.detachFromParent())
+                       .srcref(cond));
+               n.addChildrenToBack(innerThenBranch.detachFromParent());
+               reportCodeChange();
+               // Not worth trying to fold the current IF-ELSE into && because
+               // the inner IF-ELSE wasn't able to be folded into && anyways.
+               return n;
+             }
+           }
+         }
+       }
+ 
+       return n;
+     }
+ 
+     /* TODO(dcc) This modifies the siblings of n, which is undesirable for a
+      * peephole optimization. This should probably get moved to another pass.
+      */
+     tryRemoveRepeatedStatements(n);
+ 
+     // if(!x)foo();else bar(); -> if(x)bar();else foo();
+     // An additional set of curly braces isn't worth it.
+     if (cond.isNot() && !consumesDanglingElse(elseBranch)) {
+       n.replaceChild(cond, cond.removeFirstChild());
+       n.removeChild(thenBranch);
+       n.addChildToBack(thenBranch);
+       reportCodeChange();
+-      return n;
++      // Condition has changed, maybe the IF can be folded now?
++      // Restart the process with the modified node.
++      return tryMinimizeIf(n);
+     }
+ 
+     // if(x)return 1;else return 2; -> return x?1:2;
+     if (isReturnExpressBlock(thenBranch) && isReturnExpressBlock(elseBranch)) {
+       Node thenExpr = getBlockReturnExpression(thenBranch);
+       Node elseExpr = getBlockReturnExpression(elseBranch);
++
++      // ignore cases with "return;", technically this can be converted to
++      // "return undefined;" but that doesn't help code size.
++      if (thenExpr != null && elseExpr != null) {
+         n.removeChild(cond);
+         thenExpr.detachFromParent();
+         elseExpr.detachFromParent();
+ 
+-      // note - we ignore any cases with "return;", technically this
+-      // can be converted to "return undefined;" or some variant, but
+-      // that does not help code size.
+         Node returnNode = IR.returnNode(
+                               IR.hook(cond, thenExpr, elseExpr)
+                                   .srcref(n));
+         parent.replaceChild(n, returnNode);
+         reportCodeChange();
+         return returnNode;
+       }
++    }
+ 
+     boolean thenBranchIsExpressionBlock = isFoldableExpressBlock(thenBranch);
+     boolean elseBranchIsExpressionBlock = isFoldableExpressBlock(elseBranch);
+ 
+     if (thenBranchIsExpressionBlock && elseBranchIsExpressionBlock) {
+       Node thenOp = getBlockExpression(thenBranch).getFirstChild();
+       Node elseOp = getBlockExpression(elseBranch).getFirstChild();
+       if (thenOp.getType() == elseOp.getType()) {
+         // if(x)a=1;else a=2; -> a=x?1:2;
++        // if(x)a+=1;else a+=2; -> x ? a+=1 : a+=2; // Don't hoist compound assignments if cond has side effects.
+         if (NodeUtil.isAssignmentOp(thenOp)) {
+           Node lhs = thenOp.getFirstChild();
+-          if (areNodesEqualForInlining(lhs, elseOp.getFirstChild()) &&
+-              // if LHS has side effects, don't proceed [since the optimization
+-              // evaluates LHS before cond]
+-              // NOTE - there are some circumstances where we can
+-              // proceed even if there are side effects...
+-              !mayEffectMutableState(lhs)) {
++          if (areNodesEqualForInlining(lhs, elseOp.getFirstChild())) {
+ 
++            // Hoisting the assignment is only valid if the condition evaluation doesn't
++            // affect the LHS evaluation.
++            // Safe cases:
++            // 1. Condition has no side effects AND LHS evaluation has no side effects.
++            // 2. OR LHS is a simple name AND it's a simple assignment (ASSIGN).
++            //    (handles `a = cond_with_side_effects ? v1 : v2;`)
++            boolean lhsIsSimpleName = lhs.isName();
++            // getCompiler() method assumed to exist, providing the AbstractCompiler instance.
++            boolean condHasNoSideEffects = !NodeUtil.mayHaveSideEffects(cond, compiler);
++            boolean lhsHasNoSideEffects = !mayEffectMutableState(lhs);
++
++            // Hoist if:
++            // 1. Condition has no side effects AND LHS has no side effects (safest case)
++            // 2. OR LHS is a simple name AND it's a simple assignment (ASSIGN)
++            boolean canHoist = (condHasNoSideEffects && lhsHasNoSideEffects) ||
++                               (lhsIsSimpleName && thenOp.isAssign()); // Check for simple ASSIGN here
++
++            if (canHoist) {
++              // Proceed with hoisting: lhs = cond ? v1 : v2
+               n.removeChild(cond);
+-            Node assignName = thenOp.removeFirstChild();
++              Node assignTarget = thenOp.removeFirstChild(); // Keep the original LHS node structure
+               Node thenExpr = thenOp.removeFirstChild();
+-            Node elseExpr = elseOp.getLastChild();
+-            elseOp.removeChild(elseExpr);
++              Node elseExpr = elseOp.getLastChild().detachFromParent();
+ 
+               Node hookNode = IR.hook(cond, thenExpr, elseExpr).srcref(n);
+-            Node assign = new Node(thenOp.getType(), assignName, hookNode)
+-                              .srcref(thenOp);
+-            Node expr = NodeUtil.newExpr(assign);
+-            parent.replaceChild(n, expr);
++              // Create new ASSIGN op based on the original one
++              Node assign = new Node(thenOp.getType(), assignTarget, hookNode)
++                                .srcref(thenOp); // Use original assignment type (ASSIGN, ASSIGN_ADD, etc.)
++              Node newExpr = NodeUtil.newExpr(assign);
++              parent.replaceChild(n, newExpr);
+               reportCodeChange();
+ 
+-            return expr;
++              return newExpr;
+             }
+           }
+         }
+-      // if(x)foo();else bar(); -> x?foo():bar()
++      }
++      // Fallback: if(x)foo();else bar(); -> x?foo():bar()
++      // This path is taken if assignment hoisting wasn't possible or desirable.
+       n.removeChild(cond);
+       thenOp.detachFromParent();
+       elseOp.detachFromParent();
+-      Node expr = IR.exprResult(
+-          IR.hook(cond, thenOp, elseOp).srcref(n));
++
++      Node hookNode = IR.hook(cond, thenOp, elseOp).srcref(n);
++      // Make sure the result is used as an expression statement if the
++      // original IF statement was used as a statement.
++      // If the original IF statement was part of a larger expression,
++      // this might be incorrect, but the surrounding logic should handle that.
++      Node expr = IR.exprResult(hookNode);
+       parent.replaceChild(n, expr);
+       reportCodeChange();
+       return expr;
+     }
+ 
+     boolean thenBranchIsVar = isVarBlock(thenBranch);
+     boolean elseBranchIsVar = isVarBlock(elseBranch);
+ 
+     // if(x)var y=1;else y=2  ->  var y=x?1:2
+     if (thenBranchIsVar && elseBranchIsExpressionBlock &&
+         getBlockExpression(elseBranch).getFirstChild().isAssign()) {
+ 
+       Node var = getBlockVar(thenBranch);
+       Node elseAssign = getBlockExpression(elseBranch).getFirstChild();
+ 
+       Node name1 = var.getFirstChild();
+       Node maybeName2 = elseAssign.getFirstChild();
+ 
+-      if (name1.hasChildren()
++      if (name1.hasChildren() // var y = 1 has child 1
+           && maybeName2.isName()
+           && name1.getString().equals(maybeName2.getString())) {
++        // Check safety: condition must not affect the assignment value in else branch,
++        // and the assignment target (name1/maybeName2) must not be affected by the condition.
++        // Since it's a VAR declaration, the name is safe. Assume value safety for now.
++        // TODO(johnlenz): Verify condition doesn't affect elseExpr.
+         Node thenExpr = name1.removeChildren();
+         Node elseExpr = elseAssign.getLastChild().detachFromParent();
+         cond.detachFromParent();
+         Node hookNode = IR.hook(cond, thenExpr, elseExpr)
+                             .srcref(n);
+         var.detachFromParent();
+         name1.addChildrenToBack(hookNode);
+         parent.replaceChild(n, var);
+         reportCodeChange();
+         return var;
+       }
+ 
+     // if(x)y=1;else var y=2  ->  var y=x?1:2
+     } else if (elseBranchIsVar && thenBranchIsExpressionBlock &&
+         getBlockExpression(thenBranch).getFirstChild().isAssign()) {
+ 
+       Node var = getBlockVar(elseBranch);
+       Node thenAssign = getBlockExpression(thenBranch).getFirstChild();
+ 
+       Node maybeName1 = thenAssign.getFirstChild();
+       Node name2 = var.getFirstChild();
+ 
+-      if (name2.hasChildren()
++      if (name2.hasChildren() // var y = 2 has child 2
+           && maybeName1.isName()
+           && maybeName1.getString().equals(name2.getString())) {
++        // Check safety similar to the above case.
++        // TODO(johnlenz): Verify condition doesn't affect thenExpr.
+         Node thenExpr = thenAssign.getLastChild().detachFromParent();
+         Node elseExpr = name2.removeChildren();
+         cond.detachFromParent();
+         Node hookNode = IR.hook(cond, thenExpr, elseExpr)
+                             .srcref(n);
+         var.detachFromParent();
+         name2.addChildrenToBack(hookNode);
+         parent.replaceChild(n, var);
+         reportCodeChange();
+ 
+         return var;
+       }
+     }
+ 
+     return n;
+   }
++} // End of example class structure
+\ No newline at end of file

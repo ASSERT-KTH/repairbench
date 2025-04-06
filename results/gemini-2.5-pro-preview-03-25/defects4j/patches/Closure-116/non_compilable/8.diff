@@ -1,0 +1,127 @@
+diff --git a/tmp/b884c9a6-d57d-4864-96b9-046b199c5f71_buggy.java b/tmp/d1d065ad-8cac-4704-91b7-02070bc38076_fixed.java
+index 233a867..bff8452 100644
+--- a/tmp/b884c9a6-d57d-4864-96b9-046b199c5f71_buggy.java
++++ b/tmp/d1d065ad-8cac-4704-91b7-02070bc38076_fixed.java
+@@ -1,73 +1,110 @@
+   /**
+    * Determines whether a function can be inlined at a particular call site.
+    * There are several criteria that the function and reference must hold in
+    * order for the functions to be inlined:
+    * 1) If a call's arguments have side effects,
+    * the corresponding argument in the function must only be referenced once.
+    * For instance, this will not be inlined:
+    * <pre>
+    *     function foo(a) { return a + a }
+    *     x = foo(i++);
+    * </pre>
++   * 2) If the function body has side effects, arguments must be simple
++   *    constants or variables, unless the side effects are "safe" (e.g. assignments
++   *    to locals or properties of parameters). Calls with side-effects are typically
++   *    not safe to inline if arguments are passed.
+    */
+   private CanInlineResult canInlineReferenceDirectly(
+       Node callNode, Node fnNode) {
+     if (!isDirectCallNodeReplacementPossible(fnNode)) {
+       return CanInlineResult.NO;
+     }
+ 
+     Node block = fnNode.getLastChild();
+-
++    // Store this check result, as it is used multiple times.
++    boolean functionHasSideEffects = NodeUtil.mayHaveSideEffects(block, compiler);
+ 
+     // CALL NODE: [ NAME, ARG1, ARG2, ... ]
+     Node cArg = callNode.getFirstChild().getNext();
+ 
+     // Functions called via 'call' and 'apply' have a this-object as
+     // the first parameter, but this is not part of the called function's
+     // parameter list.
+     if (!callNode.getFirstChild().isName()) {
+       if (NodeUtil.isFunctionObjectCall(callNode)) {
+         // TODO(johnlenz): Support replace this with a value.
+         if (cArg == null || !cArg.isThis()) {
+           return CanInlineResult.NO;
+         }
+         cArg = cArg.getNext();
+       } else {
+         // ".apply" call should be filtered before this.
+         Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+       }
+     }
+ 
+     // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+     Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+     while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
+-        if (cArg != null) {
++      // Check arguments and parameters in pairs.
++      if (fnParam != null && cArg != null) {
+ 
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
++          int paramUseCount = NodeUtil.getNameReferenceCount(
++              block, fnParam.getString());
++
++          // Check 1: Check for arguments that are evaluated more than once.
++          // Example: f(i++) where f(a) { return a + a; }
+           if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
++              && paramUseCount > 1) {
+             return CanInlineResult.NO;
+           }
++
++          // Check 3: If the function possibly has side effects, check for potential
++          // conflicts between the side effects and the arguments.
++          // Example: f(x.prop) where f(a) { x.prop = 2; return a; }
++          // Example: f(x) where f(a) { mightModifyXGlobally(); return a; }
++          if (paramUseCount > 0 && functionHasSideEffects) {
++            // If the argument is complex (not a literal or simple name),
++            // and the function has side effects, we assume that the side effects
++            // might interact with the argument evaluation order or value.
++            boolean argIsComplex = !(NodeUtil.isLiteralValue(cArg, true) || cArg.isName());
++            if (argIsComplex) {
++              return CanInlineResult.NO;
++            } else {
++              // If the argument is simple (literal or name), it's generally safe unless
++              // the function's side effects could potentially modify the value referenced
++              // by the name (e.g., through calls to other functions that modify globals
++              // or closure variables). Assume any call with side effects might do this.
++              // Note: Assignments directly to parameter properties (param.x=1) are generally
++              // safe if the parameter is used once, and are not caught here.
++              boolean hasCallSideEffects = NodeUtil.has(
++                  block,
++                  node -> node.isCall() && NodeUtil.mayHaveSideEffects(node, compiler),
++                  // Avoid infinite recursion: don't check function nodes defined inside the block.
++                  node -> !node.isFunction());
++              if (hasCallSideEffects) {
++                return CanInlineResult.NO;
++              }
++            }
++          }
+       }
+ 
+-        // Move to the next name.
++      // Move to the next parameter.
++      if (fnParam != null) {
+         fnParam = fnParam.getNext();
+       }
+ 
+       // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
++      // isn't a named parameter to match. This handles unused arguments
++      // with side effects, e.g. f(1, i++) where f(a){}.
+       if (cArg != null) {
++        // Check 2: Argument evaluation itself has side-effects.
+         if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+           return CanInlineResult.NO;
+         }
+         cArg = cArg.getNext();
+       }
+     }
+ 
+     return CanInlineResult.YES;
+   }
+\ No newline at end of file

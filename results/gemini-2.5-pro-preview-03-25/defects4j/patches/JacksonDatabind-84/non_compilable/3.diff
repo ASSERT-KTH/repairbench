@@ -1,0 +1,157 @@
+diff --git a/tmp/06aa09d8-859c-493e-b5d8-cbb4c75ef43c_buggy.java b/tmp/dcf5b540-b92a-4361-ba49-93db14798315_fixed.java
+index e69de29..b53b724 100644
+--- a/tmp/06aa09d8-859c-493e-b5d8-cbb4c75ef43c_buggy.java
++++ b/tmp/dcf5b540-b92a-4361-ba49-93db14798315_fixed.java
+@@ -0,0 +1,151 @@
++// Located in com.fasterxml.jackson.databind.type.TypeFactory
++@SuppressWarnings("resource")
++protected JavaType _fromClass(HierarchicType ctxt, Class<?> cl, TypeBindings bindings)
++{
++    // First: possible shortcut for simple types
++    // 30-Nov-2017, tatu: As per [databind#1831] may need to avoid caching Object.class,
++    //    regardless of context type... lets start simple tho
++    if (cl == String.class) return CORE_TYPE_STRING; // since 2.7
++    if (cl == Object.class) return CORE_TYPE_OBJECT;
++
++    // Maybe already defined? Try check from cache
++    // 14-Jan-2016, tatu: Cannot cache types that depend on context... except maybe for root?
++    // TODO: Need to reconsider following caching, perhaps only enable for root elements?
++    //       Need to balance impact on performance, memory use
++    // 05-May-2017, tatu: Ok, testing suggests this is safe enough for root types
++    //   (when `ctxt` is null); and performance impact seems negligible.
++
++    final Object key = (bindings == null || bindings.isEmpty()) ? cl : bindings.asKey(cl);
++
++    // 13-Oct-2016, tatu: As per [databind#1169], need to be careful wrt caching; consider
++    JavaType result = _typeCache.get(key);
++    if (result != null) {
++        // Need to ensure that type is not being recursively resolved...
++        if ((ctxt != null) && ctxt.isCyclic()) {
++            // 13-Jan-2018, tatu: This is tricky... Need to avoid returning finalized type
++            //   in case refinement is needed? For now assume cache is ok. May need
++            //   to revisit in future.
++            // 28-Oct-2019, tatu: Let's check one thing: if `result` was resolved via
++            //    different bindings, do not return... (re-resolving is bit costly but safe)
++            //    Need to ensure this check is efficient; for now just skip if different
++            // NOTE! We check raw Class in key... but bindings may differ. Need to check.
++            // 13-Mar-2020, tatu: Actually need `equals()` check since Bindings may be same
++            //    instance OR equivalent.
++            if (result.getBindings().equals(bindings)) {
++                 return result;
++            }
++        } else {
++            return result;
++        }
++    }
++
++    // Ok: no easy shortcut, need to build type.
++
++    // 18-Nov-2015, tatu: If we have context, maybe we can get previously resolved type?
++    boolean recurse = (ctxt != null);
++    HierarchicType childCtxt;
++
++    if (recurse) {
++        // 18-Nov-2015, tatu: Related to [databind#1006], need to be careful wrt bindings
++        HierarchicType prev = ctxt.findSubType(cl);
++        if (prev != null) {
++            // Uh-oh. Loop right back to something we are resolving. Usually bad.
++            // But could also be Union type, like:
++            //  Foo<T extends Foo<T>>
++            // Let's allow that by returning resolved type associated...
++            prev.setDebugInfo(" (found previously processed)", false); // Add info for diagnostics
++            return prev.getResolvedType(); // MUST have been resolved earlier
++        }
++        childCtxt = ctxt.createChild(cl);
++    } else {
++        // Two possibilities: either genuinely new type; or directly recursive type like
++        // <T extends Base<T>>. For latter, need to check existing contexts.
++        // ... note: we could perhaps simplify/optimize check, but for now checks all bindings.
++        HierarchicType existing = _findNearestGeneric(cl, bindings);
++        if (existing != null) {
++            // Ok: resolved previously, points to existing definition, need that:
++            existing.setDebugInfo(" (already resolved)", false);
++            return existing.getResolvedType();
++        }
++        childCtxt = new HierarchicType(cl);
++        // We must associate bindings now; even if empty
++        // Should always be properly bound subtype?
++        if (bindings != null) {
++            childCtxt.setBindings(bindings);
++        }
++    }
++
++    // First, preliminary registration to allow handling recursive definitions
++    // 13-Oct-2016, tatu: Need to use factory method not constructor, used to call
++    //    `new SimpleType(cl)` which is WRONG.
++    // Important: must use a method that can either construct or reuse; can not
++    // just call constructor, MUST delegate back to TypeFactory
++    // Also: we have slight chicken-and-egg problem, need placeholder to use for resolution,
++    // can not finalize early.
++
++    // 14-Oct-2016, tatu: Actually, need to use placeholder created by `HierarchicType` itself...
++    //    or, maybe, pass `SimpleType` that we create right here and now? Try latter
++    // 24-Oct-2016, tatu: Maybe not? SimpleType does not seem right. Try again with
++    //     `constructType()` variant... or perhaps `_constructType()`?
++
++    // 12-Jan-2018, tatu: Need to ensure type has handlers, bindings, resolved via this...
++    result = _constructSimple(cl, bindings, childCtxt, null);
++    childCtxt.setResolvedType(result);
++
++    // Need context to resolve supertypes: pass `childCtxt`, not `ctxt`.
++    JavaType superClass;
++    JavaType[] superInterfaces;
++    try {
++        superClass = _resolveSuperClass(childCtxt, cl, bindings);
++        superInterfaces = _resolveSuperInterfaces(childCtxt, cl, bindings);
++    } catch (Exception e) {
++        childCtxt.setErrorReported();
++        // For [databind#1714], use placeholder type instead of failing right away
++        if (!this._cfgFailOnUnknownSubType) {
++            // 12-Jan-2018, tatu: As per comment above, should NOT call SimpleType ctor directly
++            //result. Gosh darnit. What should we do? Make it failed type maybe?
++            // For now, let's leave as is and see what happens...
++            //result = new SimpleType(cl);
++             result.setHierarchy(null, null);
++             return result;
++        }
++        // but by default, do fail
++        throw new IllegalArgumentException("Failed to process type '"+ClassUtil.nameOf(cl)+"': "+e.getMessage(), e);
++    }
++    // RBR needs to be resolved?
++    if (result instanceof SimpleType) { // sanity check; shouldn't occur otherwise
++        ((SimpleType) result).setHierarchy(superClass, superInterfaces);
++    } else { // but what if some TypeModifier sub-classed? Then need to delegate...
++        // TBD // how could this happen? Placeholder is `SimpleType`?
++        // 12-Jan-2018, tatu: Not sure what to do here; should never happen? Let's assume that
++        //   for now. If it does, need to define `setHierarchy()` on JavaType perhaps?
++    }
++
++    // Ok; fully defined now. Let's see if we can refine it; specifically
++    result = _refineSimpleType(result, cl, bindings, childCtxt, superClass, superInterfaces);
++
++    // And update context to finalized type
++    // 12-Jan-2018, tatu: Let's see if this helps...
++    // 28-Oct-2019, tatu: Actually must check for class... may have been refined into
++    //    something else? Although... probably not. Let's be safe tho
++    if (result.getClass() == SimpleType.class) {
++        if (result != childCtxt.getResolvedType()) {
++            childCtxt.setResolvedType(result);
++        }
++    }
++
++    // One more thing: self-reference? Need to check ONLY for top-level calls
++    if (!recurse) {
++        _verifySelfReference(result, childCtxt);
++    }
++
++    // Finally: let's try add to cache. But ONLY if we are root type being resolved
++    // -- otherwise resolution is context-dependent.
++    // 28-Oct-2019, tatu: Actually caching depends on whether bindings differ, not
++    //    directly on cyclic check. Although usually related.
++    // Let's try caching based on context being non-null?
++    if (ctxt == null) {
++        _typeCache.put(key, result);
++    }
++    return result;
++}
+\ No newline at end of file

@@ -1,0 +1,137 @@
+diff --git a/tmp/ca3ecce6-6680-49c8-80b7-d7e620343a06_buggy.java b/tmp/52619063-27ff-4e01-9df9-40af62d71080_fixed.java
+index 08093b4..3bf23da 100644
+--- a/tmp/ca3ecce6-6680-49c8-80b7-d7e620343a06_buggy.java
++++ b/tmp/52619063-27ff-4e01-9df9-40af62d71080_fixed.java
+@@ -1,42 +1,122 @@
++import java.io.IOException;
++import java.io.StringWriter;
++import java.util.Map;
++import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
++import org.apache.commons.compress.archivers.tar.TarConstants;
++import org.apache.commons.compress.utils.CharsetNames;
++
++// The user requested only the fixed function. Other necessary imports and class structure are assumed.
++// This code should replace the buggy version within its original class (likely TarArchiveOutputStream).
++
+     /**
+      * Writes a PAX extended header with the given map as contents.
++     * @param entryName The name of the entry the PAX header describes. Used to generate the PAX header name.
++     * @param headers The map of key-value pairs for the header.
++     * @throws IOException on error
+      * @since 1.4
+      */
+     void writePaxHeaders(String entryName,
+                          Map<String, String> headers) throws IOException {
++        // Construct name for the PAX header entry, e.g., "./PaxHeaders.X/entryName"
+         String name = "./PaxHeaders.X/" + stripTo7Bits(entryName);
+-            // TarEntry's constructor would think this is a directory
+-            // and not allow any data to be written
++
++        // PAX specification requires header names not to end with a slash.
++        // Furthermore, the TarArchiveEntry constructor treats names ending with '/'
++        // as directories, overwriting the link flag and mode, which breaks PAX headers.
++        // Remove trailing slash if present to prevent this. Fixes COMPRESS-199 / related test failure.
++        if (name.endsWith("/")) {
++            name = name.substring(0, name.length() - 1);
++        }
++
++        // Ensure the generated name fits within the TAR header's name field limit.
++        // Check length *after* potentially removing the slash.
++        // Truncate if necessary, leaving space for potential null terminator handling by underlying methods.
+         if (name.length() >= TarConstants.NAMELEN) {
+             name = name.substring(0, TarConstants.NAMELEN - 1);
+         }
++
++        // Create the TarArchiveEntry for the PAX header.
++        // Use the constructor specifying the name and the PAX header type flag.
++        // Since 'name' no longer ends with '/', the constructor will correctly use the
++        // provided LF_PAX_EXTENDED_HEADER_LC ('x') flag and not misinterpret it as a directory.
+         TarArchiveEntry pex = new TarArchiveEntry(name,
+                                                   TarConstants.LF_PAX_EXTENDED_HEADER_LC);
+ 
++        // Use StringWriter to efficiently build the header lines in memory.
+         StringWriter w = new StringWriter();
+         for (Map.Entry<String, String> h : headers.entrySet()) {
+             String key = h.getKey();
+             String value = h.getValue();
++
++            // Format the PAX header line according to specification: "length key=value\n"
++            // The 'length' field is the decimal length of the entire record including the length field itself.
++            // We must calculate this length accurately, considering UTF-8 encoding.
++            // Start with an initial guess for the total length.
+             int len = key.length() + value.length()
+                 + 3 /* blank, equals and newline */
+-                + 2 /* guess 9 < actual length < 100 */;
++                + 2 /* initial guess for length field size, e.g., "NN " */;
+             String line = len + " " + key + "=" + value + "\n";
+-            int actualLength = line.getBytes(CharsetNames.UTF_8).length;
++
++            // PAX headers MUST be encoded in UTF-8. Calculate the actual byte length.
++            byte[] lineBytes = line.getBytes(CharsetNames.UTF_8);
++            int actualLength = lineBytes.length;
++
++            // Iteratively refine the length calculation. If the actual byte length
++            // requires a different number of digits for the 'length' field than initially guessed,
++            // recalculate until the 'len' value matches the 'actualLength' of the UTF-8 encoded string.
++            // This loop handles adjustments for length field size changes (e.g., 9->10, 99->100)
++            // and multi-byte UTF-8 characters.
+             while (len != actualLength) {
+-                // Adjust for cases where length < 10 or > 100
+-                // or where UTF-8 encoding isn't a single octet
+-                // per character.
+-                // Must be in loop as size may go from 99 to 100 in
+-                // first pass so we'd need a second.
+                 len = actualLength;
+                 line = len + " " + key + "=" + value + "\n";
+-                actualLength = line.getBytes(CharsetNames.UTF_8).length;
++                lineBytes = line.getBytes(CharsetNames.UTF_8);
++                actualLength = lineBytes.length;
+             }
++            // Append the correctly formatted line to the writer.
+             w.write(line);
+         }
++
++        // Get the complete PAX header content as a byte array, encoded in UTF-8.
+         byte[] data = w.toString().getBytes(CharsetNames.UTF_8);
++
++        // Set the size field of the TarArchiveEntry for the PAX header. This is critical.
++        // If not set, it defaults to 0, leading to errors when writing the data.
+         pex.setSize(data.length);
++
++        // Write the TAR header for the PAX entry ('pex') to the output stream.
++        // This writes the metadata (name, size, type flag 'x', etc.) to the archive.
++        // The stream's internal state (currEntry, currBytesRemaining) is updated.
++        // Because 'pex' is correctly identified as a non-directory, currBytesRemaining
++        // will be set to pex.getSize() (i.e., data.length).
+         putArchiveEntry(pex);
++
++        // Write the actual PAX header content (the collected lines) to the output stream.
++        // This write operation will succeed because the number of bytes 'data.length'
++        // matches the expected size stored in currBytesRemaining.
+         write(data);
++
++        // Finalize the PAX header entry in the TAR archive.
+         closeArchiveEntry();
+     }
++
++    // Assume stripTo7Bits is defined elsewhere in the class or is accessible.
++    // Example placeholder:
++    private String stripTo7Bits(String name) {
++        // Placeholder: Replace non-7-bit ASCII characters.
++        // The actual implementation might be more sophisticated.
++        StringBuilder sb = new StringBuilder();
++        for (char ch : name.toCharArray()) {
++            if (ch > 0 && ch < 128) {
++                sb.append(ch);
++            } else {
++                sb.append("?"); // Replace with placeholder
++            }
++        }
++        return sb.toString();
++    }
++
++    // Assume putArchiveEntry, write, closeArchiveEntry are methods of the surrounding class.
++    // Example placeholders:
++    // abstract void putArchiveEntry(TarArchiveEntry entry) throws IOException;
++    // abstract void write(byte[] b) throws IOException;
++    // abstract void closeArchiveEntry() throws IOException;

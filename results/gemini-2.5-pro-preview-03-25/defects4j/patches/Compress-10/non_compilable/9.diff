@@ -1,0 +1,143 @@
+diff --git a/tmp/8515b372-6a94-4b57-aba5-ce8a9e53fc0b_buggy.java b/tmp/22a43a5c-3094-4f7d-8358-179e61e098ae_fixed.java
+index 85e6a42..3077781 100644
+--- a/tmp/8515b372-6a94-4b57-aba5-ce8a9e53fc0b_buggy.java
++++ b/tmp/22a43a5c-3094-4f7d-8358-179e61e098ae_fixed.java
+@@ -1,50 +1,131 @@
++import java.io.IOException;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++// Include necessary imports for ZipArchiveEntry, OffsetEntry, NameAndComment, ZipShort, ZipUtil, etc.
++// Assume these classes and constants (SHORT, LFH_OFFSET_FOR_FILENAME_LENGTH) are defined elsewhere correctly.
++
+     /**
+      * Walks through all recorded entries and adds the data available
+      * from the local file header.
+      *
+      * <p>Also records the offsets for the data to read from the
+      * entries.</p>
+      */
+     private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                             entriesWithoutUTF8Flag)
+         throws IOException {
+         // changing the name of a ZipArchiveEntry is going to change
+         // the hashcode - see COMPRESS-164
+         // Map needs to be reconstructed in order to keep central
+-        // directory order
+-        for (ZipArchiveEntry ze : entries.keySet()) {
+-            OffsetEntry offsetEntry = entries.get(ze);
++        // directory order andlookup mapping using potentially modified entries.
++        // Create a copy to iterate over, then rebuild the original map.
++        Map<ZipArchiveEntry, OffsetEntry> currentEntries = new LinkedHashMap<>(entries);
++        Map<ZipArchiveEntry, OffsetEntry> newEntries = new LinkedHashMap<>();
++
++        for (Map.Entry<ZipArchiveEntry, OffsetEntry> entry : currentEntries.entrySet()) {
++            ZipArchiveEntry ze = entry.getKey();
++            OffsetEntry offsetEntry = entry.getValue(); // Get the OffsetEntry associated with the original key
++
+             long offset = offsetEntry.headerOffset;
++            // If headerOffset is unknown, we have a problem. Indicative of issue during CD reading.
++            // Depending on desired behavior, could throw an exception or skip this entry.
++            // For now, assume headerOffset is valid if we reached here.
++            if (offset == OFFSET_UNKNOWN) {
++                 // log a warning? skip? based on how ZipFile promises to behave
++                 // for now, let's continue, but getInputStream will likely fail for this entry
++                 newEntries.put(ze, offsetEntry); // Keep the entry with unknown offset
++                 continue;
++            }
++
+             archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+             byte[] b = new byte[SHORT];
+             archive.readFully(b);
++            // If the archive is corrupt and we cannot read the full length, readFully will throw EOFException
+             int fileNameLen = ZipShort.getValue(b);
+             archive.readFully(b);
+             int extraFieldLen = ZipShort.getValue(b);
++
++            // Skip the filename
+             int lenToSkip = fileNameLen;
+             while (lenToSkip > 0) {
+                 int skipped = archive.skipBytes(lenToSkip);
+                 if (skipped <= 0) {
+-                    throw new RuntimeException("failed to skip file name in"
+-                                               + " local file header");
++                    // skipBytes should return > 0 if there are bytes to skip unless it hit EOF immediately.
++                    // Throw if skip fails unexpectedly.
++                    throw new IOException("Failed to skip file name in local file header: " + ze.getName());
+                 }
+                 lenToSkip -= skipped;
+             }
++
++            // Read the local extra field data
+             byte[] localExtraData = new byte[extraFieldLen];
+             archive.readFully(localExtraData);
++
++            // Set the local extra data on the entry. This might potentially
++            // update entry's metadata (e.g., Zip64 sizes) based on local extra fields.
++            // It might also change the hashcode if extra fields affect equality/hashcode.
+             ze.setExtra(localExtraData);
++
++            // Calculate the data offset and store it in the OffsetEntry.
++            // The calculation uses the LFH filename/extra field lengths.
+             offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                 + SHORT + SHORT + fileNameLen + extraFieldLen;
+ 
++            // Handle entries potentially needing name/comment update based on CD flags/fields.
++            // This needs to happen *after* setExtra if ZipUtil relies on extra fields,
++            // but be aware setExtra might have removed CD-only fields (like Unicode Path).
++            // If entriesWithoutUTF8Flag contained the original 'ze' key:
+             if (entriesWithoutUTF8Flag.containsKey(ze)) {
+                 String orig = ze.getName();
+                 NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+-                ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+-                                                         nc.comment);
++                // If nc is null, something is wrong, but proceed cautiously.
++                if (nc != null) {
++                     // This call might change ze.getName(), affecting its hashcode.
++                     ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name, nc.comment);
+                      if (!orig.equals(ze.getName())) {
++                         // Update the name lookup map.
+                          nameMap.remove(orig);
+                          nameMap.put(ze.getName(), ze);
+                      }
+                 }
+             }
++            // Add the entry (potentially modified key) and its OffsetEntry to the new map.
++            newEntries.put(ze, offsetEntry);
+         }
++
++        // Clear the original map and repopulate it from the rebuilt map.
++        // This ensures the map contains the final state of the ZipArchiveEntry keys.
++        if (entries.size() != newEntries.size()) {
++             // This case might occur if an entry with OFFSET_UNKNOWN was skipped,
++             // or potentially if duplicate keys were produced by modifications (unlikely).
++             // Log or handle as appropriate. For now, just replace.
++             // LOG.warn("Size mismatch when rebuilding entries map; was " + entries.size() + ", now " + newEntries.size());
++        }
++        entries.clear();
++        entries.putAll(newEntries);
++    }
++
++    // Dummy fields and constants assumed to exist for context
++    private static final int SHORT = 2;
++    private static final long OFFSET_UNKNOWN = -1;
++    private static final int LFH_OFFSET_FOR_FILENAME_LENGTH = 26;
++    private java.io.RandomAccessFile archive;
++    private Map<ZipArchiveEntry, OffsetEntry> entries;
++    private Map<String, ZipArchiveEntry> nameMap;
++
++    // Dummy inner classes assumed to exist
++    private static class OffsetEntry { long headerOffset = OFFSET_UNKNOWN; long dataOffset = OFFSET_UNKNOWN; }
++    private static class NameAndComment { byte[] name; byte[] comment; }
++
++    // Dummy classes/utils assumed to exist
++    private static class ZipArchiveEntry {
++        private String name; private byte[] extra;
++        String getName() { return name; }
++        void setExtra(byte[] extra) { this.extra = extra; /* + potentially parse & update state */ }
++        // hashCode() and equals() potentially depend on name and/or extra fields
++        @Override public int hashCode() { return java.util.Objects.hash(name); /* Simplified */ }
++        @Override public boolean equals(Object obj) { /* Simplified */ return obj instanceof ZipArchiveEntry && java.util.Objects.equals(this.name, ((ZipArchiveEntry)obj).name); }
++    }
++    private static class ZipShort { static int getValue(byte[] b) { return 0; } }
++    private static class ZipUtil { static void setNameAndCommentFromExtraFields(ZipArchiveEntry ze, byte[] nameBytes, byte[] commentBytes) { /* Simplified: might change ze.name */ } }

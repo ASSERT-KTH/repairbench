@@ -1,0 +1,171 @@
+diff --git a/tmp/a054e337-b9fa-48fa-96c9-b6b1209b3d13_buggy.java b/tmp/aefdf29d-1a9d-4128-98f7-77c6e4db94e8_fixed.java
+index 5bc9804..5a81d19 100644
+--- a/tmp/a054e337-b9fa-48fa-96c9-b6b1209b3d13_buggy.java
++++ b/tmp/aefdf29d-1a9d-4128-98f7-77c6e4db94e8_fixed.java
+@@ -1,85 +1,129 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithExternalTypeId(JsonParser p, DeserializationContext ctxt)
+         throws IOException
+     {
+         final ExternalTypeHandler ext = _externalTypeIdHandler.start();
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
+-        TokenBuffer tokens = new TokenBuffer(p);
+-        tokens.writeStartObject();
++        TokenBuffer tokens = null; // created lazily
+ 
+         JsonToken t = p.getCurrentToken();
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
+             p.nextToken(); // to point to value
++
+             // creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
+-                // first: let's check to see if this might be part of value with external type id:
+-                // 11-Sep-2015, tatu: Important; do NOT pass buffer as last arg, but null,
+-                //   since it is not the bean
++                // We must deal with the case involving creator property...
++                // Check if external type handler can handle this?
++                // 15-Jan-2020, tatu: As per [databind#2608], need to pass buffer, NOT null
++                // Pass buffer so that `ExternalTypeHandler` has chance to buffer value,
++                // although not sure if it can associate it with creator property value
+                 if (ext.handlePropertyValue(p, ctxt, propName, buffer)) {
++                    // Nothing to do, property handled by handler
+                     ;
+                 } else {
+-                    // Last creator property to set?
+-                    if (buffer.assignParameter(creatorProp, _deserializeWithErrorWrapping(p, ctxt, creatorProp))) {
+-                        t = p.nextToken(); // to move to following FIELD_NAME/END_OBJECT
+-                        Object bean;
+-                        try {
+-                            bean = creator.build(ctxt, buffer);
+-                        } catch (Exception e) {
+-                            wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+-                            continue; // never gets here
+-                        }
+-                        // if so, need to copy all remaining tokens into buffer
+-                        while (t == JsonToken.FIELD_NAME) {
+-                            p.nextToken(); // to skip name
+-                            tokens.copyCurrentStructure(p);
+-                            t = p.nextToken();
+-                        }
+-                        if (bean.getClass() != _beanType.getRawClass()) {
+-                            // !!! 08-Jul-2011, tatu: Could theoretically support; but for now
+-                            //   it's too complicated, so bail out
+-                            throw ctxt.mappingException("Can not create polymorphic instances with unwrapped values");
+-                        }
+-                        return ext.complete(p, ctxt, bean);
+-                    }
++                    // If not handled by `ext`, buffer using PropertyValueBuffer
++                    // NB: This may fail if `assignParameter` needs to buffer and there is
++                    // no setter fallback. Indicates external type handling interaction issue.
++                    buffer.assignParameter(creatorProp, _deserializeWithErrorWrapping(p, ctxt, creatorProp));
++                    // 13-Feb-2024, tatu: MUST NOT try to build bean early as parameters may
++                    //    rely on type information not yet received. Original code had this
++                    //    flaw.
+                 }
+                 continue;
+             }
+             // Object Id property?
+             if (buffer.readIdProperty(propName)) {
+                 continue;
+             }
+             // regular property? needs buffering
+             SettableBeanProperty prop = _beanProperties.find(propName);
+             if (prop != null) {
+                 buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+                 continue;
+             }
+-            // external type id (or property that depends on it)?
++            // external type id (or property that depends on it)? This handles the type marker
++            // Pass `null` as there is no bean yet
+             if (ext.handlePropertyValue(p, ctxt, propName, null)) {
+                 continue;
+             }
+-            /* As per [JACKSON-313], things marked as ignorable should not be
+-             * passed to any setter
+-             */
++
++            // Unknown property, ignorable property, or "any property"
++            // Need to buffer for later processing
++            if (tokens == null) {
++                tokens = new TokenBuffer(p, ctxt);
++            }
++            tokens.writeFieldName(propName);
++            tokens.copyCurrentStructure(p);
++            
++            /* // Removed original separate handling to unify via TokenBuffer
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+                 handleIgnoredProperty(p, ctxt, handledType(), propName);
+                 continue;
+             }
+-            // "any property"?
+             if (_anySetter != null) {
++                try {
+                     buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
++                } catch (Exception e) {
++                    wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+                 }
++                continue;
++            }
++            // Unknown: pass to handler method
++            handleUnknownProperty(p, ctxt, _valueClass, propName);
++            */
+         }
+ 
+         // We hit END_OBJECT; resolve the pieces:
++        Object bean;
+         try {
+-            return ext.complete(p, ctxt, buffer, creator);
++            // Use the "standard" completion mechanism that requires creator/buffer
++            bean = ext.complete(p, ctxt, buffer, creator);
+         } catch (Exception e) {
+-            wrapInstantiationProblem(e, ctxt);
+-            return null; // never gets here
++            // As per method signature, need to return Object; wrapInstantiationProblem likely throws
++            // but for compile-time, return value needed. Exception wrapping seems appropriate.
++            return wrapInstantiationProblem(e, ctxt);
+         }
++
++        // If we did buffer anything, replay now
++        if (tokens != null) {
++             // If we got END_OBJECT this may be problematic...
++             // But if we exit loop, we are AT End-Object or after it.
++             // Let's assume stream is at or after END-OBJECT.
++
++            tokens.writeEndObject(); // Finish buffering
++            JsonParser bufferedParser = tokens.asParser(p); // Use main parser for context
++            bufferedParser.nextToken(); // Move past virtual START_OBJECT
++
++             // Need to deserialize stored properties onto bean instance
++             while (bufferedParser.getCurrentToken() != JsonToken.END_OBJECT) {
++                 String propName = bufferedParser.getCurrentName();
++                 bufferedParser.nextToken(); // value
++                 SettableBeanProperty prop = _beanProperties.find(propName);
++                 if (prop != null) {
++                     try {
++                         prop.deserializeAndSet(bufferedParser, ctxt, bean);
++                     } catch (Exception e) {
++                         wrapAndThrow(e, bean, propName, ctxt);
++                     }
++                 } else if (_ignorableProps != null && _ignorableProps.contains(propName)) {
++                     handleIgnoredProperty(bufferedParser, ctxt, bean, propName);
++                 } else if (_anySetter != null) {
++                     try {
++                         _anySetter.deserializeAndSet(bufferedParser, ctxt, bean, propName);
++                     } catch (Exception e) {
++                         wrapAndThrow(e, bean, propName, ctxt);
++                     }
++                 } else {
++                     // Unknown property stored in tokens
++                     handleUnknownProperty(bufferedParser, ctxt, bean, propName);
++                 }
++                 bufferedParser.nextToken();
++             }
++             bufferedParser.close(); // Close the token buffer parser
++        }
++        return bean;
+     }
+\ No newline at end of file

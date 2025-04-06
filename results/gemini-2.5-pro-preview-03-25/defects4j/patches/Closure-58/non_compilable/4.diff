@@ -1,0 +1,194 @@
+diff --git a/tmp/37b27719-cbc3-47a5-943a-2495866f7cfa_buggy.java b/tmp/ac311ac7-4b59-40b7-90dd-0422a11ce049_fixed.java
+index 2ff27ef..874db54 100644
+--- a/tmp/37b27719-cbc3-47a5-943a-2495866f7cfa_buggy.java
++++ b/tmp/ac311ac7-4b59-40b7-90dd-0422a11ce049_fixed.java
+@@ -1,97 +1,166 @@
+   /**
+    * Computes the GEN and KILL set.
+    *
+    * @param n Root node.
+    * @param gen Local variables that are live because of the instruction at
+    *        {@code n} will be added to this set.
+    * @param kill Local variables that are killed because of the instruction at
+    *        {@code n} will be added to this set.
+    * @param conditional {@code true} if any assignments encountered are
+    *        conditionally executed. These assignments might not kill a variable.
+    */
+   private void computeGenKill(Node n, BitSet gen, BitSet kill,
+       boolean conditional) {
+ 
+     switch (n.getType()) {
+       case Token.SCRIPT:
+       case Token.BLOCK:
+       case Token.FUNCTION:
++        // These nodes defines scopes, they don't generate or kill variables
++        // themselves. Instead, we need to traverse into them. But the caller
++        // (computeFollowNode) handles traversing into block-like structures
++        // appropriately. So, we should just return here.
+         return;
+ 
+       case Token.WHILE:
+       case Token.DO:
+       case Token.IF:
++        // Only inspect the condition expression. The body/sub-blocks are handled
++        // by the dataflow framework automatically.
+         computeGenKill(NodeUtil.getConditionExpression(n), gen, kill,
+             conditional);
+         return;
+ 
+       case Token.FOR:
+         if (!NodeUtil.isForIn(n)) {
+-          computeGenKill(NodeUtil.getConditionExpression(n), gen, kill,
+-              conditional);
++          // Standard FOR loop: for(init; condition; increment) { body }
++          // Only inspect init, condition, and increment expressions. The body
++          // is handled by the dataflow framework.
++          Node init = n.getFirstChild();
++          Node condition = init.getNext();
++          Node increment = condition.getNext();
++          computeGenKill(init, gen, kill, conditional);
++          computeGenKill(condition, gen, kill, conditional);
++          computeGenKill(increment, gen, kill, conditional);
+         } else {
+-          // for(x in y) {...}
++          // FOR-IN loop: for(lhs in rhs) { body }
+           Node lhs = n.getFirstChild();
+           Node rhs = lhs.getNext();
+-          if (NodeUtil.isVar(lhs)) {
+-            // for(var x in y) {...}
+-            lhs = lhs.getLastChild();
+-          }
+-            addToSetIfLocal(lhs, kill);
+-            addToSetIfLocal(lhs, gen);
++
++          // Process the right-hand side (the object being iterated over) first.
+           computeGenKill(rhs, gen, kill, conditional);
++
++          // Process the left-hand side (the iteration variable/expression).
++          if (NodeUtil.isVar(lhs)) {
++            // Case: for(var x in y)
++            // The VAR node itself doesn't generate/kill, but the declared variable
++            // is assigned to in the loop.
++            Node varName = lhs.getFirstChild();
++            if (varName != null && varName.isName()) {
++              // Kill the variable being declared and assigned.
++              // The assignment by the loop mechanism is definite if the loop runs.
++              // We follow the convention of other assignments: kill if the context
++              // is not conditional.
++              if (!conditional) {
++                   addToSetIfLocal(varName, kill);
++              }
++              // The assignment doesn't read the old value of varName, so no GEN.
++            } else {
++              // Unexpected VAR structure, traverse defensively.
++              computeGenKill(lhs, gen, kill, conditional);
++            }
++          } else if (NodeUtil.isName(lhs)) {
++            // Case: for(x in y)
++            // Kill the variable being assigned.
++            if (!conditional) {
++                addToSetIfLocal(lhs, kill);
++            }
++            // The assignment doesn't read the old value of lhs, so no GEN.
++          } else {
++            // Case: for(a[0] in y), for(obj.prop in y), etc.
++            // The LHS is an expression. Compute GEN/KILL for its sub-expressions.
++            // For example, in a[0], 'a' is read (GEN).
++            // The assignment modifies the property/element but doesn't kill the
++            // base variable ('a' or 'obj') in the sense of this analysis.
++            computeGenKill(lhs, gen, kill, conditional);
++          }
+         }
+         return;
+ 
+       case Token.VAR:
+-        for (Node c = n.getFirstChild(); c != null; c = c.getNext()) {
+-          if (c.hasChildren()) {
+-            computeGenKill(c.getFirstChild(), gen, kill, conditional);
++        // Variable declarations: var name1 = init1, name2 = init2;
++        for (Node nameNode = n.getFirstChild(); nameNode != null; nameNode = nameNode.getNext()) {
++          // nameNode is the NAME node for the variable.
++          if (nameNode.hasChildren()) {
++            // Has initializer: var name = initializer;
++            Node initializer = nameNode.getFirstChild();
++            computeGenKill(initializer, gen, kill, conditional);
++            // The variable is killed by the assignment.
+             if (!conditional) {
+-              addToSetIfLocal(c, kill);
++              addToSetIfLocal(nameNode, kill);
+             }
++            // The declaration+assignment does not read the variable being declared.
+           }
++          // If no initializer (var name;), it neither generates nor kills the variable
++          // at this point (it just declares it).
+         }
+         return;
+ 
+       case Token.AND:
+       case Token.OR:
++        // Left operand is always executed.
+         computeGenKill(n.getFirstChild(), gen, kill, conditional);
+-        // May short circuit.
++        // Right operand is conditionally executed.
+         computeGenKill(n.getLastChild(), gen, kill, true);
+         return;
+ 
+       case Token.HOOK:
++        // Condition is always executed.
+         computeGenKill(n.getFirstChild(), gen, kill, conditional);
+-        // Assume both sides are conditional.
++        // Both branches are conditionally executed.
+         computeGenKill(n.getFirstChild().getNext(), gen, kill, true);
+         computeGenKill(n.getLastChild(), gen, kill, true);
+         return;
+ 
+       case Token.NAME:
+         if (isArgumentsName(n)) {
++          // Accessing 'arguments' potentially reads all parameters.
+           markAllParametersEscaped();
+         } else {
++          // Reading a variable adds it to the GEN set.
+           addToSetIfLocal(n, gen);
+         }
+         return;
+ 
+       default:
++        // Handle assignments, increments, decrements, and other expressions.
+         if (NodeUtil.isAssignmentOp(n) && NodeUtil.isName(n.getFirstChild())) {
++          // Assignment to a simple variable: NAME = rhs, NAME += rhs, etc.
+           Node lhs = n.getFirstChild();
+-          if (!conditional) {
+-            addToSetIfLocal(lhs, kill);
+-          }
+-          if (!NodeUtil.isAssign(n)) {
+-            // assignments such as a += 1 reads a.
+-            addToSetIfLocal(lhs, gen);
+-          }
++
++          // Process the right-hand side first.
+           computeGenKill(lhs.getNext(), gen, kill, conditional);
++
++          // Assignment kills the LHS variable if unconditional.
++          if (!conditional) {
++            addToSetIfLocal(lhs, kill);
++          }
++
++          // Compound assignments (+=, *=, etc.) also read the LHS variable.
++          // Simple assignment (=) does not.
++          if (!NodeUtil.isAssign(n)) {
++            addToSetIfLocal(lhs, gen);
++          }
+         } else {
++          // For other node types (like GETPROP, GETELEM, CALL, operators),
++          // simply traverse the children to find reads/writes within them.
++          // Assignment to properties (a.b = c, a[0] = c) falls into this case.
++          // The recursive calls will handle GEN sets correctly (e.g., reading 'a').
++          // This analysis doesn't track kills for properties, only local variables.
+           for (Node c = n.getFirstChild(); c != null; c = c.getNext()) {
+             computeGenKill(c, gen, kill, conditional);
+           }
+         }
+         return;
+     }
+   }
+\ No newline at end of file

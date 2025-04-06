@@ -1,0 +1,125 @@
+diff --git a/tmp/09e75836-7dcb-4794-aa2a-14e489eb1cbf_buggy.java b/tmp/37bac4c6-dd2f-4209-bc7d-0eabd9b6d341_fixed.java
+index 7e43c1c..4877a86 100644
+--- a/tmp/09e75836-7dcb-4794-aa2a-14e489eb1cbf_buggy.java
++++ b/tmp/37bac4c6-dd2f-4209-bc7d-0eabd9b6d341_fixed.java
+@@ -1,19 +1,115 @@
+   /**
+    * Visits a NEW node.
++   *
++   * Example: new Foo();
+    */
+   private void visitNew(NodeTraversal t, Node n) {
+     Node constructor = n.getFirstChild();
+-    JSType type = getJSType(constructor).restrictByNotNullOrUndefined();
+-    if (type.isConstructor() || type.isEmptyType() || type.isUnknownType()) {
+-      FunctionType fnType = type.toMaybeFunctionType();
++    // Get the type of the constructor expression. Could be FunctionType, UnionType, Unknown, etc.
++    JSType constructorType = getJSType(constructor);
++    // We are interested in the type when it's not null or undefined.
++    JSType restrictedType = constructorType.restrictByNotNullOrUndefined();
++
++    // Check if the restricted type could possibly be used with 'new'.
++    // This includes actual constructors, or types that could resolve to one
++    // (like unknown, empty, or unions containing constructors).
++    boolean maybeConstructor = restrictedType.isConstructor()
++        || restrictedType.isEmptyType() || restrictedType.isUnknownType();
++    if (!maybeConstructor && restrictedType.isUnionType()) {
++      // If it's a union, check if any alternative could be a constructor.
++      for (JSType alt : restrictedType.toMaybeUnionType().getAlternates()) {
++        // Check the alternative after restricting it as well.
++        JSType restrictedAlt = alt.restrictByNotNullOrUndefined();
++        if (restrictedAlt.isConstructor() || restrictedAlt.isEmptyType() || restrictedAlt.isUnknownType()) {
++          maybeConstructor = true;
++          break;
++        }
++      }
++    }
++
++    // If it's definitely not something that can be used with 'new', report an error.
++    if (!maybeConstructor) {
++      report(t, n, NOT_A_CONSTRUCTOR);
++      ensureTyped(t, n); // Assign unknown type after reporting error
++      return;
++    }
++
++    // If we're here, the type might be usable with 'new'.
++    // Try to resolve it to a specific FunctionType if possible.
++    // This will return null for UNKNOWN, EMPTY, or UNION types.
++    FunctionType fnType = restrictedType.toMaybeFunctionType();
++
+     if (fnType != null) {
++      // Case 1: The type resolved to a single FunctionType.
++      // Check if it's actually a constructor or an interface.
++      if (fnType.isConstructor()) {
++        // It's a proper constructor. Check parameters and assign the instance type.
+         visitParameterList(t, n, fnType);
+         ensureTyped(t, n, fnType.getInstanceType());
++      } else if (fnType.isInterface()) {
++        // It's an interface. Report error, cannot instantiate interfaces.
++        report(t, n, NOT_A_CONSTRUCTOR);
++        ensureTyped(t, n);
+       } else {
++        // It's some other kind of function, not marked as constructor/interface.
++        // Treat as not a constructor.
++        report(t, n, NOT_A_CONSTRUCTOR);
+         ensureTyped(t, n);
+       }
+     } else {
+-      report(t, n, NOT_A_CONSTRUCTOR);
++      // Case 2: The type did not resolve to a single FunctionType.
++      // It must be UNKNOWN, EMPTY, or a UNION (because maybeConstructor was true).
++      FunctionType representativeFnType = null; // For parameter checking
++      // Prepare to build the result type (usually UNKNOWN or a union of instance types).
++      JSType resultType = typeRegistry.getNativeType(JSTypeNative.NO_TYPE); // Start with bottom type
++      boolean hasValidInstanceType = false;
++
++      if (restrictedType.isUnionType()) {
++        // Iterate through the union alternatives to find constructors.
++        for (JSType alt : restrictedType.toMaybeUnionType().getAlternates()) {
++          JSType restrictedAlt = alt.restrictByNotNullOrUndefined();
++          if (restrictedAlt.isConstructor()) {
++            // Found a constructor alternative.
++            FunctionType altFn = restrictedAlt.toMaybeFunctionType();
++            if (altFn != null) {
++              // Use the first constructor found for parameter checking.
++              if (representativeFnType == null) {
++                representativeFnType = altFn;
++              }
++              // Add its instance type to the possible result types.
++              resultType = typeRegistry.createUnionType(resultType, altFn.getInstanceType());
++              hasValidInstanceType = true;
++            }
++          } else if (restrictedAlt.isEmptyType() || restrictedAlt.isUnknownType()) {
++            // If any alternative is unknown/empty, include UNKNOWN in the result type.
++            resultType = typeRegistry.createUnionType(resultType,
++                typeRegistry.getNativeType(JSTypeNative.UNKNOWN_TYPE));
++            hasValidInstanceType = true;
++          }
++          // Ignore alternatives that are definitely not constructors (e.g., number, string).
++          // Interfaces would also be ignored here as !isConstructor().
++        }
++      } else {
++        // Type must be UNKNOWN or EMPTY (since fnType was null but maybeConstructor was true).
++        // The result type is UNKNOWN.
++        resultType = typeRegistry.getNativeType(JSTypeNative.UNKNOWN_TYPE);
++        hasValidInstanceType = true;
++      }
++
++      // Perform parameter check if we found a representative constructor signature from a union.
++      if (representativeFnType != null) {
++        visitParameterList(t, n, representativeFnType);
++      }
++
++      // Assign the calculated result type.
++      if (hasValidInstanceType) {
++        // If resultType is still NO_TYPE, it means the union only contained non-constructors
++        // (which should have been caught earlier), so default to UNKNOWN.
++        ensureTyped(t, n, resultType.isBottomType() ?
++            typeRegistry.getNativeType(JSTypeNative.UNKNOWN_TYPE) : resultType);
++      } else {
++        // Fallback: Should not be reached if maybeConstructor was true, but ensures node gets typed.
+         ensureTyped(t, n);
+       }
+     }
++  }
+\ No newline at end of file

@@ -1,0 +1,161 @@
+diff --git a/tmp/4ce32812-0492-486b-9ea4-c8c699944da4_buggy.java b/tmp/a631f288-a54e-4926-982c-cd59b2331f51_fixed.java
+index 9976e43..8e1cb6b 100644
+--- a/tmp/4ce32812-0492-486b-9ea4-c8c699944da4_buggy.java
++++ b/tmp/a631f288-a54e-4926-982c-cd59b2331f51_fixed.java
+@@ -1,76 +1,110 @@
+   @Override
+   public boolean isSubtype(JSType other) {
+     if (!(other instanceof ArrowType)) {
+       return false;
+     }
+-
+     ArrowType that = (ArrowType) other;
+ 
+-    // This is described in Draft 2 of the ES4 spec,
+-    // Section 3.4.7: Subtyping Function Types.
+-
+-    // this.returnType <: that.returnType (covariant)
+-    if (!this.returnType.isSubtype(that.returnType)) {
++    // Covariant return types.
++    // Special casing for unknown is important. It allows <? extends Unknown> to
++    // be subtypes of <? extends Object> and vice versa.
++    if (!this.returnType.isSubtype(that.returnType) &&
++        !this.returnType.isUnknownType() && !that.returnType.isUnknownType() &&
++        // Allow Function subtypes to be subtypes of Object.
++        // TODO(nicksantos): Don't specialize the Function graph.
++        !that.returnType.isObject()) {
+       return false;
+     }
+ 
+-    // that.paramType[i] <: this.paramType[i] (contravariant)
+-    //
+-    // If this.paramType[i] is required,
+-    // then that.paramType[i] is required.
+-    //
+-    // In theory, the "required-ness" should work in the other direction as
+-    // well. In other words, if we have
+-    //
+-    // function f(number, number) {}
+-    // function g(number) {}
+-    //
+-    // Then f *should* not be a subtype of g, and g *should* not be
+-    // a subtype of f. But in practice, we do not implement it this way.
+-    // We want to support the use case where you can pass g where f is
+-    // expected, and pretend that g ignores the second argument.
+-    // That way, you can have a single "no-op" function, and you don't have
+-    // to create a new no-op function for every possible type signature.
+-    //
+-    // So, in this case, g < f, but f !< g
++    // Parameter checks:
++    // A function 'this' is a subtype of 'that' if:
++    // 1. Parameter types are contravariant: that.param[i] <: this.param[i].
++    // 2. Optionality: If that.param[i] is optional, this.param[i] must be optional/varargs.
++    // 3. Arity:
++    //    - 'this' cannot have more required parameters than 'that'.
++    //    - If 'that' takes varargs, 'this' must take varargs.
++
+     Node thisParam = parameters.getFirstChild();
+     Node thatParam = that.parameters.getFirstChild();
++    boolean thisIsVarArgs = false;
++    boolean thatIsVarArgs = false;
++
+     while (thisParam != null && thatParam != null) {
+       JSType thisParamType = thisParam.getJSType();
+       JSType thatParamType = thatParam.getJSType();
+-      if (thisParamType != null) {
+-        if (thatParamType == null ||
++
++      // 1. Check parameter type contravariance.
++      // Account for unknown types, which are subtypes/supertypes of everything.
++      if (thisParamType != null && thatParamType != null &&
++          !thisParamType.isUnknownType() && !thatParamType.isUnknownType() &&
+           !thatParamType.isSubtype(thisParamType)) {
+         return false;
+       }
+-      }
+ 
+-      boolean thisIsVarArgs = thisParam.isVarArgs();
+-      boolean thatIsVarArgs = thatParam.isVarArgs();
++      // Track varargs status, needed for optionality check and post-loop logic.
++      thisIsVarArgs = thisParam.isVarArgs();
++      thatIsVarArgs = thatParam.isVarArgs();
++
++      // 2. Check optionality constraint.
++      // A required parameter in 'this' cannot fulfill an optional parameter in 'that'.
++      // isVarArgs needs to be checked because varargs parameters are implicitly optional.
++      if (thatParam.isOptionalArg() && !thisParam.isOptionalArg() && !thisIsVarArgs) {
++        return false;
++      }
+ 
+-      // "that" can't be a supertype, because it's missing a required argument.
+-        // NOTE(nicksantos): In our type system, we use {function(...?)} and
+-        // {function(...NoType)} to to indicate that arity should not be
+-        // checked. Strictly speaking, this is not a correct formulation,
+-        // because now a sub-function can required arguments that are var_args
+-        // in the super-function. So we special-case this.
++      // Advance pointers, stopping at varargs.
++      if (thisIsVarArgs || thatIsVarArgs) {
++        // If either hits varargs, stop the pairwise comparison here.
++        // Post-loop logic will handle varargs and remaining parameters.
++        break;
++      }
+ 
+-      // don't advance if we have variable arguments
+-      if (!thisIsVarArgs) {
+       thisParam = thisParam.getNext();
+-      }
+-      if (!thatIsVarArgs) {
+       thatParam = thatParam.getNext();
+     }
+ 
+-      // both var_args indicates the end
+-      if (thisIsVarArgs && thatIsVarArgs) {
+-        thisParam = null;
+-        thatParam = null;
++    // Post-loop checks for arity and varargs.
++
++    // 3a. Check remaining 'this' parameters: must not be required.
++    // If thisIsVarArgs is true, it means the loop terminated on this's varargs node
++    // or a subsequent check found it. Any following nodes are covered by varargs.
++    if (!thisIsVarArgs && thisParam != null) {
++      Node currentThis = thisParam;
++      while (currentThis != null) {
++        // Varargs check inside loop needed if loop didn't break on varargs exactly.
++        if (currentThis.isVarArgs()) {
++          thisIsVarArgs = true;
++          break;
++        }
++        // Check requiredness. A parameter is required if it's not optional and not varargs.
++        if (!currentThis.isOptionalArg()) {
++          // 'this' has a required parameter that 'that' doesn't -> not a subtype.
++          return false;
++        }
++        currentThis = currentThis.getNext();
++      }
++    }
++
++    // 3b. Check remaining 'that' parameters to determine if 'that' ends in varargs.
++    // We don't check if remaining 'that' params are required, per lenient rules in comments.
++    if (!thatIsVarArgs && thatParam != null) {
++       Node currentThat = thatParam;
++       while (currentThat != null) {
++         if (currentThat.isVarArgs()) {
++           thatIsVarArgs = true;
++           break;
++         }
++         currentThat = currentThat.getNext();
+        }
+     }
+ 
+-    // "that" can't be a supertype, because it's missing a required arguement.
++    // 3c. Final varargs check: If 'that' is varargs, 'this' must be varargs.
++    // This catches cases where 'this' ran out of parameters before 'that' hit varargs,
++    // or where both hit varargs simultaneously (covered by thisIsVarArgs update).
++    if (thatIsVarArgs && !thisIsVarArgs) {
++      return false;
++    }
+ 
++    // All subtype checks passed.
+     return true;
+   }
+\ No newline at end of file

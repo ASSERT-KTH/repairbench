@@ -1,0 +1,115 @@
+diff --git a/tmp/062c34ca-b70c-4834-bef1-cd7074eef8c1_buggy.java b/tmp/4de35453-a80e-4ee2-88c4-877d5b4521c0_fixed.java
+index d87dd79..803cd26 100644
+--- a/tmp/062c34ca-b70c-4834-bef1-cd7074eef8c1_buggy.java
++++ b/tmp/4de35453-a80e-4ee2-88c4-877d5b4521c0_fixed.java
+@@ -1,47 +1,89 @@
+     @Override
+     protected Object decode(
+             ChannelHandlerContext ctx, Channel channel, ByteBuf buf) throws Exception {
+ 
+-        int endIndex = -1;
+-        for (int i = buf.writerIndex() - 1; i >= buf.readerIndex(); i--) {
+-            if (buf.getByte(i) == ']') {
+-                endIndex = i + 1;
+-                break;
++        // Find '[' marking the start of a frame
++        // Use ByteBuf.indexOf(int fromIndex, int toIndex, byte value)
++        int startIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '[');
++        if (startIndex == -1) {
++            // No start bracket found in the readable bytes
++            return null;
+         }
++
++        // Discard any data before the start bracket, if any.
++        // This handles cases where noise might precede a valid frame.
++        // Note: This assumes frames are independent and data before '[' can be ignored.
++        buf.readerIndex(startIndex);
++
++        // Find ']' marking the end of the frame, searching strictly after '['
++        // Use ByteBuf.indexOf(int fromIndex, int toIndex, byte value)
++        int endIndexBracket = buf.indexOf(buf.readerIndex() + 1, buf.writerIndex(), (byte) ']');
++        if (endIndexBracket == -1) {
++            // Found '[' but no corresponding ']', frame is incomplete
++            // Need more data, so return null. ByteToMessageDecoder framework will recall decode when more data arrives.
++            return null;
+         }
+ 
+-        if (endIndex > 0) {
+-            ByteBuf frame = Unpooled.buffer();
+-            while (buf.readerIndex() < endIndex) {
+-                byte b1 = buf.readByte();
+-                if (b1 == '}') {
+-                    byte b2 = buf.readByte();
++        // Calculate the full frame length including delimiters '[' and ']'
++        int frameLength = endIndexBracket - buf.readerIndex() + 1;
++
++        // Extract the complete frame bytes (including '[' and ']') into a new slice.
++        // readSlice advances the reader index of the original buffer 'buf' past this frame.
++        ByteBuf frameData = buf.readSlice(frameLength);
++
++        // Process the extracted frame slice for escape sequences.
++        // Allocate a new buffer for the decoded frame. Initial capacity can be frameLength,
++        // as escapes might slightly change the size but it's a good estimate.
++        ByteBuf decodedFrame = Unpooled.buffer(frameLength);
++        try {
++            while (frameData.isReadable()) {
++                byte b1 = frameData.readByte();
++                // Check for the escape character '}' followed by another byte within the slice
++                if (b1 == '}' && frameData.isReadable()) {
++                    byte b2 = frameData.readByte(); // Read the byte defining the escaped character
+                     switch (b2) {
+                         case 0x01:
+-                            frame.writeByte('}');
++                            decodedFrame.writeByte('}'); // 7d 01 -> 7d
+                             break;
+                         case 0x02:
+-                            frame.writeByte('[');
++                            decodedFrame.writeByte('['); // 7d 02 -> 5b
+                             break;
+                         case 0x03:
+-                            frame.writeByte(']');
++                            decodedFrame.writeByte(']'); // 7d 03 -> 5d
+                             break;
+                         case 0x04:
+-                            frame.writeByte(',');
++                            decodedFrame.writeByte(','); // 7d 04 -> 2c
+                             break;
+                         case 0x05:
+-                            frame.writeByte('*');
++                            decodedFrame.writeByte('*'); // 7d 05 -> 2a
+                             break;
+                         default:
++                            // Encountered an invalid byte following the escape character '}'
++                            // Release the buffer we allocated before throwing.
++                            decodedFrame.release();
++                            // frameData is a slice, managed by buf usually, no explicit release needed normally.
+                             throw new IllegalArgumentException(String.format(
+-                                    "unexpected byte at %d: 0x%02x", buf.readerIndex() - 1, b2));
++                                    "unexpected byte following escape character '}' at index %d: 0x%02x",
++                                    buf.readerIndex() - frameLength + frameData.readerIndex() - 1, // Calculate approx original index
++                                    b2));
+                     }
+                 } else {
+-                    frame.writeByte(b1);
++                    // This is a regular byte, or it's a '}' at the very end of the frame data
++                    // (just before the implicit final ']' which is included in frameData).
++                    // Or '}' appeared but there was no following byte (incomplete escape at end).
++                    // In these cases, write the byte as is, consistent with original logic's handling of non-escaped bytes.
++                    decodedFrame.writeByte(b1);
+                 }
+             }
+-            return frame;
++        } catch (Exception e) {
++            // Ensure allocated buffer is released if any exception occurs during processing
++            if (decodedFrame.refCnt() > 0) {
++                decodedFrame.release();
++            }
++            throw e; // Re-throw the exception
+         }
+ 
+-        return null;
++        // Return the buffer containing the processed frame (with escapes resolved).
++        // The caller (Netty pipeline/ByteToMessageDecoder framework) is responsible for releasing this buffer later.
++        return decodedFrame;
+     }
+\ No newline at end of file

@@ -1,0 +1,158 @@
+diff --git a/tmp/dc8478e5-b6bf-4e99-a486-c817c3bd4050_buggy.java b/tmp/e3fbff73-8f09-4e55-a616-25fd773a8c12_fixed.java
+index acdbb1a..fcf9a59 100644
+--- a/tmp/dc8478e5-b6bf-4e99-a486-c817c3bd4050_buggy.java
++++ b/tmp/e3fbff73-8f09-4e55-a616-25fd773a8c12_fixed.java
+@@ -1,106 +1,143 @@
+     public ZipArchiveEntry getNextZipEntry() throws IOException {
+         boolean firstEntry = true;
+         if (closed || hitCentralDirectory) {
+             return null;
+         }
+         if (current != null) {
+             closeEntry();
+             firstEntry = false;
+         }
+ 
+         try {
+             if (firstEntry) {
+                 // split archives have a special signature before the
+                 // first local file header - look for it and fail with
+                 // the appropriate error message if this is a split
+                 // archive.
+                 readFirstLocalFileHeader(LFH_BUF);
+             } else {
+                 readFully(LFH_BUF);
+             }
+         } catch (final EOFException e) {
+-            return null;
++            return null; // Cleanly reached end of stream
+         }
+ 
+         final ZipLong sig = new ZipLong(LFH_BUF);
++
++        // Check if we've reached the Central Directory or Archive Extra Data Record
+         if (sig.equals(ZipLong.CFH_SIG) || sig.equals(ZipLong.AED_SIG)) {
+             hitCentralDirectory = true;
+-            skipRemainderOfArchive();
++            skipRemainderOfArchive(); // Attempt to skip to the end of the archive
++            return null; // No more local file header entries
+         }
++
++        // If it's not a Local File Header, it's an error at this point
+         if (!sig.equals(ZipLong.LFH_SIG)) {
+-            return null;
++            // Corrupted archive or unexpected data where LFH was expected
++            throw new ZipException(String.format("Unexpected record signature: 0x%x", sig.getValue()));
+         }
+ 
++        // It is a Local File Header. Proceed with parsing.
+         int off = WORD;
+         current = new CurrentEntry();
+ 
+         final int versionMadeBy = ZipShort.getValue(LFH_BUF, off);
+         off += SHORT;
+         current.entry.setPlatform((versionMadeBy >> ZipFile.BYTE_SHIFT) & ZipFile.NIBLET_MASK);
+ 
+         final GeneralPurposeBit gpFlag = GeneralPurposeBit.parse(LFH_BUF, off);
+         final boolean hasUTF8Flag = gpFlag.usesUTF8ForNames();
+         final ZipEncoding entryEncoding = hasUTF8Flag ? ZipEncodingHelper.UTF8_ZIP_ENCODING : zipEncoding;
+         current.hasDataDescriptor = gpFlag.usesDataDescriptor();
+         current.entry.setGeneralPurposeBit(gpFlag);
+ 
+         off += SHORT;
+ 
+         current.entry.setMethod(ZipShort.getValue(LFH_BUF, off));
+         off += SHORT;
+ 
+         final long time = ZipUtil.dosToJavaTime(ZipLong.getValue(LFH_BUF, off));
+         current.entry.setTime(time);
+         off += WORD;
+ 
+         ZipLong size = null, cSize = null;
+         if (!current.hasDataDescriptor) {
+             current.entry.setCrc(ZipLong.getValue(LFH_BUF, off));
+             off += WORD;
+ 
+             cSize = new ZipLong(LFH_BUF, off);
+             off += WORD;
+ 
+             size = new ZipLong(LFH_BUF, off);
+             off += WORD;
+         } else {
++            // CRC, Compressed Size, and Uncompressed Size are deferred to Data Descriptor
+             off += 3 * WORD;
+         }
+ 
+         final int fileNameLen = ZipShort.getValue(LFH_BUF, off);
+-
+         off += SHORT;
+ 
+         final int extraLen = ZipShort.getValue(LFH_BUF, off);
+         off += SHORT;
+ 
++
++        if (fileNameLen < 0) {
++            throw new IOException("Invalid entry name length");
++        }
+         final byte[] fileName = new byte[fileNameLen];
+         readFully(fileName);
+-        current.entry.setName(entryEncoding.decode(fileName), fileName);
++        // Delay resolving name until technical encoding is known.
++        // current.entry.setName(entryEncoding.decode(fileName), fileName);
+ 
++        if (extraLen < 0) {
++            throw new IOException("Invalid extra field length");
++        }
+         final byte[] extraData = new byte[extraLen];
+         readFully(extraData);
++        try {
+             current.entry.setExtra(extraData);
++        } catch (RuntimeException ex) {
++            final ZipException ze = new ZipException("Invalid extra data in entry " + entryEncoding.decode(fileName));
++            ze.initCause(ex);
++            throw ze;
++        }
++
++        // Must be called after setExtra, requires UnparseableExtraFieldBehavior to be set.
++        current.entry.setName(entryEncoding.decode(fileName), fileName);
+ 
+         if (!hasUTF8Flag && useUnicodeExtraFields) {
+             ZipUtil.setNameAndCommentFromExtraFields(current.entry, fileName, null);
+         }
+ 
+         processZip64Extra(size, cSize);
+ 
++        // Current entry might be read from memory, create our own stream.
++        InputStream bis = new BoundedInputStream(in, current.entry.getCompressedSize());
++
+         if (current.entry.getCompressedSize() != ArchiveEntry.SIZE_UNKNOWN) {
+             if (current.entry.getMethod() == ZipMethod.UNSHRINKING.getCode()) {
+-                current.in = new UnshrinkingInputStream(new BoundedInputStream(in, current.entry.getCompressedSize()));
++                current.in = new UnshrinkingInputStream(bis);
+             } else if (current.entry.getMethod() == ZipMethod.IMPLODING.getCode()) {
+                 current.in = new ExplodingInputStream(
+                         current.entry.getGeneralPurposeBit().getSlidingDictionarySize(),
+                         current.entry.getGeneralPurposeBit().getNumberOfShannonFanoTrees(),
+-                        new BoundedInputStream(in, current.entry.getCompressedSize()));
++                        bis);
+             } else if (current.entry.getMethod() == ZipMethod.BZIP2.getCode()) {
+-                current.in = new BZip2CompressorInputStream(new BoundedInputStream(in, current.entry.getCompressedSize()));
+-            }
++                current.in = new BZip2CompressorInputStream(bis);
++            } else if (current.entry.getMethod() == ZipMethod.DEFLATED.getCode()){
++                 // Inflater needs needs a stream that supports mark/reset
++                 // So we wrap the original stream with a PushbackInputStream.
++                 // Pushback size of 1 is probably enough but the Deflate64 implementation
++                 // used 2 so we keep it at 2 for now.
++                 final PushbackInputStream pis = new PushbackInputStream(bis, 2);
++
++                 // Need to create an inflater that reads the compressed data.
++                 current.in = new InflaterInputStream(pis, inflater, buf.length);
++
++            } // TODO add STORED support?
+         }
+ 
+         entriesRead++;
+         return current.entry;
+     }
+\ No newline at end of file

@@ -1,0 +1,165 @@
+diff --git a/tmp/03b5effb-253e-4742-a428-7279b82fe0c5_buggy.java b/tmp/20564d53-7597-4f2b-877d-51b89c37b956_fixed.java
+index 7b89a27..603b4c1 100644
+--- a/tmp/03b5effb-253e-4742-a428-7279b82fe0c5_buggy.java
++++ b/tmp/20564d53-7597-4f2b-877d-51b89c37b956_fixed.java
+@@ -1,76 +1,142 @@
+     /**
+      * Determines whether a qualified name is inferred.
+      * NOTE(nicksantos): Determining whether a property is declared or not
+      * is really really obnoxious.
+      *
+      * The problem is that there are two (equally valid) coding styles:
+      *
+      * (function() {
+      *   /* The authoritative definition of goog.bar. /
+      *   goog.bar = function() {};
+      * })();
+      *
+      * function f() {
+      *   goog.bar();
+      *   /* Reset goog.bar to a no-op. /
+      *   goog.bar = function() {};
+      * }
+      *
+      * In a dynamic language with first-class functions, it's very difficult
+      * to know which one the user intended without looking at lots of
+      * contextual information (the second example demonstrates a small case
+      * of this, but there are some really pathological cases as well).
+      *
+      * The current algorithm checks if either the declaration has
+      * JsDoc type information, or @const with a known type,
+      * or a function literal with a name we haven't seen before.
+      */
+     private boolean isQualifiedNameInferred(
+         String qName, Node n, JSDocInfo info,
+         Node rhsValue, JSType valueType) {
+-      if (valueType == null) {
+-        return true;
+-      }
+ 
+-      // Prototypes of constructors and interfaces are always declared.
++      // Handle assignments to 'prototype' properties specifically.
+       if (qName != null && qName.endsWith(".prototype")) {
+-          return false;
++          // Determine the node representing the base object (e.g., 'a' in 'a.prototype = ...')
++          Node baseObjectNode = null;
++          Node propertyDefiningNode = n; // Assume n represents the property access/definition initially
++
++          // Adjust propertyDefiningNode if 'n' is the assignment/var node itself
++          if (n.isAssign()) {
++              propertyDefiningNode = n.getFirstChild();
++          } else if (n.isName() && n.getParent().isVar()) {
++              // 'n' is the NAME node in a VAR declaration. This isn't typically a GETPROP.
++              // If VAR is like 'var ns.prop = value;', propertyDefiningNode should be 'ns.prop'.
++              // However, 'var ns.prop' isn't valid JS. Assume direct assignments for prototype.
++          }
++
++          // Check if the propertyDefiningNode is indeed a GETPROP for 'prototype'
++          if (propertyDefiningNode.isGetProp() &&
++              propertyDefiningNode.getString().equals("prototype")) {
++              baseObjectNode = propertyDefiningNode.getFirstChild();
++          }
++
++          if (baseObjectNode != null) {
++              JSType objectType = baseObjectNode.getJSType();
++              if (objectType != null) {
++                  objectType = objectType.restrictByNotNullOrUndefined();
++                  // Only treat prototype assignment as DECLARATION if base is Constructor/Interface
++                  if (objectType.isConstructor() || objectType.isInterface()) {
++                      return false; // Declared
++                  }
++              }
++          }
++          // Otherwise (base is not Ctor/Iface, or type unknown, or not a direct assignment to GETPROP),
++          // treat as INFERRED. This covers the test case a.prototype where a is Object.
++          return true; // Inferred
++      }
++
++
++      // --- Original logic for non-prototype properties ---
++
++      if (valueType == null) {
++        return true; // Inferred if no type info
+       }
+ 
+       boolean inferred = true;
+       if (info != null) {
++        // Check JSDoc for explicit type, enum, const with known type, or function declaration
+         inferred = !(info.hasType()
+             || info.hasEnumParameterType()
+             || (isConstantSymbol(info, n) && valueType != null
+                 && !valueType.isUnknownType())
+             || FunctionTypeBuilder.isFunctionTypeDeclaration(info));
+       }
+ 
++      // Special handling for function assignments without sufficient JSDoc info
+       if (inferred && rhsValue != null && rhsValue.isFunction()) {
++          // Function assignments without explicit type info might still be declarations
++          // if they haven't been declared before and aren't in conditional blocks etc.
++
+           if (info != null) {
+-          return false;
+-        } else if (!scope.isDeclared(qName, false) &&
+-            n.isUnscopedQualifiedName()) {
++             // This case should have been handled by the JSDoc check above, making inferred=false.
++             // Defensively return false if we somehow get here.
++             return false; // Function with JSDoc implies declaration.
++          } else if (qName != null && !scope.isDeclared(qName, false)) {
++              // Determine the LValue node and the containing statement node more reliably
++              Node lValueNode = n;
++              Node ownerNode = n.getParent();
+ 
+-          // Check if this is in a conditional block.
+-          // Functions assigned in conditional blocks are inferred.
+-          for (Node current = n.getParent();
+-               !(current.isScript() || current.isFunction());
++              if (n.isAssign()) {
++                  lValueNode = n.getFirstChild();
++                  ownerNode = n;
++              } else if (n.isName() && n.getParent().isVar()) {
++                  lValueNode = n;
++                  ownerNode = n.getParent();
++              } else if (n.isGetProp() && n.getParent().isAssign() && n.getParent().getFirstChild() == n) {
++                  lValueNode = n;
++                  ownerNode = n.getParent();
++              } else {
++                  // If n is NAME on RHS or other complex cases, try to find owning statement
++                 ownerNode = n;
++                 while(ownerNode.getParent() != null && !NodeUtil.isStatementBlock(ownerNode.getParent()) && !ownerNode.getParent().isScript()){
++                     ownerNode = ownerNode.getParent();
++                 }
++              }
++
++              // Check qualified name status on the LValue
++              if (lValueNode.isQualifiedName() && lValueNode.isUnscopedQualifiedName()) {
++
++                    // Check if this is in a conditional block by looking up from the owner node's parent.
++                    for (Node current = ownerNode.getParent();
++                         current != null && !(current.isScript() || current.isFunction());
+                          current = current.getParent()) {
+                         if (NodeUtil.isControlStructure(current)) {
+-              return true;
++                            return true; // Inferred in control structure
+                         }
+                     }
+ 
+-          // Check if this is assigned in an inner scope.
+-          // Functions assigned in inner scopes are inferred.
++                    // Check if this is assigned in an inner scope & not escaped.
+                     AstFunctionContents contents =
+                         getFunctionAnalysisResults(scope.getRootNode());
+                     if (contents == null ||
+                         !contents.getEscapedQualifiedNames().contains(qName)) {
+-            return false;
++                       // Not declared, not in control structure, not escaped? Treat as declaration.
++                      return false; // Declared
+                     }
++                    // Otherwise, it remains inferred (escaped or contents unavailable)
+               }
+           }
+-      return inferred;
++      } // end if(inferred && rhsValue is function)
++
++      return inferred; // Return the final inferred status
+     }
+\ No newline at end of file

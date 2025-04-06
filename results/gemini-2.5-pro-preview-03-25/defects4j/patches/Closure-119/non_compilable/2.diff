@@ -1,0 +1,201 @@
+diff --git a/tmp/cf482b97-faaa-4f9d-b5c7-415aae1cdd97_buggy.java b/tmp/4102d81a-be49-4968-b18d-4652ea7de609_fixed.java
+index 6dd359b..49ae098 100644
+--- a/tmp/cf482b97-faaa-4f9d-b5c7-415aae1cdd97_buggy.java
++++ b/tmp/4102d81a-be49-4968-b18d-4652ea7de609_fixed.java
+@@ -1,125 +1,181 @@
++    @Override
+     public void collect(JSModule module, Scope scope, Node n) {
+       Node parent = n.getParent();
+ 
+       String name;
+       boolean isSet = false;
+       Name.Type type = Name.Type.OTHER;
+       boolean isPropAssign = false;
+ 
+       switch (n.getType()) {
+         case Token.GETTER_DEF:
+         case Token.SETTER_DEF:
+         case Token.STRING_KEY:
+           // This may be a key in an object literal declaration.
+           name = null;
+           if (parent != null && parent.isObjectLit()) {
+             name = getNameForObjLitKey(n);
+           }
+           if (name == null) {
+             return;
+           }
+           isSet = true;
+           switch (n.getType()) {
+             case Token.STRING_KEY:
+               type = getValueType(n.getFirstChild());
+               break;
+             case Token.GETTER_DEF:
+               type = Name.Type.GET;
+               break;
+             case Token.SETTER_DEF:
+               type = Name.Type.SET;
+               break;
+             default:
+               throw new IllegalStateException("unexpected:" + n);
+           }
+           break;
+         case Token.NAME:
+           // This may be a variable get or set.
++          name = n.getString(); // Get name first
++          if (name.isEmpty()) {
++              return; // Should not happen for valid NAME, but be safe.
++          }
++          // Determine if it's a set based on parent context
+           if (parent != null) {
+             switch (parent.getType()) {
+               case Token.VAR:
+                 isSet = true;
+                 Node rvalue = n.getFirstChild();
+                 type = rvalue == null ? Name.Type.OTHER : getValueType(rvalue);
+                 break;
+               case Token.ASSIGN:
+                 if (parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = getValueType(n.getNext());
+                 }
++                // If n is RHS (e.g. x = n), it's a get, isSet remains false.
+                 break;
+               case Token.GETPROP:
+-                return;
++                 // If n is the obj part of a GETPROP, it's a 'get'. isSet remains false.
++                 // If n is the prop part (a string), it's not a variable ref.
++                if (parent.getFirstChild() != n) {
++                    return; // e.g. obj['nameStringNode']
++                }
++                 // If n is the object part e.g. 'obj' in obj.prop, it's a get.
++                break; // isSet remains false
+               case Token.FUNCTION:
+                 Node gramps = parent.getParent();
+-                if (gramps == null || NodeUtil.isFunctionExpression(parent)) {
+-                  return;
+-                }
++                // Function declaration name is a set.
++                if (parent.getFirstChild() == n &&
++                    gramps != null &&
++                    !NodeUtil.isFunctionExpression(parent)) {
+                   isSet = true;
+                   type = Name.Type.FUNCTION;
++                } else if (NodeUtil.isFunctionExpression(parent)) {
++                  // Function expression names are local and shouldn't be checked globally.
++                  return;
++                }
++                // Parameter names are handled by scope analysis. Let isGlobalNameReference check.
++                // Other cases (e.g., name used inside function) are gets.
+                 break;
+               case Token.INC:
+               case Token.DEC:
+                 isSet = true;
+                 type = Name.Type.OTHER;
+                 break;
+               default:
+                 if (NodeUtil.isAssignmentOp(parent) &&
+                     parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = Name.Type.OTHER;
+                 }
++                // Otherwise, assume it's a get. isSet remains false.
+             }
+           }
+-          name = n.getString();
+-          break;
++          break; // End of NAME case
++
+         case Token.GETPROP:
+           // This may be a namespaced name get or set.
++
++          // If this GETPROP is part of a longer qualified name, ignore it.
++          // e.g. in a.b.c, we process 'a.b.c', not 'a.b'.
++          if (parent != null && parent.isGetProp()) {
++             return;
++          }
++
++          name = n.getQualifiedName(); // e.g., "e.name" or "a.b.c"
++          if (name == null) {
++            return;
++          }
++
++          // Check if the base name is global. This is the fix.
++          Node root = n;
++          while (root.isGetProp()) {
++            root = root.getFirstChild();
++          }
++          // If the root is a simple name and it's declared locally, then this
++          // qualified name access does not refer to a global name.
++          if (root.isName() && !isGlobalNameReference(root.getString(), scope)) {
++             return; // Base name ('e' in 'e.name') is local, so exit.
++          }
++          // Otherwise (root is not NAME, or root NAME is global), proceed.
++
++          // Determine if the GETPROP is being set. Reset defaults.
++          isSet = false;
++          type = Name.Type.OTHER;
++          isPropAssign = false;
++
+           if (parent != null) {
+             switch (parent.getType()) {
+               case Token.ASSIGN:
+                 if (parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = getValueType(n.getNext());
+                   isPropAssign = true;
+                 }
+                 break;
+               case Token.INC:
+               case Token.DEC:
+                 isSet = true;
+                 type = Name.Type.OTHER;
+                 break;
+-              case Token.GETPROP:
+-                return;
+               default:
+                 if (NodeUtil.isAssignmentOp(parent) &&
+                     parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = Name.Type.OTHER;
+                 }
+             }
+           }
+-          name = n.getQualifiedName();
++          // 'name' remains the qualified name (e.g., "a.b.c")
++          break; // End of GETPROP case
++
++        default:
++          // Ignore other node types
++          return;
++      }
++
++      // If name wasn't determined (e.g. complex objlit key), exit.
+       if (name == null) {
+           return;
+       }
+-          break;
+-        default:
+-          return;
+-      }
+ 
+-      // We are only interested in global names.
++      // We are only interested in potentially global names.
++      // The check for local base names in GETPROP case handles qualified names correctly now.
+       if (!isGlobalNameReference(name, scope)) {
+         return;
+       }
+ 
++      // If we reach here, 'name' is considered a global reference.
++      // Report sets/gets based on 'isSet'.
+       if (isSet) {
+         if (isGlobalScope(scope)) {
+           handleSetFromGlobal(module, scope, n, parent, name, isPropAssign, type);
+         } else {
+           handleSetFromLocal(module, scope, n, parent, name);
+         }
+       } else {
++        // It's a get of a global name.
+         handleGet(module, scope, n, parent, name);
+       }
+     }
+\ No newline at end of file

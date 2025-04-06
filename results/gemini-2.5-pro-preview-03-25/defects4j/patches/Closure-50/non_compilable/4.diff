@@ -1,0 +1,243 @@
+diff --git a/tmp/16bdc3d6-4c30-4b8a-9348-29f1a3f75a77_buggy.java b/tmp/145dd7ff-5354-4559-b610-80c0ecdcd315_fixed.java
+index d8b0158..577d141 100644
+--- a/tmp/16bdc3d6-4c30-4b8a-9348-29f1a3f75a77_buggy.java
++++ b/tmp/145dd7ff-5354-4559-b610-80c0ecdcd315_fixed.java
+@@ -1,113 +1,187 @@
++import com.google.common.base.Preconditions;
++import com.google.common.collect.Lists;
++import com.google.javascript.jscomp.NodeUtil;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.Token;
++import java.util.List;
++
+ /**
+  * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+  */
+ private Node tryFoldArrayJoin(Node n) {
++  // Ensure the node is a CALL node
++  if (!n.isCall()) {
++    return n;
++  }
++
+   Node callTarget = n.getFirstChild();
+-
+   if (callTarget == null || !NodeUtil.isGetProp(callTarget)) {
+     return n;
+   }
+ 
+-    Node right = callTarget.getNext();
+-    if (right != null) {
+-      if (!NodeUtil.isImmutableValue(right)) {
++  // Check function arguments: [].join() or [].join(separator)
++  Node separatorNode = callTarget.getNext(); // This is the first argument
++  Node secondArg = (separatorNode == null) ? null : separatorNode.getNext();
++
++  // If there is a second argument, or any subsequent arguments, bail.
++  if (secondArg != null) {
+     return n;
+   }
++
++  // If a separator is provided, it must be an immutable value.
++  if (separatorNode != null && !NodeUtil.isImmutableValue(separatorNode)) {
++    return n;
+   }
+ 
+   Node arrayNode = callTarget.getFirstChild();
+   Node functionName = arrayNode.getNext();
+ 
+-    if ((arrayNode.getType() != Token.ARRAYLIT) ||
++  // Check if it's a join on an array literal.
++  if (arrayNode == null || !arrayNode.isArrayLit() ||
++      functionName == null || !functionName.isString() ||
+       !functionName.getString().equals("join")) {
+     return n;
+   }
+ 
+-      // "," is the default, it doesn't need to be explicit
++  // Determine the join separator string.
++  String joinString = (separatorNode == null) ? "," : NodeUtil.getStringValue(separatorNode);
+ 
+-    String joinString = (right == null) ? "," : NodeUtil.getStringValue(right);
+   List<Node> arrayFoldedChildren = Lists.newLinkedList();
+-    StringBuilder sb = null;
+-    int foldedSize = 0;
+-    Node prev = null;
++  StringBuilder sb = null; // Used to merge consecutive foldable elements
++  Node prev = null; // Keep track of the last node processed for copying info
+   Node elem = arrayNode.getFirstChild();
+-    // Merges adjacent String nodes.
++
++  // Iterate through array elements, merging adjacent immutable values.
+   while (elem != null) {
+-      if (NodeUtil.isImmutableValue(elem) || elem.getType() == Token.EMPTY) {
++    // Use isEmpty() for empty array slots like [,,]
++    if (NodeUtil.isImmutableValue(elem) || elem.isEmpty()) {
+       if (sb == null) {
+         sb = new StringBuilder();
+       } else {
++        // Append separator *before* the next element's string value
+         sb.append(joinString);
+       }
++      // NodeUtil.getArrayElementStringValue handles null/undefined/empty -> ""
+       sb.append(NodeUtil.getArrayElementStringValue(elem));
+     } else {
++      // Hit a non-foldable element (e.g., variable, function call)
+       if (sb != null) {
++        // Add the folded string accumulated so far
+         Preconditions.checkNotNull(prev);
+-          // + 2 for the quotes.
+-          foldedSize += sb.length() + 2;
+         arrayFoldedChildren.add(
+             Node.newString(sb.toString()).copyInformationFrom(prev));
+-          sb = null;
++        sb = null; // Reset StringBuilder
+       }
+-        foldedSize += InlineCostEstimator.getCost(elem);
++      // Add the non-foldable element itself
+       arrayFoldedChildren.add(elem);
+     }
+-      prev = elem;
++    prev = elem; // Update prev to the current element before moving next
+     elem = elem.getNext();
+   }
+ 
++  // Add any remaining folded string at the end
+   if (sb != null) {
+     Preconditions.checkNotNull(prev);
+-      // + 2 for the quotes.
+-      foldedSize += sb.length() + 2;
+     arrayFoldedChildren.add(
+         Node.newString(sb.toString()).copyInformationFrom(prev));
+   }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
+ 
+   int originalSize = InlineCostEstimator.getCost(n);
++  Node parent = n.getParent(); // Keep track of parent for replacement
++
+   switch (arrayFoldedChildren.size()) {
+-      case 0:
++    case 0: // All elements folded into an empty string or array was empty
+       Node emptyStringNode = Node.newString("");
+-        n.getParent().replaceChild(n, emptyStringNode);
++      // Cost comparison: "" vs original call
++      if (InlineCostEstimator.getCost(emptyStringNode) > originalSize) {
++          return n;
++      }
++      parent.replaceChild(n, emptyStringNode);
+       reportCodeChange();
+       return emptyStringNode;
+-      case 1:
+-        Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
+-          return n;
+-        }
+-        arrayNode.detachChildren();
+-        if (foldedStringNode.getType() != Token.STRING) {
+-          // If the Node is not a string literal, ensure that
+-          // it is coerced to a string.
+-          Node replacement = new Node(Token.ADD,
++
++    case 1: // All elements folded into a single element
++      Node foldedNode = arrayFoldedChildren.remove(0);
++      Node replacementNode;
++      int foldedSize;
++
++      // Determine the replacement node based on the type of the single element
++      if (foldedNode.isString()) {
++        // Already a string literal
++        replacementNode = foldedNode;
++      } else if (NodeUtil.isImmutableValue(foldedNode) || foldedNode.isEmpty()) {
++        // Convert immutable non-string (number, boolean, null, undefined, empty) to string
++        String stringValue = NodeUtil.getArrayElementStringValue(foldedNode);
++        replacementNode = Node.newString(stringValue).copyInformationFrom(foldedNode);
++      } else {
++        // Non-immutable (e.g., variable `foo`). Result is `"" + foo` for string coercion.
++        replacementNode = new Node(Token.ADD,
+             Node.newString("").copyInformationFrom(n),
+-              foldedStringNode);
+-          foldedStringNode = replacement;
++            foldedNode);
+       }
+-        n.getParent().replaceChild(n, foldedStringNode);
+-        reportCodeChange();
+-        return foldedStringNode;
+-      default:
+-        // No folding could actually be performed.
+-        if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+-          return n;
+-        }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += (right != null) ? InlineCostEstimator.getCost(right) : 0;
++
++      foldedSize = InlineCostEstimator.getCost(replacementNode);
++
++      // Compare estimated folded size with original size
+       if (foldedSize > originalSize) {
+-          return n;
++        return n; // Not smaller, don't replace
+       }
++
++      // Perform replacement
++      parent.replaceChild(n, replacementNode);
++      reportCodeChange();
++      return replacementNode;
++
++    default: // Partial folding or no folding of elements possible
++      // Check if any change was actually made (i.e., number of elements decreased)
++      if (arrayFoldedChildren.size() >= arrayNode.getChildCount()) {
++        return n; // No reduction in elements, no benefit
++      }
++
++      // Estimate the cost of the new partially folded call:
++      // new_array_literal.join(separator) OR new_array_literal.join()
++      int kJoinPropOverhead = ".join".length();
++      int kCallOverhead = "()".length();
++
++      // Build a temporary new array node to estimate its cost
++      Node newArrayLit = new Node(Token.ARRAYLIT);
++      for (Node node : arrayFoldedChildren) {
++          newArrayLit.addChildToBack(node.cloneTree()); // Use clones for estimation
++      }
++      int newArraySize = InlineCostEstimator.getCost(newArrayLit);
++
++      int newCallSize = newArraySize + kJoinPropOverhead;
++
++      boolean useDefaultSeparator = ",".equals(joinString);
++      boolean hasSeparatorArg = (separatorNode != null);
++
++      // Add cost of separator argument if it's present and not the default ","
++      if (hasSeparatorArg && !useDefaultSeparator) {
++          newCallSize += InlineCostEstimator.getCost(separatorNode);
++          newCallSize += kCallOverhead; // .join(sep)
++      } else {
++          // Using default separator: .join()
++          newCallSize += kCallOverhead;
++      }
++
++
++      if (newCallSize > originalSize) {
++        return n; // Not smaller
++      }
++
++      // Rebuild the original array node with folded children
+       arrayNode.detachChildren();
+       for (Node node : arrayFoldedChildren) {
+         arrayNode.addChildToBack(node);
+       }
++
++      // Modify the call node: remove separator argument if it was ',' and is now default
++      if (hasSeparatorArg && useDefaultSeparator) {
++          n.removeChild(separatorNode);
++      }
++
+       reportCodeChange();
+-        break;
+-    }
+-
++      // Return the modified node n (modified in place)
+       return n;
+   }
++}
+\ No newline at end of file

@@ -1,0 +1,131 @@
+diff --git a/tmp/04037d2b-a8b7-408e-a943-f57af2603eda_buggy.java b/tmp/48332e28-4931-44d2-9edb-7420c83a2358_fixed.java
+index 0a8838d..7a43e98 100644
+--- a/tmp/04037d2b-a8b7-408e-a943-f57af2603eda_buggy.java
++++ b/tmp/48332e28-4931-44d2-9edb-7420c83a2358_fixed.java
+@@ -1,61 +1,110 @@
+     private List<Position> parseData(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int locationPacketId, String... imei) {
+         List<Position> positions = new LinkedList<>();
+ 
+-        if (!connectionless) {
+-            buf.readUnsignedInt(); // data length
+-        }
++        // This read is incorrect as the frame decoder already strips the length prefix.
++        // The payload itself doesn't start with its own length for standard codecs.
++        // if (!connectionless) {
++        //     buf.readUnsignedInt(); // data length
++        // }
+ 
+         int codec = buf.readUnsignedByte();
+         int count = buf.readUnsignedByte();
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+         if (deviceSession == null) {
++            // If session is null, cannot proceed with parsing records associated with a device.
++            // Log this situation or handle appropriately if possible without a session.
++            // Returning null might be acceptable if the caller handles it.
+              return null;
+         }
+-        String model = getCacheManager().getObject(Device.class, deviceSession.getDeviceId()).getModel();
++        String model = null;
++        // Only get model if needed (i.e., for codecs other than 12 and 13)
++        if (codec != CODEC_12 && codec != CODEC_13) {
++            Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
++            if (device != null) {
++                model = device.getModel();
++            }
++        }
++
+ 
+         for (int i = 0; i < count; i++) {
+             Position position = new Position(getProtocolName());
+ 
+             position.setDeviceId(deviceSession.getDeviceId());
+-            position.setValid(true);
++            // Validity might depend on data parsed below, set default and override if necessary
++            // position.setValid(true); // Set later based on actual data parsed
+ 
+             if (codec == CODEC_13) {
+                 buf.readUnsignedByte(); // type
+-                int length = buf.readInt() - 4;
+-                getLastLocation(position, new Date(buf.readUnsignedInt() * 1000));
++                int length = buf.readInt() - 4; // Length includes timestamp (4 bytes)
++                // Ensure length is non-negative before proceeding
++                if (length < 0) {
++                    // Invalid length, skip this record or handle error
++                    // Need to advance the buffer correctly if possible, otherwise might stall processing
++                    // Assuming the rest of the packet might be corrupt, could break the loop
++                     break; 
++                }
++                getLastLocation(position, new Date(buf.readUnsignedInt() * 1000)); // Timestamp (seconds since 2007-01-01)
++                if (buf.readableBytes() >= length) {
+                     if (isPrintable(buf, length)) {
+-                    position.set(Position.KEY_RESULT,
+-                            buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim());
++                        String data = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim();
++                        position.set(Position.KEY_RESULT, data);
++                        // Parse known text formats
++                        if (data.startsWith("GTSL")) {
++                            String[] parts = data.split("\\|");
++                            if (parts.length >= 5) {
++                                // Assuming parts[4] is the driver ID based on the test case
++                                position.set(Position.KEY_DRIVER_UNIQUE_ID, parts[4]);
++                            }
++                        }
++                        // Assuming valid if we could parse text
++                        position.setValid(true);
+                     } else {
+                         position.set(Position.KEY_RESULT,
+                                 ByteBufUtil.hexDump(buf.readSlice(length)));
++                        // Might still be valid depending on context, but lacks standard position data
++                         position.setValid(false); // Or based on other criteria
+                     }
++                } else {
++                    // Not enough readable bytes for the specified length, data truncated or invalid packet
++                    buf.skipBytes(buf.readableBytes()); // Consume remaining bytes
++                    break; // Exit loop as packet structure is compromised
++                }
++
+             } else if (codec == CODEC_12) {
++                // decodeSerial might set validity inside
+                 decodeSerial(channel, remoteAddress, deviceSession, position, buf);
+             } else {
++                // decodeLocation sets validity and other position attributes
+                 decodeLocation(position, buf, codec, model);
+             }
+ 
+-            if (!position.getOutdated() || !position.getAttributes().isEmpty()) {
++            // Add position if it's considered valid or has attributes (even if outdated)
++            if (position.getValid() || !position.getAttributes().isEmpty()) {
++                 // Check for outdated is often done later, ensuring we capture events even if old
++                 // if (!position.getOutdated() || !position.getAttributes().isEmpty()) {
+                  positions.add(position);
+             }
+         }
+ 
++        // ACK for location packets (not command responses or text messages)
+         if (channel != null && codec != CODEC_12 && codec != CODEC_13) {
+             ByteBuf response = Unpooled.buffer();
+             if (connectionless) {
+-                response.writeShort(5);
+-                response.writeShort(0);
+-                response.writeByte(0x01);
+-                response.writeByte(locationPacketId);
+-                response.writeByte(count);
++                // UDP response format seems different, might need specific handling if applicable
++                // This part looks like Teltonika GH protocol response? Verify against docs.
++                response.writeShort(5); // Packet Length
++                response.writeShort(0); // Packet ID
++                response.writeByte(0x01); // Packet Type (Response)
++                response.writeByte(locationPacketId); // AVL Packet ID (byte)
++                response.writeByte(count); // Number of Accepted AVL Data
+             } else {
++                // TCP ACK: Number of records received (4 bytes)
+                 response.writeInt(count);
+             }
+             channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+         }
+ 
+         return positions.isEmpty() ? null : positions;
+     }
+\ No newline at end of file

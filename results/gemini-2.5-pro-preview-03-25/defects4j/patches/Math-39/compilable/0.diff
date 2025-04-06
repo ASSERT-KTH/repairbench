@@ -1,0 +1,245 @@
+diff --git a/tmp/01552fda-8f56-45d3-90b9-ee185dce56d5_buggy.java b/tmp/c0124d64-ad3f-41a6-a8a7-dc2dfb1dc282_fixed.java
+index fe2e012..5f5773a 100644
+--- a/tmp/01552fda-8f56-45d3-90b9-ee185dce56d5_buggy.java
++++ b/tmp/c0124d64-ad3f-41a6-a8a7-dc2dfb1dc282_fixed.java
+@@ -1,140 +1,202 @@
+   /** {@inheritDoc} */
+   @Override
+   public void integrate(final ExpandableStatefulODE equations, final double t)
+       throws MathIllegalStateException, MathIllegalArgumentException {
+ 
+     sanityChecks(equations, t);
+     setEquations(equations);
+     final boolean forward = t > equations.getTime();
+ 
+     // create some internal working arrays
+     final double[] y0  = equations.getCompleteState();
+     final double[] y = y0.clone();
+     final int stages = c.length + 1;
+     final double[][] yDotK = new double[stages][y.length];
+     final double[] yTmp    = y0.clone();
+     final double[] yDotTmp = new double[y.length];
+ 
+     // set up an interpolator sharing the integrator arrays
+     final RungeKuttaStepInterpolator interpolator = (RungeKuttaStepInterpolator) prototype.copy();
+     interpolator.reinitialize(this, yTmp, yDotK, forward,
+                               equations.getPrimaryMapper(), equations.getSecondaryMappers());
+     interpolator.storeTime(equations.getTime());
+ 
+     // set up integration control objects
+     stepStart         = equations.getTime();
+     double  hNew      = 0;
+     boolean firstTime = true;
+     initIntegration(equations.getTime(), y0, t);
+ 
+     // main integration loop
+     isLastStep = false;
+     do {
+ 
+       interpolator.shift();
+ 
+       // iterate over step size, ensuring local normalized error is smaller than 1
+       double error = 10;
++      boolean firstAttempt = true; // Flag for first attempt within this step
+       while (error >= 1.0) {
+ 
+-        if (firstTime || !fsal) {
+-          // first stage
+-          computeDerivatives(stepStart, y, yDotK[0]);
+-        }
+-
++        // Determine step size for this attempt
++        if (firstAttempt) {
+             if (firstTime) {
++                // Compute derivatives for the first stage (§4.1 compute g(tn, yn))
++                computeDerivatives(stepStart, y, yDotK[0]);
++
++                // Compute initial step size suggestion
+                 final double[] scale = new double[mainSetDimension];
+                 if (vecAbsoluteTolerance == null) {
+                     for (int i = 0; i < scale.length; ++i) {
+                         scale[i] = scalAbsoluteTolerance + scalRelativeTolerance * FastMath.abs(y[i]);
+                     }
+                 } else {
+                     for (int i = 0; i < scale.length; ++i) {
+                         scale[i] = vecAbsoluteTolerance[i] + vecRelativeTolerance[i] * FastMath.abs(y[i]);
+                     }
+                 }
+                 hNew = initializeStep(forward, getOrder(), scale,
+                                       stepStart, y, yDotK[0], yTmp, yDotK[1]);
+-          firstTime = false;
++                firstTime = false; // Overall first time initialization done
+             }
+-
++            // For the first attempt of any step, use the suggested step size
+             stepSize = hNew;
++            firstAttempt = false; // Mark first attempt as done
++        } else {
++            // Step was rejected, reduce step size based on error
++            final double factor =
++                FastMath.min(maxGrowth,
++                             FastMath.max(minReduction, safety * FastMath.pow(error, exp)));
++            stepSize = stepSize * factor; // Reduce the previously attempted stepSize
++        }
+ 
+-        // next stages
++        // If !fsal, compute the first stage derivative f(stepStart, y) for this attempt.
++        // (If fsal, yDotK[0] is assumed to be correct from the previous step or initial computation).
++        // Skip if firstTime was true (handled above), otherwise yDotK[0] needs recomputation if !fsal.
++        // Note: firstTime is false after the first attempt of the first step.
++        if (!fsal && !firstTime && firstAttempt) { // Condition simplifies: compute if !fsal and not the very first attempt overall
++             // Error in logic simplification above. Revert to original logic structure for computing yDotK[0].
++             // It should be computed if it's the first attempt OR if !fsal. The 'firstTime' check is separate for hNew init.
++             // Let's rethink: yDotK[0] = f(stepStart, y). It only needs recomputation if !fsal OR if it's the very first step.
++             // The original code's check `if (firstTime || !fsal)` before the loop was almost correct, but needs to be inside.
++        }
++        // Correct logic for yDotK[0] computation inside the loop:
++        // It needs to be computed before step size determination only on the very first step (firstTime=true).
++        // If !fsal, it needs to be computed at the start of *every* attempt within the while loop.
++        // If fsal, it's computed only on the very first step, and subsequent attempts reuse the value from the previous *accepted* step.
++        // The calculation is split: initial computation during firstTime, re-computation if !fsal inside the loop.
++
++        if (!fsal && !firstTime) { // If not FSAL and not the first step ever (where it was already computed)
++            computeDerivatives(stepStart, y, yDotK[0]); // Recompute f(t_n, y_n) for this attempt
++        }
++
++
++        // Ensure the step size for THIS attempt does not overshoot the final time t
++        final double dt = t - stepStart; // Remaining time
++        if (forward) {
++            if (stepSize > dt) {
++                stepSize = dt;
++            }
++        } else { // backward
++            if (stepSize < dt) { // dt is negative, stepSize is negative
++                stepSize = dt;
++            }
++        }
++
++        // Apply min/max step and other filtering
++        // Accept small steps if we were capped by dt (means this is effectively the last step segment)
++        stepSize = filterStep(stepSize, forward, FastMath.abs(stepSize) <= FastMath.abs(dt));
++
++
++        // Prevent zero step size if possible (filterStep should handle minStep)
++        if (stepSize == 0.0 && stepStart != t) {
++             // This might indicate dt was zero or smaller than minStep and filterStep returned 0.
++             // Or floating point issues. The integration should likely stop.
++             // Let acceptStep handle the isLastStep logic based on comparing stepStart+stepSize to t.
++             // If stepSize is truly zero, the RK stages might fail.
++             // However, filterStep is expected to throw if step size is below minimum (unless acceptSmall is true).
++             // If stepSize==dt and dt was < minStep, acceptSmall=true allows it.
++        }
++
++
++        // Perform the Runge-Kutta stages
++        // yDotK[0] is assumed to be correctly set at this point.
+         for (int k = 1; k < stages; ++k) {
+-
+           for (int j = 0; j < y0.length; ++j) {
+             double sum = a[k-1][0] * yDotK[0][j];
+             for (int l = 1; l < k; ++l) {
+               sum += a[k-1][l] * yDotK[l][j];
+             }
+             yTmp[j] = y[j] + stepSize * sum;
+           }
+-
++          // Time evaluation below uses the capped stepSize, ensuring t is not exceeded.
+           computeDerivatives(stepStart + c[k-1] * stepSize, yTmp, yDotK[k]);
+-
+         }
+ 
+-        // estimate the state at the end of the step
++        // Estimate the state at the end of the step
+         for (int j = 0; j < y0.length; ++j) {
+           double sum = b[0] * yDotK[0][j];
+           for (int l = 1; l < stages; ++l) {
+             sum += b[l] * yDotK[l][j];
+           }
+           yTmp[j] = y[j] + stepSize * sum;
+         }
+ 
+-        // estimate the error at the end of the step
++        // Estimate the error at the end of the step
+         error = estimateError(yDotK, y, yTmp, stepSize);
+         if (error >= 1.0) {
+-          // reject the step and attempt to reduce error by stepsize control
+-          final double factor =
+-              FastMath.min(maxGrowth,
+-                           FastMath.max(minReduction, safety * FastMath.pow(error, exp)));
+-          hNew = filterStep(stepSize * factor, forward, false);
++          // Reject the step. The loop will continue, step size will be reduced
++          // based on the rejected stepSize in the next iteration.
++          // firstAttempt remains false.
++          // If !fsal, yDotK[0] will be recomputed.
+         }
+ 
+-      }
++      } // End of error control loop (while error >= 1.0)
+ 
+-      // local error is small enough: accept the step, trigger events and step handlers
+-      interpolator.storeTime(stepStart + stepSize);
+-      System.arraycopy(yTmp, 0, y, 0, y0.length);
+-      System.arraycopy(yDotK[stages - 1], 0, yDotTmp, 0, y0.length);
+-      stepStart = acceptStep(interpolator, y, yDotTmp, t);
+-      System.arraycopy(y, 0, yTmp, 0, y.length);
++      // local error is small enough: accept the step
++      interpolator.storeTime(stepStart + stepSize); // Store time for the end of the accepted step
++      System.arraycopy(yTmp, 0, y, 0, y0.length); // Update main state vector y
++      System.arraycopy(yDotK[stages - 1], 0, yDotTmp, 0, y0.length); // Store last derivative for FSAL/handlers
++      stepStart = acceptStep(interpolator, y, yDotTmp, t); // Perform end-of-step tasks, update stepStart, update isLastStep
++      System.arraycopy(y, 0, yTmp, 0, y.length); // Update yTmp for interpolator consistency (y is the state at new stepStart)
+ 
+       if (!isLastStep) {
++          // Prepare for the next step
+ 
+-          // prepare next step
+-          interpolator.storeTime(stepStart);
++          interpolator.storeTime(stepStart); // Store the new stepStart for the interpolator
+ 
+           if (fsal) {
+-              // save the last evaluation for the next step
++              // Save the last evaluation for the next step's first stage
+               System.arraycopy(yDotTmp, 0, yDotK[0], 0, y0.length);
+           }
+ 
+-          // stepsize control for next step
++          // Estimate step size for the next step attempt (hNew)
+           final double factor =
+-              FastMath.min(maxGrowth, FastMath.max(minReduction, safety * FastMath.pow(error, exp)));
+-          final double  scaledH    = stepSize * factor;
+-          final double  nextT      = stepStart + scaledH;
++              FastMath.min(maxGrowth, FastMath.max(minReduction, safety * FastMath.pow(error, exp))); // error < 1.0 here
++          final double scaledH = stepSize * factor; // stepSize is the accepted size of the completed step
++          final double nextT = stepStart + scaledH; // Potential time at end of next step
+           final boolean nextIsLast = forward ? (nextT >= t) : (nextT <= t);
++
++          // Filter the suggested step size (min/max bounds)
++          // Pass nextIsLast hint to potentially allow a small step if it's the final one
+           hNew = filterStep(scaledH, forward, nextIsLast);
+ 
++          // Now, explicitly check if the filtered step size would still overshoot t,
++          // and if so, adjust it to hit t exactly. This corrects the aim for the next step.
+           final double filteredNextT = stepStart + hNew;
+-          final boolean filteredNextIsLast = forward ? (filteredNextT >= t) : (filteredNextT <= t);
+-          if (filteredNextIsLast) {
+-              hNew = t - stepStart;
++          final boolean filteredIsLast = forward ? (filteredNextT >= t) : (filteredNextT <= t);
++          if (filteredIsLast) {
++              hNew = t - stepStart; // Aim exactly for the final time
+           }
+-
++          // hNew now holds the recommended step size for the *next* attempt
+       }
+ 
+     } while (!isLastStep);
+ 
+     // dispatch results
+-    equations.setTime(stepStart);
++    equations.setTime(stepStart); // Should be == t if integration finished normally
+     equations.setCompleteState(y);
+ 
+     resetInternalState();
+ 
+   }
+\ No newline at end of file

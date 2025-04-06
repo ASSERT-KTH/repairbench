@@ -1,0 +1,229 @@
+diff --git a/tmp/d52fb785-3230-4a81-aff7-f87100cedbf8_buggy.java b/tmp/48ec99ed-3df3-42b3-a826-73085b322f70_fixed.java
+index ae9ef3f..810806e 100644
+--- a/tmp/d52fb785-3230-4a81-aff7-f87100cedbf8_buggy.java
++++ b/tmp/48ec99ed-3df3-42b3-a826-73085b322f70_fixed.java
+@@ -1,158 +1,182 @@
+   /**
+    * Parses the externs and main inputs.
+    *
+    * @return A synthetic root node whose two children are the externs root
+    *     and the main root
+    */
+   Node parseInputs() {
+     boolean devMode = options.devMode != DevMode.OFF;
+ 
+     // If old roots exist (we are parsing a second time), detach each of the
+     // individual file parse trees.
+     if (externsRoot != null) {
+       externsRoot.detachChildren();
+     }
+     if (jsRoot != null) {
+       jsRoot.detachChildren();
+     }
+ 
+-    // Parse main js sources.
++    // Initialize roots
+     jsRoot = IR.block();
+     jsRoot.setIsSyntheticBlock(true);
+-
+     externsRoot = IR.block();
+     externsRoot.setIsSyntheticBlock(true);
+-
+     externAndJsRoot = IR.block(externsRoot, jsRoot);
+     externAndJsRoot.setIsSyntheticBlock(true);
+ 
+     if (options.tracer.isOn()) {
+       tracker = new PerformanceTracker(jsRoot, options.tracer);
+       addChangeHandler(tracker.getCodeChangeHandler());
+     }
+ 
+     Tracer tracer = newTracer("parseInputs");
+ 
+     try {
+-      // Parse externs sources.
++      // 1. Parse externs sources.
+       for (CompilerInput input : externs) {
+         Node n = input.getAstRoot(this);
+         if (hasErrors()) {
+           return null;
+         }
+         externsRoot.addChildToBack(n);
+       }
+ 
+-      // Modules inferred in ProcessCommonJS pass.
++      // 2. Process AMD/CommonJS modules (may update 'modules' and 'inputs')
+       if (options.transformAMDToCJSModules || options.processCommonJSModules) {
+         processAMDAndCommonJSModules();
+       }
+ 
+-      // Check if inputs need to be rebuilt from modules.
+-      boolean staleInputs = false;
++      // 3. Ensure ASTs are parsed for all inputs before potential reordering
++      //    or modification checks. The AST is cached in the CompilerInput.
++      for (CompilerInput input : inputs) {
++        input.getAstRoot(this); // Populate AST cache
++        if (hasErrors()) {
++          return null;
++        }
++      }
+ 
+-      // Check if the sources need to be re-ordered.
++      // 4. Dependency management
++      // Create a list to hold the potentially sorted inputs. Start with the current inputs.
++      List<CompilerInput> sortedInputs = Lists.newArrayList(inputs);
++      boolean orderChanged = false;
+       if (options.dependencyOptions.needsManagement() &&
+           !options.skipAllPasses &&
+           options.closurePass) {
+         for (CompilerInput input : inputs) {
+           // Forward-declare all the provided types, so that they
+           // are not flagged even if they are dropped from the process.
+           for (String provide : input.getProvides()) {
+             getTypeRegistry().forwardDeclareType(provide);
+           }
+         }
+ 
+         try {
+-          inputs =
+-              (moduleGraph == null ? new JSModuleGraph(modules) : moduleGraph)
+-              .manageDependencies(options.dependencyOptions, inputs);
+-          staleInputs = true;
++          JSModuleGraph graph =
++              (moduleGraph == null ? new JSModuleGraph(modules) : moduleGraph);
++          // manageDependencies returns a new sorted list.
++          List<CompilerInput> newSortedInputs =
++              graph.manageDependencies(options.dependencyOptions, inputs);
++          if (!sortedInputs.equals(newSortedInputs)) {
++              orderChanged = true;
++              sortedInputs = newSortedInputs;
++          }
+         } catch (CircularDependencyException e) {
+           report(JSError.make(
+               JSModule.CIRCULAR_DEPENDENCY_ERROR, e.getMessage()));
+-
+-          // If in IDE mode, we ignore the error and keep going.
+-          if (hasErrors()) {
+-            return null;
+-          }
++          if (hasErrors()) return null; // Check errors, potentially return null
+         } catch (MissingProvideException e) {
+           report(JSError.make(
+               MISSING_ENTRY_ERROR, e.getMessage()));
+-
+-          // If in IDE mode, we ignore the error and keep going.
+-          if (hasErrors()) {
+-            return null;
+-          }
++          if (hasErrors()) return null; // Check errors, potentially return null
+         }
+       }
+ 
++      // 5. Check for @externs/@nocompile inputs and mark them for removal/moving.
++      //    Iterate the original list ('inputs') to ensure all initial inputs are checked.
++      Set<CompilerInput> inputsToRemove = Sets.newHashSet();
++      boolean modulesModified = false;
+       for (CompilerInput input : inputs) {
+-        Node n = input.getAstRoot(this);
+-
+-        // Inputs can have a null AST during initial parse.
++        Node n = input.getAstRoot(this); // AST is cached
+         if (n == null) {
+           continue;
+         }
+ 
+         if (n.getJSDocInfo() != null) {
+           JSDocInfo info = n.getJSDocInfo();
+           if (info.isExterns()) {
+             // If the input file is explicitly marked as an externs file, then
+             // assume the programmer made a mistake and throw it into
+             // the externs pile anyways.
+-            externsRoot.addChildToBack(n);
++            externsRoot.addChildToBack(n); // Add AST to externs
+             input.setIsExtern(true);
+-
+-            input.getModule().remove(input);
+-
+-            externs.add(input);
+-            staleInputs = true;
++            if (input.getModule() != null) {
++                input.getModule().remove(input); // Remove from module
++            }
++            externs.add(input); // Add Input object to externs list
++            inputsToRemove.add(input); // Mark for removal from main inputs
++            modulesModified = true;
+           } else if (info.isNoCompile()) {
+-            input.getModule().remove(input);
+-            staleInputs = true;
++            if (input.getModule() != null) {
++                input.getModule().remove(input); // Remove from module
++            }
++            inputsToRemove.add(input); // Mark for removal from main inputs
++            modulesModified = true;
+           }
+         }
+       }
+ 
+-      if (staleInputs) {
+-        fillEmptyModules(modules);
+-        rebuildInputsFromModules();
++      // 6. Finalize the list of inputs to be included in the build.
++      //    Start with the potentially sorted list.
++      List<CompilerInput> finalInputs;
++      if (modulesModified) {
++        fillEmptyModules(modules); // Update modules if some became empty
++        // Filter the sorted list to remove marked inputs
++        finalInputs = Lists.newArrayList();
++        for(CompilerInput input : sortedInputs) {
++            if (!inputsToRemove.contains(input)) {
++                finalInputs.add(input);
++            }
+         }
++      } else {
++        // No modules modified, use the sorted list directly.
++        finalInputs = sortedInputs;
++      }
++
++      // Update the compiler's main 'inputs' list for subsequent passes.
++      this.inputs = finalInputs;
+ 
+-      // Build the AST.
+-      for (CompilerInput input : inputs) {
+-        Node n = input.getAstRoot(this);
++      // 7. Build the AST for jsRoot using the final, ordered list.
++      for (CompilerInput input : finalInputs) {
++        Node n = input.getAstRoot(this); // AST should be cached
+         if (n == null) {
+-          continue;
++          continue; // Should not happen normally
+         }
+ 
+         if (devMode) {
+           runSanityCheck();
+           if (hasErrors()) {
+             return null;
+           }
+         }
+ 
+         if (options.sourceMapOutputPath != null ||
+             options.nameReferenceReportPath != null) {
+-
+           // Annotate the nodes in the tree with information from the
+           // input file. This information is used to construct the SourceMap.
+           SourceInformationAnnotator sia =
+               new SourceInformationAnnotator(
+                   input.getName(), options.devMode != DevMode.OFF);
+           NodeTraversal.traverse(this, n, sia);
+         }
+ 
+         jsRoot.addChildToBack(n);
+       }
+ 
+       if (hasErrors()) {
+         return null;
+       }
+       return externAndJsRoot;
+     } finally {
+       stopTracer(tracer, "parseInputs");
+     }
+   }
+\ No newline at end of file

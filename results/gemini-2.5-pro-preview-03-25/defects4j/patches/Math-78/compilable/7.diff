@@ -1,0 +1,186 @@
+diff --git a/tmp/fba6b1d7-a7f0-4b47-9424-f34046c984e1_buggy.java b/tmp/03b29f3f-f11b-4bfc-8d74-88637f9a3e1e_fixed.java
+index 032fa8e..0784df0 100644
+--- a/tmp/fba6b1d7-a7f0-4b47-9424-f34046c984e1_buggy.java
++++ b/tmp/03b29f3f-f11b-4bfc-8d74-88637f9a3e1e_fixed.java
+@@ -1,108 +1,137 @@
+     /** Evaluate the impact of the proposed step on the event handler.
+      * @param interpolator step interpolator for the proposed step
+      * @return true if the event handler triggers an event before
+      * the end of the proposed step (this implies the step should be
+      * rejected)
+      * @exception DerivativeException if the interpolator fails to
+      * compute the switching function somewhere within the step
+      * @exception EventException if the switching function
+      * cannot be evaluated
+      * @exception ConvergenceException if an event cannot be located
+      */
+     public boolean evaluateStep(final StepInterpolator interpolator)
+         throws DerivativeException, EventException, ConvergenceException {
+ 
+         try {
+ 
+-            forward = interpolator.isForward();
++            // Get step interval from interpolator
++            final double t0_step = interpolator.getPreviousTime();
+             final double t1      = interpolator.getCurrentTime();
+-            final int    n  = Math.max(1, (int) Math.ceil(Math.abs(t1 - t0) / maxCheckInterval));
+-            final double h  = (t1 - t0) / n;
++            forward = interpolator.isForward(); // Integration direction
++
++            // Determine number of sub-intervals and step size h
++            final int    n;
++            final double h;
++            // Check step size only if maxCheckInterval is positive; otherwise, check only the endpoint
++            // Also handle case where t1 == t0_step to avoid division by zero
++            if (maxCheckInterval > 0 && t1 != t0_step) {
++                n = Math.max(1, (int) Math.ceil(Math.abs(t1 - t0_step) / maxCheckInterval));
++                h = (t1 - t0_step) / n;
++            } else {
++                n = 1;
++                h = t1 - t0_step; // h can be 0 if t1 == t0_step
++            }
++
++            double ta = t0_step;
++            interpolator.setInterpolatedTime(ta);
++            // Evaluate g at the start of the step interval [t0_step, t1]
++            double ga = handler.g(ta, interpolator.getInterpolatedState());
+ 
+-            double ta = t0;
+-            double ga = g0;
+-            double tb = t0 + (interpolator.isForward() ? convergence : -convergence);
+             for (int i = 0; i < n; ++i) {
+ 
+-                // evaluate handler value at the end of the substep
+-                tb += h;
++                // Evaluate handler value at the end of the sub-step tb
++                // Use t1 for the last endpoint to avoid potential floating point overshoot/undershoot
++                final double tb = (i == n - 1) ? t1 : t0_step + (i + 1) * h;
+                 interpolator.setInterpolatedTime(tb);
+                 final double gb = handler.g(tb, interpolator.getInterpolatedState());
+ 
+-                // check events occurrence
+-                if (g0Positive ^ (gb >= 0)) {
+-                    // there is a sign change: an event is expected during this step
++                // Check for events occurrence: sign change between ga and gb
++                // Use != comparison for robustness against zero values (detects crossing zero)
++                if ((ga >= 0) != (gb >= 0)) {
++                    // There is a sign change: an event is expected during this sub-step [ta, tb]
+ 
+-                        // this is a corner case:
+-                        // - there was an event near ta,
+-                        // - there is another event between ta and tb
+-                        // - when ta was computed, convergence was reached on the "wrong side" of the interval
+-                        // this implies that the real sign of ga is the same as gb, so we need to slightly
+-                        // shift ta to make sure ga and gb get opposite signs and the solver won't complain
+-                        // about bracketing
+-                            // this should never happen
+-                         
+-                    // variation direction, with respect to the integration direction
++                    // Determine variation direction, with respect to the integration direction, using ga and gb
+                     increasing = gb >= ga;
+ 
++                    // Define the function for the root finder, evaluating g(t) using the interpolator
+                     final UnivariateRealFunction f = new UnivariateRealFunction() {
+                         public double value(final double t) throws FunctionEvaluationException {
+                             try {
+                                 interpolator.setInterpolatedTime(t);
+                                 return handler.g(t, interpolator.getInterpolatedState());
+                             } catch (DerivativeException e) {
++                                // Wrap exceptions to fit UnivariateRealFunction interface
+                                 throw new FunctionEvaluationException(e, t);
+                             } catch (EventException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             }
+                         }
+                     };
++
++                    // Use Brent method to find the root (event time)
+                     final BrentSolver solver = new BrentSolver();
+-                    solver.setAbsoluteAccuracy(convergence);
+-                    solver.setMaximalIterationCount(maxIterationCount);
+-                    final double root = (ta <= tb) ? solver.solve(f, ta, tb) : solver.solve(f, tb, ta);
+-                    if ((Math.abs(root - ta) <= convergence) &&
+-                         (Math.abs(root - previousEventTime) <= convergence)) {
+-                        // we have either found nothing or found (again ?) a past event, we simply ignore it
++                    solver.setAbsoluteAccuracy(convergence); // Set accuracy based on event state's convergence
++                    solver.setMaximalIterationCount(maxIterationCount); // Set max iterations based on event state
++
++                    // Find the root within the sub-interval [ta, tb] or [tb, ta] depending on direction
++                    // BrentSolver requires the interval endpoints to have different signs, which
++                    // the condition (ga >= 0) != (gb >= 0) ensures (unless both are exactly 0).
++                    final double root = forward ? solver.solve(f, ta, tb) : solver.solve(f, tb, ta);
++
++                    // Check if the found root is the same as the last known event time (within convergence)
++                    if (!Double.isNaN(previousEventTime) && (Math.abs(root - previousEventTime) <= convergence)) {
++                        // Root is too close to the previous event time, likely a duplicate detection. Ignore it.
++                        // Advance to the next sub-interval for checking
+                         ta = tb;
+                         ga = gb;
+-                    } else if (Double.isNaN(previousEventTime) ||
+-                               (Math.abs(previousEventTime - root) > convergence)) {
++                        continue; // Continue to the next sub-interval
++                    }
++
++                    // We have found a new event candidate time. Store it.
+                     pendingEventTime = root;
+-                        if (pendingEvent && (Math.abs(t1 - pendingEventTime) <= convergence)) {
+-                            // we were already waiting for this event which was
+-                            // found during a previous call for a step that was
+-                            // rejected, this step must now be accepted since it
+-                            // properly ends exactly at the event occurrence
+-                            return false;
+-                        }
+-                        // either we were not waiting for the event or it has
+-                        // moved in such a way the step cannot be accepted
+                     pendingEvent = true;
++
++                    // Check if the proposed step end time (t1) is very close to this event time
++                    if (Math.abs(t1 - pendingEventTime) <= convergence) {
++                        // The step ends precisely at the event time. The step is acceptable.
++                        // Return false to indicate the step should be accepted.
++                        return false;
++                    } else {
++                        // The step crosses the event time but does not end there.
++                        // The step must be rejected so the integrator can shorten it to end at the event.
++                        // Return true to indicate the step should be rejected.
+                         return true;
+                     }
+ 
+                 } else {
+-                    // no sign change: there is no event for now
++                    // No sign change detected in this sub-interval [ta, tb].
++                    // Advance the start point and value for the next sub-interval check.
+                     ta = tb;
+                     ga = gb;
+                 }
++            } // End of sub-interval loop
+ 
+-            }
+-
+-            // no event during the whole step
++            // No event was detected during the entire step interval [t0_step, t1].
+             pendingEvent     = false;
+             pendingEventTime = Double.NaN;
++            // Return false to indicate the step is acceptable (no event needing step rejection).
+             return false;
+ 
+         } catch (FunctionEvaluationException e) {
++            // Handle exceptions potentially thrown by the UnivariateRealFunction wrapper
+             final Throwable cause = e.getCause();
+             if ((cause != null) && (cause instanceof DerivativeException)) {
++                // Unwrap and rethrow specific exceptions declared by the method
+                 throw (DerivativeException) cause;
+             } else if ((cause != null) && (cause instanceof EventException)) {
++                // Unwrap and rethrow specific exceptions declared by the method
+                 throw (EventException) cause;
+             }
++            // Wrap other causes or the FunctionEvaluationException itself in an EventException
+             throw new EventException(e);
++        } catch (org.apache.commons.math.ConvergenceException e) {
++            // Handle convergence exception specifically from the Brent solver
++            // This exception is declared in the method signature.
++            throw new ConvergenceException(e);
+         }
+-
+     }
+\ No newline at end of file

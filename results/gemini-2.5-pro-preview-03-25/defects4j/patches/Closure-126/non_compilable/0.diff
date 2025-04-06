@@ -1,0 +1,210 @@
+diff --git a/tmp/3f70f05c-d8bd-4dd1-adc5-96508f65938f_buggy.java b/tmp/f571e886-2c92-4d36-bfb8-92bf437ec5b0_fixed.java
+index 7d7ab59..8187efc 100644
+--- a/tmp/3f70f05c-d8bd-4dd1-adc5-96508f65938f_buggy.java
++++ b/tmp/f571e886-2c92-4d36-bfb8-92bf437ec5b0_fixed.java
+@@ -1,124 +1,161 @@
+   /**
+    * Attempts to minimize the number of explicit exit points in a control
+    * structure to take advantage of the implied exit at the end of the
+    * structure.  This is accomplished by removing redundant statements, and
+    * moving statements following a qualifying IF node into that node.
+    * For example:
+    *
+    * function () {
+    *   if (x) return;
+    *   else blah();
+    *   foo();
+    * }
+    *
+    * becomes:
+    *
+    * function () {
+    *  if (x) ;
+    *  else {
+    *    blah();
+    *    foo();
+    *  }
+    *
+    * @param n The execution node of a parent to inspect.
+    * @param exitType The type of exit to look for.
+    * @param labelName If parent is a label the name of the label to look for,
+    *   null otherwise.
+    * @nullable labelName non-null only for breaks within labels.
+    */
+   void tryMinimizeExits(Node n, int exitType, String labelName) {
+ 
+-    // Just an 'exit'.
++    // Do not try to minimize the exits of nodes inside a FINALLY block,
++    // as it can change the completion type of the finally block.
++    // See ECMA 262 Sections 8.9 & 12.14
++    boolean isWithinFinally = NodeUtil.isWithinFinallyBlock(n);
++
++    // If n is the exit node itself:
+     if (matchingExitNode(n, exitType, labelName)) {
++      // Check if removing this node is safe
++      if (!isWithinFinally) {
+         NodeUtil.removeChild(n.getParent(), n);
+         compiler.reportCodeChange();
++      }
++      // Whether removed or not, cannot recurse further down this path.
+       return;
+     }
+ 
+-    // Just an 'if'.
++    // Recurse into the node's structure.
++
++    // Handle IF structure
+     if (n.isIf()) {
+-      Node ifBlock = n.getFirstChild().getNext();
+-      tryMinimizeExits(ifBlock, exitType, labelName);
+-      Node elseBlock = ifBlock.getNext();
++      // Recurse on THEN block
++      Node thenBlock = n.getFirstChild().getNext();
++      tryMinimizeExits(thenBlock, exitType, labelName);
++      // Recurse on ELSE block
++      Node elseBlock = thenBlock.getNext();
+       if (elseBlock != null) {
+         tryMinimizeExits(elseBlock, exitType, labelName);
+       }
++      // Return: IF structure is handled recursively.
+       return;
+     }
+ 
+-    // Just a 'try/catch/finally'.
++    // Handle TRY structure
+     if (n.isTry()) {
++      // Recurse on TRY block
+       Node tryBlock = n.getFirstChild();
+       tryMinimizeExits(tryBlock, exitType, labelName);
++      // Recurse on CATCH block
+       Node allCatchNodes = NodeUtil.getCatchBlock(n);
+       if (NodeUtil.hasCatchHandler(allCatchNodes)) {
+-        Preconditions.checkState(allCatchNodes.hasOneChild());
++        // Note: This assumes only one CATCH, which is generally true after Normalize.
++        Preconditions.checkState(allCatchNodes.hasOneChild(), "Catch block has more than one child");
+         Node catchNode = allCatchNodes.getFirstChild();
+         Node catchCodeBlock = catchNode.getLastChild();
+         tryMinimizeExits(catchCodeBlock, exitType, labelName);
+       }
+-      /* Don't try to minimize the exits of finally blocks, as this
+-       * can cause problems if it changes the completion type of the finally
+-       * block. See ECMA 262 Sections 8.9 & 12.14
+-       */
++      // Recurse on FINALLY block
++      // The check at the beginning of the function prevents bad removals.
+       if (NodeUtil.hasFinally(n)) {
+         Node finallyBlock = n.getLastChild();
+         tryMinimizeExits(finallyBlock, exitType, labelName);
+       }
++      // Return: TRY structure is handled recursively.
++      return;
+     }
+ 
+-    // Just a 'label'.
++    // Handle LABEL structure
+     if (n.isLabel()) {
+       Node labelBlock = n.getLastChild();
+       tryMinimizeExits(labelBlock, exitType, labelName);
++      // Return: LABEL structure is handled recursively.
++      return;
+     }
+ 
+-    // TODO(johnlenz): The last case of SWITCH statement?
++    // TODO(johnlenz): Handle SWITCH
++
++    // The rest applies only to BLOCK structures (or SCRIPT/FUNCTION)
++    if (!n.isBlock() && !n.isScript() && !n.isFunction()) {
++        return;
++    }
+ 
+-    // The rest assumes a block with at least one child, bail on anything else.
+-    if (!n.isBlock() || n.getLastChild() == null) {
++    // Only applies to BLOCK/SCRIPT/FUNCTION, and must have children
++    if (n.getFirstChild() == null) {
+       return;
+     }
+ 
+-    // Multiple if-exits can be converted in a single pass.
+-    // Convert "if (blah) break;  if (blah2) break; other_stmt;" to
+-    // become "if (blah); else { if (blah2); else { other_stmt; } }"
+-    // which will get converted to "if (!blah && !blah2) { other_stmt; }".
+-    for (Node c : n.children()) {
++    // ----- Processing for BLOCK/SCRIPT/FUNCTION -----
+ 
+-      // An 'if' block to process below.
++    // Optimize IF statements within this block
++    // Traverse the children, optimizing IFs as we find them.
++    for (Node c = n.getFirstChild(); c != null; ) {
++      Node next = c.getNext(); // Store next node since c might be removed/changed
+       if (c.isIf()) {
+-        Node ifTree = c;
+-        Node trueBlock, falseBlock;
++        // Handle the IF case: move trailing statements into ELSE, etc.
++        // Note: This function might change the structure, including 'next'.
++        // It needs to be careful, or this loop needs adapting.
++        Node ifNode = c;
++        Node trueBlock = ifNode.getFirstChild().getNext();
++        Node falseBlock = trueBlock.getNext();
++        // Optimize the IF's true branch regarding exits
++        tryMinimizeIfBlockExits(trueBlock, falseBlock, ifNode, exitType, labelName);
+ 
+-        // First, the true condition block.
+-        trueBlock = ifTree.getFirstChild().getNext();
+-        falseBlock = trueBlock.getNext();
+-        tryMinimizeIfBlockExits(trueBlock, falseBlock,
+-            ifTree, exitType, labelName);
+-
+-        // Now the else block.
+-        // The if blocks may have changed, get them again.
+-        trueBlock = ifTree.getFirstChild().getNext();
++        // Re-fetch else block, might have changed
++        trueBlock = ifNode.getFirstChild().getNext(); // Re-fetch true block too? Maybe not needed.
+         falseBlock = trueBlock.getNext();
++        // Optimize the IF's false branch regarding exits
+         if (falseBlock != null) {
+-          tryMinimizeIfBlockExits(falseBlock, trueBlock,
+-              ifTree, exitType, labelName);
++          tryMinimizeIfBlockExits(falseBlock, trueBlock, ifNode, exitType, labelName);
+         }
+       }
++      c = next;
++    }
+ 
+-      if (c == n.getLastChild()) {
+-        break;
++    // Minimize trailing exits within the block.
++    // Keep removing the last child if it's an exit node (and not in finally)
++    // until the last child is no longer a removable exit.
++    while (true) {
++      Node lastChild = n.getLastChild();
++      if (lastChild == null) {
++        break; // Block is empty
+       }
++
++      // Store the original last child reference before the recursive call
++      Node originalLastChild = lastChild;
++
++      // Try to minimize exits within the last child structure itself
++      // (e.g., if the last child is an IF or TRY).
++      // This recursive call will handle the isWithinFinally check internally.
++      tryMinimizeExits(lastChild, exitType, labelName);
++
++      // If the recursive call removed or modified the last child,
++      // loop again to process whatever is the new last child.
++      if (n.getLastChild() != originalLastChild) {
++        continue;
+       }
+ 
+-    // Now try to minimize the exits of the last child, if it is removed
+-    // look at what has become the last child.
+-    for (Node c = n.getLastChild(); c != null; c = n.getLastChild()) {
+-      tryMinimizeExits(c, exitType, labelName);
+-      // If the node is still the last child, we are done.
+-      if (c == n.getLastChild()) {
++      // If the last child was not changed by the recursive call,
++      // no further optimization is possible on the trailing child sequence.
+       break;
+     }
+   }
+\ No newline at end of file
+-  }

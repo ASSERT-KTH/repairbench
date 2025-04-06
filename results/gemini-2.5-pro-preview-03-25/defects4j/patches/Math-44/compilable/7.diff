@@ -1,0 +1,154 @@
+diff --git a/tmp/74070989-00f7-40b8-86ba-a541f4120b73_buggy.java b/tmp/11c41a6b-8233-4a45-a94c-5b45dba03ac1_fixed.java
+index 2c4ed06..2cbbd24 100644
+--- a/tmp/74070989-00f7-40b8-86ba-a541f4120b73_buggy.java
++++ b/tmp/11c41a6b-8233-4a45-a94c-5b45dba03ac1_fixed.java
+@@ -1,111 +1,142 @@
+     /** Accept a step, triggering events and step handlers.
+      * @param interpolator step interpolator
+      * @param y state vector at step end time, must be reset if an event
+      * asks for resetting or if an events stops integration during the step
+      * @param yDot placeholder array where to put the time derivative of the state vector
+      * @param tEnd final integration time
+      * @return time at end of step
+      * @exception MathIllegalStateException if the value of one event state cannot be evaluated
+      * @since 2.2
+      */
+     protected double acceptStep(final AbstractStepInterpolator interpolator,
+                                 final double[] y, final double[] yDot, final double tEnd)
+         throws MathIllegalStateException {
+ 
+             double previousT = interpolator.getGlobalPreviousTime();
+             final double currentT = interpolator.getGlobalCurrentTime();
+             resetOccurred = false;
+ 
+             // initialize the events states if needed
+             if (! statesInitialized) {
+                 for (EventState state : eventsStates) {
+                     state.reinitializeBegin(interpolator);
+                 }
+                 statesInitialized = true;
+             }
+ 
+             // search for next events that may occur during the step
+             final int orderingSign = interpolator.isForward() ? +1 : -1;
+             SortedSet<EventState> occuringEvents = new TreeSet<EventState>(new Comparator<EventState>() {
+ 
+                 /** {@inheritDoc} */
+                 public int compare(EventState es0, EventState es1) {
+                     return orderingSign * Double.compare(es0.getEventTime(), es1.getEventTime());
+                 }
+ 
+             });
+ 
+             for (final EventState state : eventsStates) {
+                 if (state.evaluateStep(interpolator)) {
+                     // the event occurs during the current step
+                     occuringEvents.add(state);
+                 }
+             }
+ 
+             while (!occuringEvents.isEmpty()) {
+ 
+                 // handle the chronologically first event
+                 final Iterator<EventState> iterator = occuringEvents.iterator();
+                 final EventState currentEvent = iterator.next();
+                 iterator.remove();
+ 
+                 // restrict the interpolator to the first part of the step, up to the event
+                 final double eventT = currentEvent.getEventTime();
+                 interpolator.setSoftPreviousTime(previousT);
+                 interpolator.setSoftCurrentTime(eventT);
+ 
+                 // trigger the event
+                 interpolator.setInterpolatedTime(eventT);
++                // get state at event time
+                 final double[] eventY = interpolator.getInterpolatedState();
++
++                // update the state vector Y (expected by event handlers potentially)
++                // BEFORE the event is triggered, simply because the T value matches
++                // This is needed for MATH-695 behavior only? Consider if needed otherwise.
++                // Maybe not needed: event handlers should use the state provided, not rely on y
++                // Let's remove this System.arraycopy for now, as it deviates from original logic
++                // System.arraycopy(eventY, 0, y, 0, y.length);
++
++                // advance all event states to current time; update their internal state
++                // including g0Positive indicator used by evaluateStep below
+                 currentEvent.stepAccepted(eventT, eventY);
+                 isLastStep = currentEvent.stop();
+ 
+                 // handle the first part of the step, up to the event
+                 for (final StepHandler handler : stepHandlers) {
+                     handler.handleStep(interpolator, isLastStep);
+                 }
+ 
+                 if (isLastStep) {
+                     // the event asked to stop integration
+-                    System.arraycopy(eventY, 0, y, 0, y.length);
++                    System.arraycopy(eventY, 0, y, 0, y.length); // Ensure state y reflects event time
+                     return eventT;
+                 }
+ 
++                // Check if the event requests state reset
++                // Note: eventOccurred is called internally by reset() and might modify eventY if it's not a copy.
++                // We assume getInterpolatedState returns a *copy* for safety,
++                // so eventOccurred modifies the copy eventY.
+                 if (currentEvent.reset(eventT, eventY)) {
+                     // some event handler has triggered changes that
+                     // invalidate the derivatives, we need to recompute them
+-                    System.arraycopy(eventY, 0, y, 0, y.length);
+-                    computeDerivatives(eventT, y, yDot);
++                    System.arraycopy(eventY, 0, y, 0, y.length); // Copy the modified state into the main state array y
++                    computeDerivatives(eventT, y, yDot); // Compute derivatives for the new state y at eventT
+                     resetOccurred = true;
+-                    return eventT;
++                    // Update the event state internal indicators AFTER the reset action.
++                    // This ensures that g0Positive is consistent with the *reset* state y
++                    // for the next step evaluation.
++                    currentEvent.stepAccepted(eventT, y);
++                    return eventT; // Return immediately, step ends here
+                 }
+ 
+                 // prepare handling of the remaining part of the step
+                 previousT = eventT;
+                 interpolator.setSoftPreviousTime(eventT);
+                 interpolator.setSoftCurrentTime(currentT);
+ 
+                 // check if the same event occurs again in the remaining part of the step
++                // This evaluation needs to use the current state at previousT=eventT,
++                // but evaluateStep uses the interpolator which might have older state info.
++                // However, stepAccepted was just called for currentEvent, updating its g0Positive
++                // based on eventY at eventT (before potential reset), which might be sufficient.
+                 if (currentEvent.evaluateStep(interpolator)) {
+                     // the event occurs during the current step
+                     occuringEvents.add(currentEvent);
+                 }
+ 
+             }
+ 
++            // The step has been accepted, handle the last part of it
+             interpolator.setInterpolatedTime(currentT);
+             final double[] currentY = interpolator.getInterpolatedState();
++            // Update state y to reflect the end of the step
++            System.arraycopy(currentY, 0, y, 0, y.length);
++
++            // Advance all event states to the end of the step
+             for (final EventState state : eventsStates) {
+                 state.stepAccepted(currentT, currentY);
+-                isLastStep = isLastStep || state.stop();
++                isLastStep = isLastStep || state.stop(); // Check for stops requested at step end
+             }
+             isLastStep = isLastStep || Precision.equals(currentT, tEnd, 1);
+ 
+-            // handle the remaining part of the step, after all events if any
++            // handle the full step, or the remaining part after the last event
++            // Note: step handlers might have been called for sub-intervals ending at event times
++            // This call handles the full step [original_previousT, currentT] or the last
++            // remaining sub-interval [last_eventT, currentT]. The interpolator's state reflects currentT.
+             for (StepHandler handler : stepHandlers) {
+                 handler.handleStep(interpolator, isLastStep);
+             }
+ 
+             return currentT;
+ 
+     }
+\ No newline at end of file

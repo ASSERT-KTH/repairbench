@@ -1,0 +1,350 @@
+diff --git a/tmp/b2f39b7f-02ea-4834-bdf5-f4c709225a83_buggy.java b/tmp/8cceda9e-abf3-4220-899c-ecc991ee202e_fixed.java
+index 7b8ee38..eecc257 100644
+--- a/tmp/b2f39b7f-02ea-4834-bdf5-f4c709225a83_buggy.java
++++ b/tmp/8cceda9e-abf3-4220-899c-ecc991ee202e_fixed.java
+@@ -1,179 +1,274 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
++        if (buf.readableBytes() < 10) { // Basic check for minimum length (e.g., [AB*1*1234*TYPE])
++            return null;
++        }
+ 
+-        buf.skipBytes(1); // '[' header
+-        manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
+-        buf.skipBytes(1); // '*' delimiter
++        if (buf.getByte(buf.readerIndex()) != '[') {
++            return null; // Doesn't start with '['
++        }
++        buf.skipBytes(1); // Skip '['
+ 
+-        int idIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        String id = buf.readSlice(idIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++        // Determine end index (ignoring ']')
++        int endSearchIndex = buf.writerIndex() - 1;
++        if (endSearchIndex < buf.readerIndex() || buf.getByte(endSearchIndex) != ']') {
++            // Malformed or ']' missing at the end
++            return null;
++        }
++
++        // 1. Manufacturer (2 bytes)
++        if (buf.readableBytes() < 2 + 1) return null; // Need manufacturer + '*' delimiter
++        String manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
++        if (buf.readByte() != '*') return null; // Ensure '*' delimiter follows manufacturer
++
++        // 2. ID (variable length until '*')
++        int idEndIndex = buf.indexOf(buf.readerIndex(), endSearchIndex, (byte) '*');
++        if (idEndIndex < 0) return null; // No '*' delimiter after ID
++        String id = buf.readSlice(idEndIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++        buf.readerIndex(idEndIndex + 1); // Position reader after ID and '*'
++
++        // Retrieve device session early
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, id);
+         if (deviceSession == null) {
+-            return null;
++            return null; // Cannot process without a session
+         }
+ 
+-        buf.skipBytes(1); // '*' delimiter
++        // 3. Optional Index / Length / Payload Structure Determination
++        // Count remaining '*' delimiters before the final ']'
++        int starCount = 0;
++        int currentSearchIndex = buf.readerIndex();
++        while (currentSearchIndex < endSearchIndex) {
++            int starIndex = buf.indexOf(currentSearchIndex, endSearchIndex, (byte) '*');
++            if (starIndex < 0) {
++                break;
++            }
++            starCount++;
++            currentSearchIndex = starIndex + 1;
++        }
+ 
+         String index = null;
+-        int contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        if (contentIndex + 5 < buf.writerIndex() && buf.getByte(contentIndex + 5) == '*'
+-                && buf.toString(contentIndex + 1, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
+-            int indexLength = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*') - buf.readerIndex();
++        boolean hasIndex; // Track if index was present and parsed
++
++        // Parse based on delimiter count
++        if (starCount == 2) { // Format: [manufacturer*id*index*length*payload]
+             hasIndex = true;
+-            index = buf.readSlice(indexLength).toString(StandardCharsets.US_ASCII);
+-            buf.skipBytes(1); // '*' delimiter
++            int indexEndIndex = buf.indexOf(buf.readerIndex(), endSearchIndex, (byte) '*');
++            if (indexEndIndex < 0) return null; // Should be found based on starCount
++            index = buf.readSlice(indexEndIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++            buf.readerIndex(indexEndIndex + 1); // Position after index and '*'
++
++            // Skip length (4 bytes assumed) and final '*' before payload
++            if (buf.readableBytes() < 4 + 1) return null; // Need length field + '*' delimiter
++            buf.skipBytes(4); // Skip length field
++            if (buf.readByte() != '*') return null; // Ensure '*' delimiter follows length
++
++        } else if (starCount == 1) { // Format: [manufacturer*id*length*payload]
++            hasIndex = false; // Explicitly set for clarity, though index remains null
++            index = null;
++            // Skip length (4 bytes assumed) and final '*' before payload
++            if (buf.readableBytes() < 4 + 1) return null; // Need length field + '*' delimiter
++            buf.skipBytes(4); // Skip length field
++            if (buf.readByte() != '*') return null; // Ensure '*' delimiter follows length
++        } else {
++            // Invalid number of '*' delimiters found
++            return null;
+         }
+ 
+-        buf.skipBytes(4); // length
+-        buf.skipBytes(1); // '*' delimiter
++        // Now buf.readerIndex points to the start of the payload
++        // Adjust writerIndex to effectively ignore the final ']' for payload processing
++        buf.writerIndex(endSearchIndex);
+ 
+-        buf.writerIndex(buf.writerIndex() - 1); // ']' ignore ending
++        // 4. Payload Type (string until first ',' or end of payload)
++        int payloadStartIndex = buf.readerIndex();
++        if (!buf.isReadable()) {
++            return null; // No payload present
++        }
+ 
+-        contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-        if (contentIndex < 0) {
+-            contentIndex = buf.writerIndex();
++        int commaIndex = buf.indexOf(payloadStartIndex, buf.writerIndex(), (byte) ',');
++        int typeEndIndex;
++
++        if (commaIndex < 0) {
++            typeEndIndex = buf.writerIndex(); // Type is the whole remaining payload
++        } else {
++            typeEndIndex = commaIndex; // Type is up to the comma
+         }
+ 
+-        String type = buf.readSlice(contentIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++        String type = buf.readSlice(typeEndIndex - payloadStartIndex).toString(StandardCharsets.US_ASCII);
++        buf.readerIndex(typeEndIndex); // Position reader after the type string
+ 
+-        if (contentIndex < buf.writerIndex()) {
+-            buf.readerIndex(contentIndex + 1);
++        // Move reader index past the comma if it exists, ready for payload data
++        if (commaIndex >= 0) {
++            buf.skipBytes(1); // Skip ','
+         }
+ 
++        // --- Process Payload based on Type ---
++
+         if (type.equals("INIT")) {
+-
+             sendResponse(channel, id, index, "INIT,1");
++            return null;
+ 
+         } else if (type.equals("LK")) {
+-
+             sendResponse(channel, id, index, "LK");
+-
+             if (buf.isReadable()) {
+-                String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+-                if (values.length >= 3) {
++                String payload = buf.toString(StandardCharsets.US_ASCII);
++                String[] values = payload.split(",");
++                if (values.length >= 3) { // Expect steps, ?, battery
+                     Position position = new Position(getProtocolName());
+                     position.setDeviceId(deviceSession.getDeviceId());
+-
+-                    getLastLocation(position, null);
+-
+-                    position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2]));
++                    getLastLocation(position, null); // Use last known location
++                    try {
+                         position.set(Position.KEY_STEPS, Integer.parseInt(values[0]));
+-
++                        position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2]));
++                    } catch (NumberFormatException e) {
++                        // Ignore parsing errors for LK optional data
++                    }
+                     return position;
+                 }
+             }
++            return null; // No position if LK payload is missing/invalid or unreadable
+ 
+         } else if (type.startsWith("UD") || type.startsWith("AL") || type.startsWith("WT")) {
+-
+-            Position position = decodePosition(deviceSession, buf.toString(StandardCharsets.US_ASCII));
++            String payload = buf.toString(StandardCharsets.US_ASCII); // Pass remaining buffer as string
++            Position position = decodePosition(deviceSession, payload);
+ 
+             if (type.startsWith("AL")) {
+                 if (position != null) {
++                    // Consider decoding specific alarm types from payload if needed
+                     position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+                 }
+-                sendResponse(channel, id, index, "AL");
++                sendResponse(channel, id, index, "AL"); // Send response even if position is null/failed decoding
+             }
+-
+             return position;
+ 
+         } else if (type.equals("TKQ") || type.equals("TKQ2")) {
+-
+             sendResponse(channel, id, index, type);
++            return null;
+ 
+         } else if (type.equalsIgnoreCase("PULSE")
+                 || type.equalsIgnoreCase("HEART")
+                 || type.equalsIgnoreCase("BLOOD")
+                 || type.equalsIgnoreCase("BPHRT")
+                 || type.equalsIgnoreCase("btemp2")) {
+ 
+             if (buf.isReadable()) {
+-
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
++                getLastLocation(position, new Date()); // Use current time for health data
+ 
+-                getLastLocation(position, new Date());
+-
+-                String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
++                String payload = buf.toString(StandardCharsets.US_ASCII);
++                String[] values = payload.split(",");
+                 int valueIndex = 0;
+ 
++                try {
+                     if (type.equalsIgnoreCase("btemp2")) {
+-                    if (Integer.parseInt(values[valueIndex++]) > 0) {
++                        if (values.length > valueIndex + 1 && Integer.parseInt(values[valueIndex++]) > 0) {
+                             position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[valueIndex]));
+                         }
+                     } else {
+                         if (type.equalsIgnoreCase("BPHRT") || type.equalsIgnoreCase("BLOOD")) {
++                            if (values.length > valueIndex + 1) {
+                                 position.set("pressureHigh", values[valueIndex++]);
+                                 position.set("pressureLow", values[valueIndex++]);
+                             }
+-                    if (valueIndex <= values.length - 1) {
++                        }
++                        if (valueIndex < values.length) { // Check index bounds
+                             position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex]));
+                         }
+                     }
+-
+-                return position;
+-
++                    if (!position.getAttributes().isEmpty()) {
++                        return position; // Return only if data was successfully parsed
+                     }
++                } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
++                    // Log error parsing health data? Ignore for now.
++                }
++            }
++            return null;
+ 
+         } else if (type.equals("img")) {
+-
++            // Assuming image data is the rest of the buffer after "img,"
++            if (buf.isReadable()) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+-
+-            getLastLocation(position, null);
+-
+-            int timeIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-            buf.readerIndex(timeIndex + 12 + 2);
++                getLastLocation(position, null); // Use last known location
+                 position.set(Position.KEY_IMAGE, writeMediaFile(id, buf, "jpg"));
+-
+                 return position;
++            }
++            return null;
+ 
+         } else if (type.equals("JXTK")) {
++            // Payload: meta_0,meta_1,current_chunk,total_chunks,audio_data...
+ 
+-            int dataIndex = BufferUtil.indexOf(buf, buf.readerIndex(), buf.writerIndex(), (byte) ',', 4) + 1;
+-            String[] values = buf.readCharSequence(
+-                    dataIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString().split(",");
++            int jxtkPayloadStart = buf.readerIndex();
++            int comma1 = buf.indexOf(jxtkPayloadStart, buf.writerIndex(), (byte) ',');
++            if (comma1 < 0) return null;
++            int comma2 = buf.indexOf(comma1 + 1, buf.writerIndex(), (byte) ',');
++            if (comma2 < 0) return null;
++            int comma3 = buf.indexOf(comma2 + 1, buf.writerIndex(), (byte) ',');
++            if (comma3 < 0) return null;
++            int comma4 = buf.indexOf(comma3 + 1, buf.writerIndex(), (byte) ','); // Comma after total_chunks
++            if (comma4 < 0) return null;
+ 
+-            int current = Integer.parseInt(values[2]);
+-            int total = Integer.parseInt(values[3]);
++            String metadata = buf.toString(jxtkPayloadStart, comma4 - jxtkPayloadStart, StandardCharsets.US_ASCII);
++            String[] values = metadata.split(",");
++            if (values.length < 4) return null; // Expect at least 4 parts in metadata
+ 
++            int current;
++            int total;
++            try {
++                current = Integer.parseInt(values[2]);
++                total = Integer.parseInt(values[3]);
++            } catch (NumberFormatException e) {
++                return null; // Failed to parse chunk numbers
++            }
++
++            // Position reader at the start of audio data
++            buf.readerIndex(comma4 + 1);
++
++            // Use session attribute for audio buffer accumulation (key assumed to be "audioBuffer")
++            ByteBuf audio = (ByteBuf) deviceSession.get("audioBuffer");
+             if (audio == null) {
+                 audio = Unpooled.buffer();
++                deviceSession.set("audioBuffer", audio);
+             }
++
++            // Append current audio chunk data (rest of the buffer)
+             audio.writeBytes(buf);
+ 
+             sendResponse(channel, id, index, "JXTKR,1");
+ 
+             if (current < total) {
++                // More chunks coming, buffer is stored in session
+                 return null;
+             } else {
++                // Last chunk received
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+-                getLastLocation(position, null);
++                getLastLocation(position, null); // Use last known location
++
+                 position.set(Position.KEY_AUDIO, writeMediaFile(id, audio, "amr"));
++
++                // Clean up session buffer
+                 audio.release();
+-                audio = null;
++                deviceSession.set("audioBuffer", null);
++
+                 return position;
+             }
+ 
+         } else if (type.equals("TK")) {
+-
+-            if (buf.readableBytes() == 1) {
+-                return null;
+-            }
+-
++            // Assuming TK payload is raw audio data
++            if (buf.isReadable()) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+-
+                 getLastLocation(position, null);
+-
+-            position.set(Position.KEY_AUDIO, writeMediaFile(id, buf, "amr"));
+-
++                position.set(Position.KEY_AUDIO, writeMediaFile(id, buf, "amr")); // Pass remaining buffer
+                 return position;
+-
++            }
++            return null;
+         }
+ 
++        // Unknown type or case not handled
+         return null;
+     }
+\ No newline at end of file

@@ -1,0 +1,169 @@
+diff --git a/tmp/4b18d869-1428-4cb0-b483-3cfc87b93c0d_buggy.java b/tmp/a50aaaf5-0c6a-4b2e-b766-ddb0a5020368_fixed.java
+index c6164f1..7d566f0 100644
+--- a/tmp/4b18d869-1428-4cb0-b483-3cfc87b93c0d_buggy.java
++++ b/tmp/a50aaaf5-0c6a-4b2e-b766-ddb0a5020368_fixed.java
+@@ -1,116 +1,158 @@
+     private Position decodePosition(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         int status = buf.readUnsignedShort();
+ 
+         position.setValid(BitUtil.check(status, 15));
+ 
+         position.set(Position.KEY_STATUS, status);
+         position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+         int event = buf.readUnsignedShort();
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, event);
+ 
+         String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
+         DateBuilder dateBuilder = new DateBuilder()
+                 .setYear(Integer.parseInt(time.substring(0, 2)))
+                 .setMonth(Integer.parseInt(time.substring(2, 4)))
+                 .setDay(Integer.parseInt(time.substring(4, 6)))
+                 .setHour(Integer.parseInt(time.substring(6, 8)))
+                 .setMinute(Integer.parseInt(time.substring(8, 10)))
+                 .setSecond(Integer.parseInt(time.substring(10, 12)));
+         position.setTime(dateBuilder.getDate());
+ 
+         position.setLongitude(buf.readInt() * 0.00001);
+         position.setLatitude(buf.readInt() * 0.00001);
+ 
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+         position.setCourse(buf.readUnsignedShort());
+         position.setAltitude(buf.readUnsignedShort());
+ 
+         position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
+ 
+         Network network = new Network();
+ 
++        // Original loop required > 4 bytes (at least 5) to read subtype, length, and potentially start reading value
+         while (buf.readableBytes() > 4) {
+             int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
++            int totalLength = buf.readUnsignedShort(); // Total length including subtype and length fields
++            int length = totalLength - 4; // Calculate length of the value part
++
++            // Check for invalid length (negative) or if buffer has insufficient data for the declared length
++            if (length < 0 || buf.readableBytes() < length) {
++                // Invalid TLV structure or truncated data, stop processing further TLVs
++                break;
++            }
++
++            // Now 'length' is non-negative and buffer has at least 'length' readable bytes.
+             switch (subtype) {
+                 case 0x0001:
++                    // This case reads a fixed number of bytes (17). It doesn't use 'length'.
++                    // We should ensure we don't read past the end of the buffer,
++                    // but the check 'buf.readableBytes() < length' above should ideally prevent this
++                    // if the protocol guarantees length matches the fixed size.
++                    // Reading fixed size regardless of 'length':
+                     int coolantTemperature = buf.readUnsignedByte() - 40;
+                     if (coolantTemperature <= 215) {
+                         position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                     }
+                     int rpm = buf.readUnsignedShort();
+                     if (rpm <= 65535) {
+                         position.set(Position.KEY_RPM, rpm);
+                     }
+                     position.set("averageSpeed", buf.readUnsignedByte());
+                     buf.readUnsignedShort(); // interval fuel consumption
+                     position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
+                     position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+                     buf.readUnsignedInt(); // trip id
++                    // If length != 17, the buffer pointer might be incorrect for the next iteration.
++                    // However, modifying this requires assumptions not derived from the bug report.
+                     break;
+                 case 0x0005:
++                    // Reads a fixed number of bytes (6).
+                     position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                     position.set(Position.KEY_HDOP, buf.readUnsignedByte());
+                     buf.readUnsignedInt(); // run time
+                     break;
+                 case 0x0009:
++                    // Uses 'length', which is now guaranteed non-negative and readable.
+                     position.set(
+                             Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
+                     break;
+                 case 0x0011:
++                    // Reads a fixed number of bytes (4).
+                     position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
+                     break;
+                 case 0x0014:
++                     // Reads a fixed number of bytes (6).
+                     position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
+                     position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+                     position.set("airTemp", buf.readUnsignedByte() - 40);
+                     position.set("airFlow", buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
+                     break;
+                 case 0x0020:
+-                    String[] cells = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                    // Uses 'length', which is now guaranteed non-negative and readable.
++                    try {
++                        String cellString = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
++                        String[] cells = cellString.split("\\+");
+                         for (String cell : cells) {
++                            if (cell.isEmpty()) {
++                                continue;
++                            }
+                             String[] values = cell.split("@");
++                            if (values.length == 4) {
+                                 network.addCellTower(CellTower.from(
+                                         Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                         Integer.parseInt(values[2], 16), Integer.parseInt(values[3], 16)));
+                             }
++                        }
++                    } catch (RuntimeException e) {
++                        // Ignore errors parsing potentially malformed data
++                    }
+                     break;
+                 case 0x0021:
+-                    String[] points = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                     // Uses 'length', which is now guaranteed non-negative and readable.
++                    try {
++                        String wifiString = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
++                        String[] points = wifiString.split("\\+");
+                         for (String point : points) {
++                            if (point.isEmpty()) {
++                                continue;
++                            }
+                             String[] values = point.split("@");
++                            if (values.length == 2) {
+                                 network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
+                             }
++                        }
++                    } catch (RuntimeException e) {
++                        // Ignore errors parsing potentially malformed data
++                    }
+                     break;
+                 default:
++                     // Uses 'length', which is now guaranteed non-negative and readable.
+                     buf.skipBytes(length);
+                     break;
+             }
+         }
+ 
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+         sendResponse(channel, MSG_POSITION_RSP, index, null);
+ 
+         return position;
+     }
+\ No newline at end of file

@@ -1,0 +1,213 @@
+diff --git a/tmp/7cfb2581-0bc4-4ab5-9e9a-f28c726a868e_buggy.java b/tmp/6a257a65-a659-43f8-90c1-db7c504b2245_fixed.java
+index c6164f1..927a5d5 100644
+--- a/tmp/7cfb2581-0bc4-4ab5-9e9a-f28c726a868e_buggy.java
++++ b/tmp/6a257a65-a659-43f8-90c1-db7c504b2245_fixed.java
+@@ -1,116 +1,176 @@
+     private Position decodePosition(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         int status = buf.readUnsignedShort();
+ 
+         position.setValid(BitUtil.check(status, 15));
+ 
+         position.set(Position.KEY_STATUS, status);
+         position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+         int event = buf.readUnsignedShort();
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, event);
+ 
+         String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
+         DateBuilder dateBuilder = new DateBuilder()
+                 .setYear(Integer.parseInt(time.substring(0, 2)))
+                 .setMonth(Integer.parseInt(time.substring(2, 4)))
+                 .setDay(Integer.parseInt(time.substring(4, 6)))
+                 .setHour(Integer.parseInt(time.substring(6, 8)))
+                 .setMinute(Integer.parseInt(time.substring(8, 10)))
+                 .setSecond(Integer.parseInt(time.substring(10, 12)));
+         position.setTime(dateBuilder.getDate());
+ 
+         position.setLongitude(buf.readInt() * 0.00001);
+         position.setLatitude(buf.readInt() * 0.00001);
+ 
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+         position.setCourse(buf.readUnsignedShort());
+         position.setAltitude(buf.readUnsignedShort());
+ 
+         position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
+ 
+         Network network = new Network();
+ 
+-        while (buf.readableBytes() > 4) {
++        // Process subtypes. Each subtype block starts with subtype (2 bytes) and length (2 bytes).
++        // The length field includes the size of the subtype and length fields themselves.
++        while (buf.readableBytes() >= 4) { // Need at least 4 bytes for subtype and length
+             int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
++            int originalLength = buf.readUnsignedShort(); // Total length of this block
++
++            // Validate the length field. Minimum possible length is 4 (subtype + length).
++            if (originalLength < 4) {
++                // Invalid length field value, indicates data corruption or protocol mismatch.
++                // Stop processing further subtype blocks for this message.
++                // Consider logging this event.
++                // Log.warn("Invalid subtype block length: " + originalLength + " for subtype " + subtype);
++                break;
++            }
++
++            int dataLength = originalLength - 4; // Length of the data payload following the header
++
++            // Check if the buffer contains enough readable bytes for the declared data length.
++            if (buf.readableBytes() < dataLength) {
++                // Buffer underflow: not enough bytes remain as declared by the length field.
++                // Stop processing further subtype blocks.
++                // Consider logging this event.
++                // Log.warn("Buffer underflow for subtype " + subtype + ". Declared data length: " + dataLength
++                //         + ", available: " + buf.readableBytes());
++                break;
++            }
++
++            // Create a slice of the buffer containing only the data for the current subtype.
++            // This prevents reading beyond the intended block in the switch cases.
++            ByteBuf dataBuf = buf.readSlice(dataLength);
++
+             switch (subtype) {
+                 case 0x0001:
+-                    int coolantTemperature = buf.readUnsignedByte() - 40;
++                    // Ensure the data slice has the minimum expected bytes for this subtype
++                    if (dataBuf.readableBytes() >= 13) {
++                        int coolantTemperature = dataBuf.readUnsignedByte() - 40;
+                         if (coolantTemperature <= 215) {
+                             position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                         }
+-                    int rpm = buf.readUnsignedShort();
+-                    if (rpm <= 65535) {
++                        int rpm = dataBuf.readUnsignedShort();
++                        // Check "rpm <= 65535" is redundant for unsigned short
+                         position.set(Position.KEY_RPM, rpm);
++                        position.set("averageSpeed", dataBuf.readUnsignedByte());
++                        dataBuf.readUnsignedShort(); // interval fuel consumption
++                        position.set(Position.KEY_FUEL_CONSUMPTION, dataBuf.readUnsignedShort() * 0.01);
++                        position.set(Position.KEY_ODOMETER_TRIP, dataBuf.readUnsignedShort());
++                        position.set(Position.KEY_POWER, dataBuf.readUnsignedShort() * 0.01);
++                        position.set(Position.KEY_FUEL_LEVEL, dataBuf.readUnsignedByte() * 0.4);
++                        dataBuf.readUnsignedInt(); // trip id
+                     }
+-                    position.set("averageSpeed", buf.readUnsignedByte());
+-                    buf.readUnsignedShort(); // interval fuel consumption
+-                    position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+-                    position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
+-                    position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+-                    position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+-                    buf.readUnsignedInt(); // trip id
++                    // Any remaining bytes in dataBuf are automatically skipped as we move to the next subtype
+                     break;
+                 case 0x0005:
+-                    position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+-                    position.set(Position.KEY_HDOP, buf.readUnsignedByte());
+-                    buf.readUnsignedInt(); // run time
++                    if (dataBuf.readableBytes() >= 6) {
++                        position.set(Position.KEY_RSSI, dataBuf.readUnsignedByte());
++                        position.set(Position.KEY_HDOP, dataBuf.readUnsignedByte());
++                        dataBuf.readUnsignedInt(); // run time
++                    }
+                     break;
+-                case 0x0009:
++                case 0x0009: // VIN
++                    // Check length before reading sequence
++                    if (dataLength > 0) {
+                         position.set(
+-                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
++                                Position.KEY_VIN, dataBuf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString());
++                    }
+                     break;
+-                case 0x0011:
+-                    position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
++                case 0x0011: // Hours
++                     if (dataBuf.readableBytes() >= 4) {
++                         position.set(Position.KEY_HOURS, dataBuf.readUnsignedInt() * 0.05);
++                     }
+                     break;
+                 case 0x0014:
+-                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
+-                    position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+-                    position.set("airTemp", buf.readUnsignedByte() - 40);
+-                    position.set("airFlow", buf.readUnsignedShort() * 0.01);
+-                    position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
++                     if (dataBuf.readableBytes() >= 7) {
++                         position.set(Position.KEY_ENGINE_LOAD, dataBuf.readUnsignedByte() / 255.0);
++                         position.set("timingAdvance", dataBuf.readUnsignedByte() * 0.5);
++                         position.set("airTemp", dataBuf.readUnsignedByte() - 40);
++                         position.set("airFlow", dataBuf.readUnsignedShort() * 0.01);
++                         position.set(Position.KEY_THROTTLE, dataBuf.readUnsignedByte() / 255.0);
++                     }
+                      break;
+-                case 0x0020:
+-                    String[] cells = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                case 0x0020: // Cell Towers
++                    if (dataLength > 0) {
++                        String cellsText = dataBuf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
++                        String[] cells = cellsText.split("\\+");
+                         for (String cell : cells) {
+                             String[] values = cell.split("@");
++                            if (values.length == 4) {
++                                try {
+                                     network.addCellTower(CellTower.from(
+                                             Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                             Integer.parseInt(values[2], 16), Integer.parseInt(values[3], 16)));
++                                } catch (NumberFormatException | IndexOutOfBoundsException e) {
++                                    // Log or ignore parsing errors for robust handling
++                                }
++                            }
++                        }
+                     }
+                     break;
+-                case 0x0021:
+-                    String[] points = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                case 0x0021: // WiFi Points
++                    if (dataLength > 0) {
++                        String pointsText = dataBuf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
++                        String[] points = pointsText.split("\\+");
+                         for (String point : points) {
+                             String[] values = point.split("@");
++                            if (values.length == 2) {
++                                 try {
+                                      network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
++                                 } catch (NumberFormatException | IndexOutOfBoundsException e) {
++                                    // Log or ignore parsing errors
++                                 }
++                            }
++                        }
+                     }
+                     break;
+                 default:
+-                    buf.skipBytes(length);
++                    // Unknown subtype, data is automatically skipped because we used readSlice.
++                    // No need for dataBuf.skipBytes(dataLength) or buf.skipBytes(dataLength).
+                     break;
+             }
++            // The reader index of the main buffer 'buf' has already been advanced by originalLength (4 + dataLength)
++            // due to reading subtype, length, and the readSlice operation.
+         }
+ 
++        // Check if we have collected any network info before setting it
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+         sendResponse(channel, MSG_POSITION_RSP, index, null);
+ 
+         return position;
+     }
+\ No newline at end of file

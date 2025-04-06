@@ -1,0 +1,260 @@
+diff --git a/tmp/9ecb2b12-4627-4239-8de9-3d1f11650006_buggy.java b/tmp/98843de8-1982-4bc6-a7dd-f142b90f16f6_fixed.java
+index 39bd733..7c11bcb 100644
+--- a/tmp/9ecb2b12-4627-4239-8de9-3d1f11650006_buggy.java
++++ b/tmp/98843de8-1982-4bc6-a7dd-f142b90f16f6_fixed.java
+@@ -1,193 +1,228 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+         buf.readUnsignedByte(); // header
+         int flags = buf.readUnsignedByte();
+         buf.readUnsignedShortLE(); // length
+         buf.readUnsignedShortLE(); // checksum
+         int index = buf.readUnsignedShortLE();
+         int type = buf.readUnsignedByte();
+ 
+         if (BitUtil.check(flags, 4)) {
+             sendResponse(channel, remoteAddress, index, type, buf);
+         }
+ 
+         if (type == MSG_DATA) {
+ 
+             List<Position> positions = new LinkedList<>();
+             Set<Integer> keys = new HashSet<>();
+             boolean hasLocation = false;
+             Position position = new Position(getProtocolName());
+ 
++            // DeviceSession might be identified later via key 0x01
+             DeviceSession deviceSession = null;
+ 
+             while (buf.isReadable()) {
+                 int endIndex = buf.readUnsignedByte() + buf.readerIndex();
+                 int key = buf.readUnsignedByte();
+ 
+                 if (keys.contains(key)) {
++                    // Record boundary detected. Finalize and add the previous position.
+                     if (!hasLocation) {
+-                        getLastLocation(position, null);
++                        // Attempt to get last location if current record lacks it.
++                        // This requires a deviceSession to be meaningful.
++                        getLastLocation(position, null); // Replicates original logic
+                     }
+-                    positions.add(position);
++                    // Set deviceId before adding if known at this point
++                    if (deviceSession != null) {
++                        position.setDeviceId(deviceSession.getDeviceId());
++                    }
++                    positions.add(position); // Add the completed position
++
++                    // Reset for the next position record
+                     keys.clear();
+                     hasLocation = false;
+                     position = new Position(getProtocolName());
++                    // Pre-set deviceId on new position if session already known
++                    if (deviceSession != null) {
++                        position.setDeviceId(deviceSession.getDeviceId());
++                    }
+                 }
+                 keys.add(key);
+ 
+                 switch (key) {
+-                    case 0x01:
++                    case 0x01: // IMEI
++                        // Identify device session using IMEI
+                         deviceSession = getDeviceSession(
+                                 channel, remoteAddress, buf.readCharSequence(15, StandardCharsets.US_ASCII).toString());
+-
++                        // If session exists, set deviceId on the current position object
++                        if (deviceSession != null) {
+                             position.setDeviceId(deviceSession.getDeviceId());
++                        }
+                         break;
+-                    case 0x02:
++                    case 0x02: // Alarm
+                         long alarm = buf.readUnsignedIntLE();
+                         position.set(Position.KEY_ALARM, decodeAlarm(alarm));
+                         if (BitUtil.check(alarm, 31)) {
+                             position.set("bark", true);
+                         }
+                         break;
+-                    case 0x14:
++                    case 0x14: // Battery
+                         position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+                         position.set(Position.KEY_BATTERY, buf.readUnsignedShortLE() * 0.001);
+                         break;
+-                    case 0x20:
++                    case 0x20: // GPS Location
+                         hasLocation = true;
+                         position.setLatitude(buf.readIntLE() * 0.0000001);
+                         position.setLongitude(buf.readIntLE() * 0.0000001);
+                         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShortLE()));
+                         position.setCourse(buf.readUnsignedShortLE());
+                         position.setAltitude(buf.readShortLE());
+                         int hdop = buf.readUnsignedShortLE();
+                         position.setValid(hdop > 0);
+                         position.set(Position.KEY_HDOP, hdop * 0.1);
+                         position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
+                         position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+                         break;
+-                    case 0x21:
++                    case 0x21: // Cell Tower
+                         int mcc = buf.readUnsignedShortLE();
+                         int mnc = buf.readUnsignedByte();
+                         if (position.getNetwork() == null) {
+                             position.setNetwork(new Network());
+                         }
+                         while (buf.readerIndex() < endIndex) {
+                             int rssi = buf.readByte();
+                             position.getNetwork().addCellTower(CellTower.from(
+                                     mcc, mnc, buf.readUnsignedShortLE(), buf.readUnsignedShortLE(), rssi));
+                         }
+                         break;
+-                    case 0x22:
++                    case 0x22: // WiFi AP
+                         if (position.getNetwork() == null) {
+                             position.setNetwork(new Network());
+                         }
+                         while (buf.readerIndex() < endIndex) {
+                             int rssi = buf.readByte();
+                             String mac = ByteBufUtil.hexDump(buf.readSlice(6)).replaceAll("(..)", "$1:");
+                             position.getNetwork().addWifiAccessPoint(WifiAccessPoint.from(
+                                     mac.substring(0, mac.length() - 1), rssi));
+                         }
+                         break;
+-                    case 0x23:
++                    case 0x23: // Tag Location
+                         position.set("tagId", readTagId(buf));
+                         position.setLatitude(buf.readIntLE() * 0.0000001);
+                         position.setLongitude(buf.readIntLE() * 0.0000001);
+                         position.setValid(true);
+                         hasLocation = true;
+                         break;
+-                    case 0x24:
++                    case 0x24: // Timestamp and Status
+                         position.setTime(new Date(buf.readUnsignedIntLE() * 1000));
+                         long status = buf.readUnsignedIntLE();
+                         if (BitUtil.check(status, 4)) {
+                             position.set(Position.KEY_CHARGE, true);
+                         }
+                         if (BitUtil.check(status, 7)) {
+                             position.set(Position.KEY_ARCHIVE, true);
+                         }
+                         position.set(Position.KEY_MOTION, BitUtil.check(status, 9));
+                         position.set(Position.KEY_RSSI, BitUtil.between(status, 19, 24));
+                         position.set(Position.KEY_BATTERY_LEVEL, BitUtil.from(status, 24));
+                         position.set(Position.KEY_STATUS, status);
+                         break;
+-                    case 0x28:
++                    case 0x28: // Beacon Info
+                         int beaconFlags = buf.readUnsignedByte();
+                         position.set("tagId", readTagId(buf));
+                         position.set("tagRssi", (int) buf.readByte());
+                         position.set("tag1mRssi", (int) buf.readByte());
+                         if (BitUtil.check(beaconFlags, 7)) {
+                             position.setLatitude(buf.readIntLE() * 0.0000001);
+                             position.setLongitude(buf.readIntLE() * 0.0000001);
+                             position.setValid(true);
+                             hasLocation = true;
+                         }
+                         if (BitUtil.check(beaconFlags, 6)) {
++                            int descriptionLength = endIndex - buf.readerIndex();
++                            if (descriptionLength > 0) {
+                                 position.set("description", buf.readCharSequence(
+-                                    endIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString());
++                                        descriptionLength, StandardCharsets.US_ASCII).toString());
++                            }
+                         }
+                         break;
+-                    case 0x2A:
++                    case 0x2A: // WiFi Location Alt
+                         buf.readUnsignedByte(); // flags
+                         buf.skipBytes(6); // mac
+                         buf.readUnsignedByte(); // rssi
+                         position.setLatitude(buf.readIntLE() * 0.0000001);
+                         position.setLongitude(buf.readIntLE() * 0.0000001);
+                         position.setValid(true);
+                         hasLocation = true;
+                         break;
+-                    case 0x30:
++                    case 0x30: // Steps
+                         buf.readUnsignedIntLE(); // timestamp
+                         position.set(Position.KEY_STEPS, buf.readUnsignedIntLE());
+                         break;
+-                    case 0x31:
++                    case 0x31: // Activity
+                         int i = 1;
+                         while (buf.readerIndex() < endIndex) {
+                             position.set("activity" + i + "Time", buf.readUnsignedIntLE());
+                             position.set("activity" + i, buf.readUnsignedIntLE());
+                             i += 1;
+                         }
+                         break;
+-                    case 0x37:
++                    case 0x37: // Barking
+                         buf.readUnsignedIntLE(); // timestamp
+                         long barking = buf.readUnsignedIntLE();
+                         if (BitUtil.check(barking, 31)) {
+                             position.set("barkStop", true);
+                         }
+                         position.set("barkCount", BitUtil.to(barking, 31));
+                         break;
+-                    case 0x40:
++                    case 0x40: // Heart Rate
+                         buf.readUnsignedIntLE(); // timestamp
+                         int heartRate = buf.readUnsignedByte();
+                         if (heartRate > 1) {
+                             position.set(Position.KEY_HEART_RATE, heartRate);
+                         }
+                         break;
+                     default:
++                         // Unknown key: data will be skipped by buf.readerIndex(endIndex)
+                         break;
+                 }
++                // Ensure reader index is positioned at the end of the current field's data,
++                // regardless of whether the switch case consumed all bytes.
+                 buf.readerIndex(endIndex);
+             }
+ 
++            // Handle the last position object being built
++            if (!keys.isEmpty()) { // Check if any data was put into the last position object
+                 if (!hasLocation) {
++                    // Replicates original logic
+                     getLastLocation(position, null);
+                 }
+-            positions.add(position);
++                 // Set deviceId before adding if known
++                if (deviceSession != null) {
++                    position.setDeviceId(deviceSession.getDeviceId());
++                }
++                positions.add(position); // Add the final position object
++            }
+ 
++            // Post-process the list: If deviceSession was found (possibly late), ensure all positions have the ID.
+             if (deviceSession != null) {
++                long deviceId = deviceSession.getDeviceId();
+                 for (Position p : positions) {
+-                    p.setDeviceId(deviceSession.getDeviceId());
++                    // Set deviceId if it wasn't set previously (e.g., position added before key 0x01)
++                    if (p.getDeviceId() == 0) { // Default deviceId is 0
++                         p.setDeviceId(deviceId);
+                     }
+-            } else {
+-                return null;
+                 }
+-
+-            return positions;
+-
+             }
++            // FIX: Return the list if it's not empty, even if deviceSession is null.
++            // Avoids returning null just because the device hasn't identified itself in this message.
++            return positions.isEmpty() ? null : positions;
++
++        } // End of if (type == MSG_DATA)
+ 
+-        return null;
++        return null; // Return null if type is not MSG_DATA
+     }
+\ No newline at end of file

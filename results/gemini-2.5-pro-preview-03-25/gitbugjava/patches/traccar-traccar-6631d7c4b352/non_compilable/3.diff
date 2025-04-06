@@ -1,0 +1,109 @@
+diff --git a/tmp/20844e82-ae12-4a2f-8409-9d880f60e47a_buggy.java b/tmp/35d735cd-f382-4cfb-9c69-f25755f89733_fixed.java
+index d87dd79..0653c14 100644
+--- a/tmp/20844e82-ae12-4a2f-8409-9d880f60e47a_buggy.java
++++ b/tmp/35d735cd-f382-4cfb-9c69-f25755f89733_fixed.java
+@@ -1,47 +1,85 @@
+     @Override
+     protected Object decode(
+             ChannelHandlerContext ctx, Channel channel, ByteBuf buf) throws Exception {
+ 
+-        int endIndex = -1;
+-        for (int i = buf.writerIndex() - 1; i >= buf.readerIndex(); i--) {
+-            if (buf.getByte(i) == ']') {
+-                endIndex = i + 1;
+-                break;
++        // Find the start '[' bracket, beginning from the current reader index.
++        int startIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '[');
++        if (startIndex == -1) {
++            // No start bracket found in the readable bytes. Wait for more data.
++            return null;
+         }
++
++        // Discard any bytes before the start bracket '['.
++        // This handles potential garbage data between frames or at the beginning.
++        buf.readerIndex(startIndex);
++
++        // Find the end ']' bracket, searching after the start bracket.
++        // Need readerIndex + 1 because the frame must contain at least '[]'.
++        int endIndex = buf.indexOf(buf.readerIndex() + 1, buf.writerIndex(), (byte) ']');
++        if (endIndex == -1) {
++            // Found '[' but not the corresponding ']'. Frame is incomplete. Wait for more data.
++            return null;
+         }
+ 
+-        if (endIndex > 0) {
+-            ByteBuf frame = Unpooled.buffer();
++        // We have identified a complete frame from readerIndex (at '[') to endIndex (at ']').
++        int frameLength = endIndex - buf.readerIndex() + 1;
++        // Allocate buffer for the decoded frame (estimate initial capacity).
++        // Using Unpooled as in the original code. ctx.alloc() might be preferable if ctx is always available.
++        ByteBuf frame = Unpooled.buffer(frameLength);
++
++        // Read and write the opening bracket '['. This also advances the reader index.
++        frame.writeByte(buf.readByte());
++
++        // Process the content bytes between '[' and ']'.
+         while (buf.readerIndex() < endIndex) {
+             byte b1 = buf.readByte();
+-                if (b1 == '}') {
+-                    byte b2 = buf.readByte();
++            if (b1 == '}') { // Check for escape character
++                // Ensure there's a byte following '}' before the end ']'
++                if (buf.readerIndex() >= endIndex) {
++                    frame.release(); // Release partially built frame
++                    // Skip the corrupted frame by advancing reader index past ']'
++                    buf.readerIndex(endIndex + 1);
++                    // Use CorruptedFrameException for framing errors
++                    throw new io.netty.handler.codec.CorruptedFrameException(
++                            "Malformed frame: escape character '}' found immediately before closing bracket ']'");
++                }
++                byte b2 = buf.readByte(); // Read the byte being escaped
+                 switch (b2) {
+                     case 0x01:
+-                            frame.writeByte('}');
++                        frame.writeByte('}'); // 7d 01 -> 7d
+                         break;
+                     case 0x02:
+-                            frame.writeByte('[');
++                        frame.writeByte('['); // 7d 02 -> 5b
+                         break;
+                     case 0x03:
+-                            frame.writeByte(']');
++                        frame.writeByte(']'); // 7d 03 -> 5d
+                         break;
+                     case 0x04:
+-                            frame.writeByte(',');
++                        frame.writeByte(','); // 7d 04 -> 2c
+                         break;
+                     case 0x05:
+-                            frame.writeByte('*');
++                        frame.writeByte('*'); // 7d 05 -> 2a
+                         break;
+                     default:
++                        // Invalid byte sequence after escape character.
++                        frame.release(); // Release partially built frame
++                        // Skip the corrupted frame by advancing reader index past ']'
++                        buf.readerIndex(endIndex + 1);
++                        // Using IllegalArgumentException as in the original code for invalid content
+                         throw new IllegalArgumentException(String.format(
+-                                    "unexpected byte at %d: 0x%02x", buf.readerIndex() - 1, b2));
++                                "Unexpected byte after escape character '}' at index %d: 0x%02x",
++                                buf.readerIndex() - 1, b2));
+                 }
+             } else {
++                // Normal byte, just copy it.
+                 frame.writeByte(b1);
+             }
+         }
++
++        // Read and write the closing bracket ']'.
++        // At this point, readerIndex should be exactly endIndex.
++        frame.writeByte(buf.readByte()); // This reads the byte at endIndex
++
++        // The readerIndex of 'buf' is now at endIndex + 1, correctly positioned after the consumed frame.
+         return frame;
+     }
+\ No newline at end of file
+-
+-        return null;
+-    }

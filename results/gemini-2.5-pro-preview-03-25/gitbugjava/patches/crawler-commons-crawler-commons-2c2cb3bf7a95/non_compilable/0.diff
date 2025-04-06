@@ -1,0 +1,260 @@
+diff --git a/tmp/5b1fc4ad-bca4-488c-9dcd-342dd303144a_buggy.java b/tmp/399ff46a-fb3f-4f01-9d9b-b58c3053effe_fixed.java
+index fd205cf..25980a8 100644
+--- a/tmp/5b1fc4ad-bca4-488c-9dcd-342dd303144a_buggy.java
++++ b/tmp/399ff46a-fb3f-4f01-9d9b-b58c3053effe_fixed.java
+@@ -1,151 +1,244 @@
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++import java.util.Collection;
++import java.util.Locale;
++import java.util.StringTokenizer;
++// Assuming necessary imports for Logger, RobotToken, Directive, ParseState, SimpleRobotRules, RobotRulesMode etc. are present
++
++// Note: The percentEncodePath helper method is included for context, as it's essential for the fix.
++// Ideally, it would be a private static method within the same class as parseContent.
++
++/**
++ * Percent-encodes a path string according to RFC 3986 for robots.txt path matching.
++ * It encodes necessary characters into UTF-8 bytes and then percent-encodes bytes
++ * that are not in the 'unreserved' set or the forward slash '/'.
++ *
++ * @param path The path string to encode.
++ * @return The percent-encoded path string.
++ */
++private static String percentEncodePath(String path) {
++    if (path == null) {
++        return null;
++    }
++    if (path.isEmpty()) {
++        return "";
++    }
++
++    StringBuilder sb = new StringBuilder();
++    // Encode the path using UTF-8 bytes
++    byte[] utf8Bytes = path.getBytes(StandardCharsets.UTF_8);
++
++    for (byte b : utf8Bytes) {
++        int unsignedByte = b & 0xFF;
++        // Check against unreserved characters from RFC 3986 Section 2.3
++        // unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
++        if ((unsignedByte >= 'a' && unsignedByte <= 'z') ||
++            (unsignedByte >= 'A' && unsignedByte <= 'Z') ||
++            (unsignedByte >= '0' && unsignedByte <= '9') ||
++            unsignedByte == '-' || unsignedByte == '.' ||
++            unsignedByte == '_' || unsignedByte == '~') {
++            sb.append((char) unsignedByte);
++        } else if (unsignedByte == '/') {
++            // Do not encode the forward slash, keep it as is for path structure.
++            sb.append('/');
++        } else {
++            // Percent-encode all other bytes.
++            sb.append(String.format("%%%02X", unsignedByte));
++        }
++    }
++    return sb.toString();
++}
++
++
+ private SimpleRobotRules parseContent(String url, byte[] content, String contentType, Collection<String> robotNames, boolean exactUserAgentMatching) {
+ 
+     // If there's nothing there, treat it like we have no restrictions.
+     if ((content == null) || (content.length == 0)) {
+         return new SimpleRobotRules(RobotRulesMode.ALLOW_ALL);
+     }
+ 
+     int bytesLen = content.length;
+     int offset = 0;
+     Charset encoding = StandardCharsets.US_ASCII;
+ 
+     // Check for a UTF-8 BOM at the beginning (EF BB BF)
+     if ((bytesLen >= 3) && (content[0] == (byte) 0xEF) && (content[1] == (byte) 0xBB) && (content[2] == (byte) 0xBF)) {
+         offset = 3;
+         bytesLen -= 3;
+         encoding = StandardCharsets.UTF_8;
+     }
+     // Check for UTF-16LE BOM at the beginning (FF FE)
+     else if ((bytesLen >= 2) && (content[0] == (byte) 0xFF) && (content[1] == (byte) 0xFE)) {
+         offset = 2;
+         bytesLen -= 2;
+         encoding = StandardCharsets.UTF_16LE;
+     }
+     // Check for UTF-16BE BOM at the beginning (FE FF)
+     else if ((bytesLen >= 2) && (content[0] == (byte) 0xFE) && (content[1] == (byte) 0xFF)) {
+         offset = 2;
+         bytesLen -= 2;
+         encoding = StandardCharsets.UTF_16BE;
+     }
+ 
+     String contentAsStr;
+     contentAsStr = new String(content, offset, bytesLen, encoding);
+ 
+     // Decide if we need to do special HTML processing.
+     boolean isHtmlType = ((contentType != null) && contentType.toLowerCase(Locale.ROOT).startsWith("text/html"));
+ 
+     // If it looks like it contains HTML, but doesn't have a user agent
+     // field, then
+     // assume somebody messed up and returned back to us a random HTML page
+     // instead
+     // of a robots.txt file.
+     boolean hasHTML = false;
+     if (isHtmlType || SIMPLE_HTML_PATTERN.matcher(contentAsStr).find()) {
+         if (!USER_AGENT_PATTERN.matcher(contentAsStr).find()) {
+             LOGGER.trace("Found non-robots.txt HTML file: " + url);
+             return new SimpleRobotRules(RobotRulesMode.ALLOW_ALL);
+         } else {
+             // We'll try to strip out HTML tags below.
+             if (isHtmlType) {
+                 LOGGER.debug("HTML content type returned for robots.txt file: " + url);
+             } else {
+                 LOGGER.debug("Found HTML in robots.txt file: " + url);
+             }
+ 
+             hasHTML = true;
+         }
+     }
+ 
+     // Break on anything that might be used as a line ending. Since
+     // tokenizer doesn't return empty tokens, a \r\n sequence still
+     // works since it looks like an empty string between the \r and \n.
+     StringTokenizer lineParser = new StringTokenizer(contentAsStr, "\n\r\u0085\u2028\u2029");
+     ParseState parseState = new ParseState(url, robotNames);
+ 
+     while (lineParser.hasMoreTokens()) {
+         String line = lineParser.nextToken();
+ 
+         // Get rid of HTML markup, in case some brain-dead webmaster has
+         // created an HTML
+         // page for robots.txt. We could do more sophisticated processing
+         // here to better
+         // handle bad HTML, but that's a very tiny percentage of all
+         // robots.txt files.
+         if (hasHTML) {
+             line = line.replaceAll("<[^>]+>", "");
+         }
+ 
+         // trim out comments and whitespace
+         int hashPos = line.indexOf("#");
+         if (hashPos >= 0) {
+             line = line.substring(0, hashPos);
+         }
+ 
+         line = line.trim();
+         if (line.length() == 0) {
+             continue;
+         }
+ 
+         RobotToken token = tokenize(line);
+-            switch (token.getDirective()) {
++        // Use a potentially modified token for handlers that require encoded data.
++        // This assumes RobotToken can be instantiated with new data, e.g., new RobotToken(directive, data).
++        // If RobotToken is immutable without such a constructor, this approach needs adjustment.
++        RobotToken potentiallyModifiedToken = token;
++
++        // RFC 9309 requires path values for Allow/Disallow to be compared after percent-encoding.
++        // We encode the path here before passing it to the handler, storing the canonical form.
++        if (token.getDirective() == Directive.ALLOW || token.getDirective() == Directive.DISALLOW) {
++             String originalPath = token.getData();
++             if (originalPath != null) {
++                 String encodedPath = percentEncodePath(originalPath);
++                 // Assume RobotToken can be created with updated data.
++                 potentiallyModifiedToken = new RobotToken(token.getDirective(), encodedPath);
++             }
++        }
++        // Sitemap URLs should also be handled correctly, potentially involving percent-encoding.
++        // We use Java's URI class for robust handling of full URLs including IDN.
++        else if (token.getDirective() == Directive.SITEMAP) {
++             String sitemapUrlStr = token.getData();
++             if (sitemapUrlStr != null) {
++                 try {
++                     URI sitemapUri = new URI(sitemapUrlStr);
++                     // toASCIIString handles IDN and ensures proper percent-encoding.
++                     String encodedSitemapUrlStr = sitemapUri.toASCIIString();
++                     potentiallyModifiedToken = new RobotToken(token.getDirective(), encodedSitemapUrlStr);
++                 } catch (URISyntaxException e) {
++                     reportWarning(parseState, "Invalid Sitemap URL syntax: {}", sitemapUrlStr);
++                     // Keep original token if invalid; handler might skip or log.
++                     potentiallyModifiedToken = token;
++                 }
++             }
++        }
++
++
++        // Use the potentially modified token for relevant directives in the switch.
++        switch (potentiallyModifiedToken.getDirective()) {
+             case USER_AGENT:
++            // User agent names typically don't require URL encoding. Pass original token.
+             handleUserAgent(parseState, token);
+                 break;
+ 
+             case DISALLOW:
+             parseState.setFinishedAgentFields(true);
+-                handleDisallow(parseState, token);
++            // Pass the token with the percent-encoded path.
++            handleDisallow(parseState, potentiallyModifiedToken);
+                 break;
+ 
+             case ALLOW:
+             parseState.setFinishedAgentFields(true);
+-                handleAllow(parseState, token);
++            // Pass the token with the percent-encoded path.
++            handleAllow(parseState, potentiallyModifiedToken);
+                 break;
+ 
+             case CRAWL_DELAY:
+             parseState.setFinishedAgentFields(true);
++            // Crawl-delay value is numeric, no encoding needed. Pass original token.
+             handleCrawlDelay(parseState, token);
+                 break;
+ 
+             case SITEMAP:
+             parseState.setFinishedAgentFields(true);
+-                handleSitemap(parseState, token);
++            // Pass the potentially modified token with the encoded/validated Sitemap URL.
++            handleSitemap(parseState, potentiallyModifiedToken);
+                 break;
+ 
+-                case HTTP:
++            case HTTP: // Directive not standard; pass original token.
+             parseState.setFinishedAgentFields(true);
+             handleHttp(parseState, token);
+                 break;
+ 
+             case UNKNOWN:
++            // Use the original line for the warning message.
+             reportWarning(parseState, "Unknown directive in robots.txt file: {}", line);
+             parseState.setFinishedAgentFields(true);
+                 break;
+ 
+             case MISSING:
++             // Use the original line for the warning message.
+             reportWarning(parseState, "Unknown line in robots.txt file (size {}): {}", content.length, line);
+             parseState.setFinishedAgentFields(true);
+                 break;
+ 
+             default:
+-                    // All others we just ignore
+-                    // TODO KKr - which of these should be setting
+-                    // finishedAgentFields to true?
+-                    // TODO KKr - handle no-index
+-                    // TODO KKr - handle request-rate and visit-time
++                // All others we just ignore (e.g., Host, NoIndex, Request-Rate, Visit-Time if defined)
++                // Existing TODOs apply. Consider if finishedAgentFields should be set for these.
+                 break;
+         }
+     }
+ 
+     this._numWarningsDuringLastParse.set(parseState._numWarnings);
+     SimpleRobotRules result = parseState.getRobotRules();
+     if (result.getCrawlDelay() > _maxCrawlDelay) {
+         // Some evil sites use a value like 3600 (seconds) for the crawl
+         // delay, which would cause lots of problems for us.
+         LOGGER.debug("Crawl delay exceeds max value - so disallowing all URLs: {}", url);
+         return new SimpleRobotRules(RobotRulesMode.ALLOW_NONE);
+     } else {
+         result.sortRules();
+         return result;
+     }
+ }
+\ No newline at end of file

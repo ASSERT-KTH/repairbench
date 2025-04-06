@@ -1,0 +1,763 @@
+diff --git a/tmp/77ce7cf1-cab6-4c76-8e46-0941bf2286e3_buggy.java b/tmp/117d1e30-2dc3-4a46-b005-64c34243c021_fixed.java
+index 144f6a9..137d92b 100644
+--- a/tmp/77ce7cf1-cab6-4c76-8e46-0941bf2286e3_buggy.java
++++ b/tmp/117d1e30-2dc3-4a46-b005-64c34243c021_fixed.java
+@@ -1,394 +1,640 @@
+     private Object decodeExtended(Channel channel, SocketAddress remoteAddress, ByteBuf buf) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         if (!deviceSession.contains(DeviceSession.KEY_TIMEZONE)) {
+             deviceSession.set(DeviceSession.KEY_TIMEZONE, getTimeZone(deviceSession.getDeviceId()));
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         buf.readUnsignedShort(); // length
+         int type = buf.readUnsignedByte();
+ 
+-        if (type == MSG_STRING_INFO) {
++        if (type == MSG_STRING_INFO) { // 0x15
+ 
+             buf.readUnsignedInt(); // server flag
+             String data;
++            // Check remaining length before reading encoding type and data
++            if (buf.readableBytes() >= 1 + 6) { // encoding byte + end bytes
+                 if (buf.readUnsignedByte() == 1) {
+                     data = buf.readSlice(buf.readableBytes() - 6).toString(StandardCharsets.US_ASCII);
+                 } else {
+                     data = buf.readSlice(buf.readableBytes() - 6).toString(StandardCharsets.UTF_16BE);
+                 }
++            } else {
++                return null; // Not enough data
++            }
++
+ 
+             Parser parser = new Parser(PATTERN_LOCATION, data);
+ 
+             if (parser.matches()) {
+                 position.setValid(true);
+                 position.setLatitude(parser.nextCoordinate(Parser.CoordinateFormat.HEM_DEG));
+                 position.setLongitude(parser.nextCoordinate(Parser.CoordinateFormat.HEM_DEG));
+                 position.setCourse(parser.nextDouble());
+                 position.setSpeed(parser.nextDouble());
+                 position.setTime(parser.nextDateTime(Parser.DateTimeFormat.YMD_HMS));
+             } else {
+                 getLastLocation(position, null);
+                 position.set(Position.KEY_RESULT, data);
+             }
++            // No response needed for string info?
+ 
+             return position;
+ 
+-        } else if (type == MSG_INFO) {
++        } else if (type == MSG_INFO) { // 0x13
+ 
+             int subType = buf.readUnsignedByte();
+ 
+             getLastLocation(position, null);
+ 
+             if (subType == 0x00) {
+-
++                if (buf.readableBytes() >= 2 + 6) {
+                     position.set(Position.PREFIX_ADC + 1, buf.readUnsignedShort() * 0.01);
+                     return position;
+-
++                }
+             } else if (subType == 0x05) {
+-
++                // Date(6) + Flags(1) + End(6) = 13
+                 if (buf.readableBytes() >= 6 + 1 + 6) {
+                     DateBuilder dateBuilder = new DateBuilder((TimeZone) deviceSession.get(DeviceSession.KEY_TIMEZONE))
+                             .setDate(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
+                             .setTime(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte());
+                     position.setDeviceTime(dateBuilder.getDate());
+-                }
+ 
+                     int flags = buf.readUnsignedByte();
+                     position.set(Position.KEY_DOOR, BitUtil.check(flags, 0));
+-                position.set(Position.PREFIX_IO + 1, BitUtil.check(flags, 2));
++                    position.set(Position.PREFIX_IO + 1, BitUtil.check(flags, 2)); // ACC?
+                     return position;
+-
++                }
+             } else if (subType == 0x0a) {
+-
++                // IMEI(8) + IMSI(8) + ICCID(10) + End(6) = 32
++                if (buf.readableBytes() >= 8 + 8 + 10 + 6) {
+                     buf.skipBytes(8); // imei
+                     buf.skipBytes(8); // imsi
+                     position.set(Position.KEY_ICCID, ByteBufUtil.hexDump(buf.readSlice(10)).replaceAll("f", ""));
+                     return position;
+-
++                }
+             } else if (subType == 0x0d) {
+-
+-                if (buf.getByte(buf.readerIndex()) != '!') {
++                // Format: Optional Header(6) + !AIOIL,.... + End(6)
++                if (buf.readableBytes() > 6) { // Check if there's any data before the end bytes
++                    int startIndex = buf.readerIndex();
++                    if (buf.getByte(startIndex) != '!') {
++                        if (buf.readableBytes() >= 6 + 6) { // Header + End bytes
+                             buf.skipBytes(6);
++                            startIndex += 6;
++                        } else {
++                            return null; // Not enough data for header + content + end
+                         }
+-
+-                Parser parser = new Parser(PATTERN_FUEL, buf.toString(
+-                        buf.readerIndex(), buf.readableBytes() - 4 - 2, StandardCharsets.US_ASCII));
++                    }
++                    // Data Length = Total Readable - Start Offset - End Bytes (index, checksum, footer = 6)
++                    int dataLength = buf.readableBytes() - (buf.readerIndex() - startIndex) - 6;
++                    if (dataLength > 0) {
++                        Parser parser = new Parser(PATTERN_FUEL, buf.toString(buf.readerIndex(), dataLength, StandardCharsets.US_ASCII));
+                         if (!parser.matches()) {
+-                    return null;
++                            return null; // Parsing failed
+                         }
+-
+                         position.set(Position.PREFIX_TEMP + 1, parser.nextDouble(0));
+                         position.set(Position.KEY_FUEL_LEVEL, parser.nextDouble(0));
+-
++                        buf.skipBytes(dataLength); // Consume parsed data
+                         return position;
+-
++                    }
++                }
+             } else if (subType == 0x1b) {
+-
++                // Check if enough bytes for end marker
++                if (buf.readableBytes() >= 6) {
+                     if (Character.isLetter(buf.getUnsignedByte(buf.readerIndex()))) {
++                        // Serial String
+                         String data = buf.readCharSequence(buf.readableBytes() - 6, StandardCharsets.US_ASCII).toString();
+                         position.set("serial", data.trim());
+                     } else {
++                        // Driver ID: Header(1) + Type(1) + ID(4) + Checksum(1) + Footer(1) = 8 bytes minimum before end
++                         if (buf.readableBytes() >= 1 + 1 + 4 + 1 + 1 + 6) {
+                             buf.readUnsignedByte(); // header
+                             buf.readUnsignedByte(); // type
+                             position.set(Position.KEY_DRIVER_UNIQUE_ID, ByteBufUtil.hexDump(buf.readSlice(4)));
+                             buf.readUnsignedByte(); // checksum
+                             buf.readUnsignedByte(); // footer
++                        } else {
++                             return null; // Not enough data for Driver ID format
++                        }
+                     }
+                     return position;
+-
+                 }
++            }
++            // If subtype not handled or not enough data, fall through to return null
+ 
+-        } else if (type == MSG_X1_PHOTO_DATA) {
++        } else if (type == MSG_X1_PHOTO_DATA) { // 0xE2
+ 
+             int pictureId = buf.readInt();
+-
+             ByteBuf photo = photos.get(pictureId);
+ 
++            // Check photo exists before proceeding
++            if (photo == null) {
++                 return null; // No photo buffer initialized for this ID
++            }
++
+             buf.readUnsignedInt(); // offset
+-            buf.readBytes(photo, buf.readUnsignedShort());
++            int photoDataLength = buf.readUnsignedShort();
++
++            if (buf.readableBytes() >= photoDataLength + 6) { // Check enough data for photo chunk and end bytes
++                int readable = Math.min(photoDataLength, photo.writableBytes());
++                if (readable > 0) {
++                     buf.readBytes(photo, readable);
++                }
++                // Skip any remaining bytes from this chunk if buffer is full or length mismatch
++                if (photoDataLength > readable) {
++                    buf.skipBytes(photoDataLength - readable);
++                }
+ 
+                 if (photo.writableBytes() > 0) {
+                     sendPhotoRequest(channel, pictureId);
++                    return null; // More data needed, return null (no position update yet)
+                 } else {
++                    getLastLocation(position, null); // Associate photo with last known location/time
+                     position.set(Position.KEY_IMAGE, writeMediaFile(deviceSession.getUniqueId(), photo, "jpg"));
+                     photos.remove(pictureId).release();
++                    // No response needed for data message? Protocol might expect ack separately.
++                    return position; // Return position with image key
+                 }
++            }
++             // Not enough data in buffer, maybe next packet will have it. Return null for now.
+ 
+-        } else if (type == MSG_AZ735_GPS || type == MSG_AZ735_ALARM) {
++        } else if (type == MSG_AZ735_GPS || type == MSG_AZ735_ALARM) { // 0xA2, 0xA4
+ 
+-            if (!decodeGps(position, buf, true, deviceSession.get(DeviceSession.KEY_TIMEZONE))) {
++            if (!decodeGps(position, buf, true, (TimeZone) deviceSession.get(DeviceSession.KEY_TIMEZONE))) {
+                 getLastLocation(position, position.getDeviceTime());
+             }
+ 
+             if (decodeLbs(position, buf, type, true)) {
++                // Check if RSSI byte exists before reading
++                if (buf.readableBytes() >= 1) {
+                      position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                 }
++            }
+ 
+-            buf.skipBytes(buf.readUnsignedByte()); // additional cell towers
+-            buf.skipBytes(buf.readUnsignedByte()); // wifi access point
++            // Skip additional cell towers / wifi APs safely
++            if (buf.readableBytes() >= 1) {
++                buf.skipBytes(Math.min(buf.readUnsignedByte(), buf.readableBytes()));
++            }
++             if (buf.readableBytes() >= 1) {
++                buf.skipBytes(Math.min(buf.readUnsignedByte(), buf.readableBytes()));
++            }
+ 
++            if (buf.readableBytes() >= 1) {
+                  int status = buf.readUnsignedByte();
+                  position.set(Position.KEY_STATUS, status);
+ 
+                  if (type == MSG_AZ735_ALARM) {
+                      switch (status) {
+                          case 0xA0:
+                              position.set(Position.KEY_ARMED, true);
+                              break;
+                          case 0xA1:
+                              position.set(Position.KEY_ARMED, false);
+                              break;
+                          case 0xA2:
+                          case 0xA3:
+                              position.set(Position.KEY_ALARM, Position.ALARM_LOW_BATTERY);
+                              break;
+                          case 0xA4:
+                              position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+                              break;
+                          case 0xA5:
+                              position.set(Position.KEY_ALARM, Position.ALARM_DOOR);
+                              break;
+                          default:
+                              break;
+                      }
+                  }
++             }
+ 
+-            buf.skipBytes(buf.readUnsignedByte()); // reserved extension
++            // Skip reserved extension safely
++            if (buf.readableBytes() >= 1 + 6) { // Need length byte + end bytes
++                 buf.skipBytes(Math.min(buf.readUnsignedByte(), buf.readableBytes() - 6));
++            }
+ 
++            // Check for index before reading
++            if (buf.readableBytes() >= 2) {
+                  sendResponse(channel, true, type, buf.getShort(buf.writerIndex() - 6), null);
++            }
+ 
+             return position;
+ 
+-        } else if (type == MSG_OBD) {
++        } else if (type == MSG_OBD) { // 0x34
+ 
++            // Date(6) + Ignition(1) + ... + End(18) - Variable length
++            if (buf.readableBytes() >= 6 + 1 + 18) {
+                 DateBuilder dateBuilder = new DateBuilder((TimeZone) deviceSession.get(DeviceSession.KEY_TIMEZONE))
+                         .setDate(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
+                         .setTime(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte());
+ 
+                 getLastLocation(position, dateBuilder.getDate());
+ 
+                 position.set(Position.KEY_IGNITION, buf.readUnsignedByte() > 0);
+ 
+-            String data = buf.readCharSequence(buf.readableBytes() - 18, StandardCharsets.US_ASCII).toString();
++                // Data length = total readable - already read (7) - end bytes (18)
++                int dataLength = buf.readableBytes() - 18;
++                if (dataLength > 0) {
++                    String data = buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
+                     for (String pair : data.split(",")) {
+                         String[] values = pair.split("=");
+                         if (values.length >= 2) {
++                            try {
++                                // Replicate logic from MSG_OBD (0x34) handler
+                                 switch (Integer.parseInt(values[0].substring(0, 2), 16)) {
+-                        case 40:
++                                    case 0x40:
+                                         position.set(Position.KEY_ODOMETER, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 43:
++                                    case 0x43:
+                                         position.set(Position.KEY_FUEL_LEVEL, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 45:
++                                    case 0x45:
+                                         position.set(Position.KEY_COOLANT_TEMP, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 53:
++                                    case 0x53:
+                                         position.set(Position.KEY_OBD_SPEED, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 54:
++                                    case 0x54:
+                                         position.set(Position.KEY_RPM, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 71:
++                                    case 0x71:
+                                         position.set(Position.KEY_FUEL_USED, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 73:
++                                    case 0x73:
+                                         position.set(Position.KEY_HOURS, Integer.parseInt(values[1], 16) * 0.01);
+                                         break;
+-                        case 74:
++                                    case 0x74:
+                                         position.set(Position.KEY_VIN, values[1]);
+                                         break;
+                                     default:
+                                         break;
+                                 }
++                            } catch (NumberFormatException | IndexOutOfBoundsException e) {
++                                // Ignore invalid OBD pairs
+                             }
+                         }
+-
++                    }
++                }
++                // No response defined for OBD message? Skip final bytes.
++                buf.skipBytes(18);
+                 return position;
++            }
+ 
+-        } else if (type == MSG_GPS_MODULAR) {
++        } else if (type == MSG_GPS_MODULAR) { // 0x70
+ 
+-            while (buf.readableBytes() > 6) {
++            while (buf.readableBytes() > 6) { // Need 2 for type, 2 for length + minimum 1 data byte + end(6)? No, end bytes are after loop. Just need module header.
++                if (buf.readableBytes() < 4) { // Check enough bytes for module type and length
++                    break;
++                }
+                 int moduleType = buf.readUnsignedShort();
+                 int moduleLength = buf.readUnsignedShort();
+ 
++                if (buf.readableBytes() < moduleLength) {
++                    break; // Not enough data for declared module length
++                }
++
++                ByteBuf moduleSlice = buf.readSlice(moduleLength);
++
+                 switch (moduleType) {
+-                    case 0x03:
+-                        position.set(Position.KEY_ICCID, ByteBufUtil.hexDump(buf.readSlice(10)));
++                    case 0x03: // ICCID
++                        if (moduleLength >= 10) {
++                             // Avoid replacing 'f' as it might be part of valid ICCID
++                            position.set(Position.KEY_ICCID, ByteBufUtil.hexDump(moduleSlice.readSlice(10)));
++                        }
+                         break;
+-                    case 0x09:
+-                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                    case 0x09: // Satellites used
++                        if (moduleLength >= 1) {
++                            position.set(Position.KEY_SATELLITES, moduleSlice.readUnsignedByte());
++                        }
+                         break;
+-                    case 0x0a:
+-                        position.set(Position.KEY_SATELLITES_VISIBLE, buf.readUnsignedByte());
++                    case 0x0a: // Satellites visible
++                        if (moduleLength >= 1) {
++                            position.set(Position.KEY_SATELLITES_VISIBLE, moduleSlice.readUnsignedByte());
++                        }
+                         break;
+-                    case 0x11:
++                    case 0x11: // LBS
++                        if (moduleLength >= 9) { // MCC(2) MNC(2) LAC(2) CID(3) RSSI(1) = 10 bytes? Check CellTower.from params
++                                                 // MCC(ushort), MNC(ushort), LAC(ushort), CID(uint medium), RSSI(ubyte) -> 2+2+2+3+1 = 10 bytes
++                             if (moduleLength >= 10) {
+                                  CellTower cellTower = CellTower.from(
+-                                buf.readUnsignedShort(),
+-                                buf.readUnsignedShort(),
+-                                buf.readUnsignedShort(),
+-                                buf.readUnsignedMedium(),
+-                                buf.readUnsignedByte());
+-                        if (cellTower.getCellId() > 0) {
++                                         moduleSlice.readUnsignedShort(),   // mcc
++                                         moduleSlice.readUnsignedShort(),   // mnc -> This might be wrong, standard MNC is often 1 byte BCD or 3 digits. Check usage. Assuming ushort for now.
++                                         moduleSlice.readUnsignedShort(),   // lac
++                                         moduleSlice.readUnsignedMedium(), // cid
++                                         moduleSlice.readUnsignedByte());  // rssi
++                                 if (cellTower.getCellId() > 0 && cellTower.getMobileCountryCode() != 0) {
+                                      position.setNetwork(new Network(cellTower));
+                                  }
++                             }
++                        }
+                         break;
+-                    case 0x18:
+-                        position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
++                    case 0x18: // Battery Voltage
++                        if (moduleLength >= 2) {
++                            position.set(Position.KEY_BATTERY, moduleSlice.readUnsignedShort() * 0.01);
++                        }
+                         break;
+-                    case 0x28:
+-                        position.set(Position.KEY_HDOP, buf.readUnsignedByte() * 0.1);
++                    case 0x28: // HDOP
++                        if (moduleLength >= 1) {
++                            position.set(Position.KEY_HDOP, moduleSlice.readUnsignedByte() * 0.1);
++                        }
+                         break;
+-                    case 0x29:
+-                        position.set(Position.KEY_INDEX, buf.readUnsignedInt());
++                    case 0x29: // Index / Serial
++                        if (moduleLength >= 4) {
++                            position.set(Position.KEY_INDEX, moduleSlice.readUnsignedInt());
++                        }
+                         break;
+-                    case 0x2a:
+-                        int input = buf.readUnsignedByte();
+-                        position.set(Position.KEY_DOOR, BitUtil.to(input, 4) > 0);
+-                        position.set("tamper", BitUtil.from(input, 4) > 0);
++                    case 0x2a: // Digital Input Status
++                        if (moduleLength >= 1) {
++                            int input = moduleSlice.readUnsignedByte();
++                            // Example interpretation - adjust based on device spec
++                            position.set(Position.KEY_DOOR, BitUtil.check(input, 0)); // Bit 0 for Door
++                            position.set(Position.KEY_IGNITION, BitUtil.check(input, 1)); // Bit 1 for Ignition
++                            position.set("tamper", BitUtil.check(input, 4)); // Bit 4 for Tamper
++                        }
+                         break;
+-                    case 0x2b:
+-                        int event = buf.readUnsignedByte();
++                    case 0x2b: // Event Code
++                        if (moduleLength >= 1) {
++                            int event = moduleSlice.readUnsignedByte();
+                             switch (event) {
+                                 case 0x11:
+                                     position.set(Position.KEY_ALARM, Position.ALARM_LOW_BATTERY);
+                                     break;
+                                 case 0x12:
+                                     position.set(Position.KEY_ALARM, Position.ALARM_LOW_POWER);
+                                     break;
+                                 case 0x13:
+                                     position.set(Position.KEY_ALARM, Position.ALARM_POWER_CUT);
+                                     break;
+                                 case 0x14:
+                                     position.set(Position.KEY_ALARM, Position.ALARM_REMOVING);
+                                     break;
+                                 default:
+                                     break;
+                             }
+                             position.set(Position.KEY_EVENT, event);
++                        }
+                         break;
+-                    case 0x2e:
+-                        position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
++                    case 0x2e: // Odometer
++                        if (moduleLength >= 4) {
++                            position.set(Position.KEY_ODOMETER, moduleSlice.readUnsignedIntLE());
++                        }
+                         break;
+-                    case 0x33:
+-                        position.setTime(new Date(buf.readUnsignedInt() * 1000));
+-                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+-                        position.setAltitude(buf.readShort());
++                    case 0x33: // GPS Data
++                        if (moduleLength >= 18) {
++                            position.setTime(new Date(moduleSlice.readUnsignedInt() * 1000));
++                            position.set(Position.KEY_SATELLITES, moduleSlice.readUnsignedByte());
++                            position.setAltitude(moduleSlice.readShort());
+ 
+-                        double latitude = buf.readUnsignedInt() / 60.0 / 30000.0;
+-                        double longitude = buf.readUnsignedInt() / 60.0 / 30000.0;
+-                        position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedByte()));
++                            double latitude = moduleSlice.readUnsignedInt() / 60.0 / 30000.0;
++                            double longitude = moduleSlice.readUnsignedInt() / 60.0 / 30000.0;
++                            position.setSpeed(UnitsConverter.knotsFromKph(moduleSlice.readUnsignedByte()));
+ 
+-                        int flags = buf.readUnsignedShort();
++                            int flags = moduleSlice.readUnsignedShort();
+                             position.setCourse(BitUtil.to(flags, 10));
+                             position.setValid(BitUtil.check(flags, 12));
+ 
+                             if (!BitUtil.check(flags, 10)) {
+                                 latitude = -latitude;
+                             }
+-                        if (BitUtil.check(flags, 11)) {
++                            if (BitUtil.check(flags, 11)) { // Protocol spec says bit 11 = 1 means East, 0 means West. East is positive.
+                                 longitude = -longitude;
+                             }
+ 
+                             position.setLatitude(latitude);
+                             position.setLongitude(longitude);
++                        }
+                         break;
+-                    case 0x34:
+-                        position.set(Position.KEY_EVENT, buf.readUnsignedByte());
+-                        buf.readUnsignedIntLE(); // time
+-                        buf.skipBytes(buf.readUnsignedByte()); // content
++                    case 0x34: // Event Report with Content
++                        if (moduleLength >= 5) { // Event(1) + Time(4) = 5 minimum before content length byte
++                            position.set(Position.KEY_EVENT, moduleSlice.readUnsignedByte());
++                            long eventTimeSeconds = moduleSlice.readUnsignedIntLE();
++                            // Check if content length byte exists
++                            if (moduleSlice.readableBytes() >= 1) {
++                                int contentLength = moduleSlice.readUnsignedByte();
++                                if (moduleSlice.readableBytes() >= contentLength) {
++                                    // Process or skip content
++                                    moduleSlice.skipBytes(contentLength);
++                                }
++                            }
++                        }
+                         break;
+                     default:
+-                        buf.skipBytes(moduleLength);
+-                        break;
++                        break; // Ignore unknown modules (already skipped by readSlice)
+                 }
++                 // Ensure the entire module slice was consumed if parsing logic didn't
++                 moduleSlice.skipBytes(moduleSlice.readableBytes());
+             }
+ 
+             if (position.getFixTime() == null) {
+                 getLastLocation(position, null);
+             }
+ 
++            // Check for index/serial number before reading it
++            if (buf.readableBytes() >= 2) {
+                 sendResponse(channel, false, MSG_GPS_MODULAR, buf.readUnsignedShort(), null);
++            }
+ 
+             return position;
+ 
+-        } else if (type == MSG_MULTIMEDIA) {
++        } else if (type == MSG_MULTIMEDIA) { // 0x20
+ 
++            // Serial(8) + Timestamp(4) + GPS(12) + Cell(8) + MediaID(4) + MediaLength(4) + Type(1) + Format(1) = 42 bytes minimum before event/index
++            if (buf.readableBytes() < 42 + 1 + 2 + 6) { // Need headers + event(1) + index(2) + end(6)
++                 return null;
++            }
+             buf.skipBytes(8); // serial number
+             long timestamp = buf.readUnsignedInt() * 1000;
+-            buf.skipBytes(4 + 4 + 2 + 1 + 1 + 2); // gps
+-            buf.skipBytes(2 + 2 + 2 + 2); // cell
++            buf.skipBytes(12); // gps
++            buf.skipBytes(8); // cell
+ 
+             int mediaId = buf.readInt();
+             int mediaLength = buf.readInt();
+             int mediaType = buf.readUnsignedByte();
+             int mediaFormat = buf.readUnsignedByte();
+ 
+-            if (mediaType == 0 && mediaFormat == 0) {
++            Position positionForMedia = null; // Create position only if photo is complete
+ 
+-                buf.readUnsignedByte(); // event
++            if (mediaType == 0 && mediaFormat == 0) { // Photo JPEG
++                buf.readUnsignedByte(); // event triggering photo
++                int packetIndex = buf.readUnsignedShort();
++                ByteBuf photo = photos.get(mediaId);
+ 
+-                ByteBuf photo;
+-                if (buf.readUnsignedShort() == 0) {
++                if (packetIndex == 0 && photo != null) {
++                    photos.remove(mediaId).release();
++                    photo = null;
++                }
++                if (photo == null && packetIndex == 0) {
+                     photo = Unpooled.buffer(mediaLength);
+-                    if (photos.containsKey(mediaId)) {
+-                        photos.remove(mediaId).release();
+-                    }
+                     photos.put(mediaId, photo);
+-                } else {
+-                    photo = photos.get(mediaId);
+                 }
+ 
+                 if (photo != null) {
+-                    buf.readBytes(photo, buf.readableBytes() - 3 * 2);
++                    if (buf.readableBytes() >= 6) { // Check enough bytes for data chunk + end(6)
++                        int photoChunkLength = buf.readableBytes() - 6;
++                        if (photoChunkLength > 0) {
++                            int readable = Math.min(photoChunkLength, photo.writableBytes());
++                            buf.readBytes(photo, readable);
++                            buf.skipBytes(photoChunkLength - readable); // Skip extra if any
++                        }
++
+                         if (!photo.isWritable()) {
+-                        position = new Position(getProtocolName());
+-                        position.setDeviceId(deviceSession.getDeviceId());
+-                        getLastLocation(position, new Date(timestamp));
+-                        position.set(Position.KEY_IMAGE, writeMediaFile(deviceSession.getUniqueId(), photo, "jpg"));
++                            positionForMedia = new Position(getProtocolName());
++                            positionForMedia.setDeviceId(deviceSession.getDeviceId());
++                            getLastLocation(positionForMedia, new Date(timestamp));
++                            positionForMedia.set(Position.KEY_IMAGE, writeMediaFile(deviceSession.getUniqueId(), photo, "jpg"));
+                             photos.remove(mediaId).release();
+                         }
+                     }
+-
++                }
+             }
+ 
++            // Always send response? Check protocol spec. Assuming yes.
++            // Check for index before reading
++             if (buf.readableBytes() >= 2) {
+                  sendResponse(channel, true, type, buf.getShort(buf.writerIndex() - 6), null);
++             } else {
++                 // Cannot read index for response
++             }
+ 
+-            return position;
++            return positionForMedia; // Return position only if photo is complete
+ 
+-        } else if (type == MSG_SERIAL) {
++        } else if (type == MSG_SERIAL) { // 0x9B
+ 
+-            position = new Position(getProtocolName());
+-            position.setDeviceId(deviceSession.getDeviceId());
+             getLastLocation(position, null);
+ 
++            // DevType(1) + Data(...) + LineBreak(1?) + End(6)
++            if (buf.readableBytes() < 1 + 6) {
++                return null; // Not enough data
++            }
+             buf.readUnsignedByte(); // external device type code
+-            int length = buf.readableBytes() - 9; // line break + checksum + index + checksum + footer
++            int dataLength = buf.readableBytes() - 6;
+ 
+-            if (length <= 0) {
+-                return null;
+-            } else if (length < 8) {
+-                position.set(
+-                        Position.PREFIX_TEMP + 1,
+-                        Double.parseDouble(buf.readCharSequence(length - 1, StandardCharsets.US_ASCII).toString()));
+-            } else {
++            if (dataLength <= 0) {
++                 return null; // No data
++            }
++
++            // Assuming short messages are temperature, longer ones are RFID/iButton
++            if (dataLength < 8) { // Temperature? e.g., "23.5\n"
++                // Read up to (but not including) the last byte if it might be newline
++                int readLen = dataLength > 1 ? dataLength - 1 : dataLength;
++                String tempStr = buf.readCharSequence(readLen, StandardCharsets.US_ASCII).toString().trim();
++                try {
++                    position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(tempStr));
++                } catch (NumberFormatException e) { /* ignore */ }
++                buf.skipBytes(dataLength - readLen); // Skip the last byte (newline?)
++            } else { // RFID/iButton? e.g., Type(1) + "IDDDDDDD\n"
++                 if (dataLength >= 2) { // Need Type + ID + possible newline
+                      buf.readUnsignedByte(); // card type
+-                position.set(
+-                        Position.KEY_DRIVER_UNIQUE_ID,
+-                        buf.readCharSequence(length - 1, StandardCharsets.US_ASCII).toString());
++                     int readLen = dataLength - 2 > 0 ? dataLength - 2 : 0; // Length excluding type and possible newline
++                     if (readLen > 0) {
++                         String driverId = buf.readCharSequence(readLen, StandardCharsets.US_ASCII).toString().trim();
++                         position.set(Position.KEY_DRIVER_UNIQUE_ID, driverId);
+                      }
++                     buf.skipBytes(dataLength - 1 - readLen); // Skip potential newline
++                 } else {
++                     buf.skipBytes(dataLength); // Skip data if too short for ID format
++                 }
++            }
++
++            return position;
++
++        // ADDED HANDLERS for types seen in tests with 7979 header
++        } else if (type == 0x21) { // Server Message / Response text
+ 
++            getLastLocation(position, null);
++            // Serial(4) + Lang(1) + Message(...) + End(6)
++            if (buf.readableBytes() >= 4 + 1 + 6) {
++                buf.skipBytes(4); // Skip serial number
++                buf.skipBytes(1); // Skip language code
++                String message = buf.readCharSequence(buf.readableBytes() - 6, StandardCharsets.UTF_16BE).toString();
++                position.set(Position.KEY_RESULT, message.trim());
++                sendResponse(channel, true, type, buf.getShort(buf.writerIndex() - 6), null);
+                 return position;
++            }
+ 
++        } else if (type == 0x8C) { // OBD data string
++
++            getLastLocation(position, null);
++            // Serial/Flag(4) + Data(...) + End(6)
++            if (buf.readableBytes() >= 4 + 6) {
++                buf.readUnsignedInt(); // Serial number / server flag
++                String data = buf.readSlice(buf.readableBytes() - 6).toString(StandardCharsets.US_ASCII);
++
++                for (String pair : data.split(",")) {
++                    String[] values = pair.split("=");
++                    if (values.length >= 2) {
++                        try {
++                            switch (Integer.parseInt(values[0].substring(0, 2), 16)) {
++                                case 0x40:
++                                    position.set(Position.KEY_ODOMETER, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x43:
++                                    position.set(Position.KEY_FUEL_LEVEL, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x45:
++                                    position.set(Position.KEY_COOLANT_TEMP, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x53:
++                                    position.set(Position.KEY_OBD_SPEED, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x54:
++                                    position.set(Position.KEY_RPM, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x71:
++                                    position.set(Position.KEY_FUEL_USED, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x73:
++                                    position.set(Position.KEY_HOURS, Integer.parseInt(values[1], 16) * 0.01);
++                                    break;
++                                case 0x74:
++                                    position.set(Position.KEY_VIN, values[1]);
++                                    break;
++                                default:
++                                    break;
++                            }
++                        } catch (NumberFormatException | IndexOutOfBoundsException e) { /* ignore */ }
++                    }
++                }
++                sendResponse(channel, true, type, buf.getShort(buf.writerIndex() - 6), null);
++                return position;
++            }
++
++        } else if (type == MSG_ALARM) { // 0x94, Extended Alarm (LBS/WIFI based)
++
++            // Attempt to decode LBS/WIFI location data first
++            decodeLbs(position, buf, type, true); // hasLength=true for LBS in Alarm messages
++            if (position.getLatitude() == 0 && position.getLongitude() == 0) {
++                 decodeWifi(position, buf); // Try WIFI if LBS failed or not present
++            }
++
++            // Decode Status, Alarm, Language if present before end bytes
++            if (buf.readableBytes() >= 1 + 1 + 1 + 6) { // Status(1)+Alarm(1)+Lang(1)+End(6)
++                 int status = buf.readUnsignedByte();
++                 decodeStatus(position, status);
++                 position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedByte()));
++                 buf.readUnsignedByte(); // language
++            } else {
++                 // Not enough data for status/alarm, rely on LBS/WIFI time if available
++                 getLastLocation(position, position.getFixTime());
++            }
++
++            if (position.getFixTime() == null) {
++                 getLastLocation(position, null); // Fallback if no time found
++            }
++
++            // Check for index before sending response
++            if (buf.readableBytes() >= 2) {
++                 sendResponse(channel, true, type, buf.getShort(buf.writerIndex() - 6), null);
++            }
++            return position;
+         }
+ 
++        // If type is not handled by any block above, return null
+         return null;
+     }
+\ No newline at end of file

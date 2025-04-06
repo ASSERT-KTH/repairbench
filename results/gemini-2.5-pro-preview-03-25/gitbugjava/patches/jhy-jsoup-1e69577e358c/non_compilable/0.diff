@@ -1,0 +1,152 @@
+diff --git a/tmp/6d93b912-389d-4610-923b-ff27cef3f07d_buggy.java b/tmp/00692b75-3f99-4dee-8e35-95c570c479f0_fixed.java
+index c9c77a4..a596028 100644
+--- a/tmp/6d93b912-389d-4610-923b-ff27cef3f07d_buggy.java
++++ b/tmp/00692b75-3f99-4dee-8e35-95c570c479f0_fixed.java
+@@ -1,35 +1,129 @@
+     URL build() {
+         try {
+-            // use the URI class to encode non-ascii in path
+-            URI uri = new URI(
+-                u.getProtocol(),
+-                u.getUserInfo(),
+-                IDN.toASCII(decodePart(u.getHost())), // puny-code
+-                u.getPort(),
+-                decodePart(u.getPath()),
+-                null, null // query and fragment appended later so as not to encode
+-            );
+-
+-            String normUrl = uri.toASCIIString();
+-            if (q != null || u.getRef() != null) {
+-                StringBuilder sb = StringUtil.borrowBuilder().append(normUrl);
+-                if (q != null) {
++            // Strategy: Manually reconstruct the URL string, applying IDN to the host,
++            // and using the raw path from the URI representation to preserve original path encoding.
++            // This avoids the URI multi-argument constructor's re-encoding behavior which can
++            // change valid percent escapes like %2B into different characters like +.
++
++            // Use URI to parse the original URL and access components reliably.
++            // u.toURI() preserves original encoding, especially in the path.
++            URI uri = u.toURI();
++
++            String scheme = uri.getScheme();
++            String userInfo = uri.getRawUserInfo();
++            String host = uri.getHost(); // Decoded host, suitable for IDN.toASCII
++            // Use port from original URL u, as uri.getPort() returns -1 for default ports,
++            // but u.getPort() might contain an explicitly specified default port.
++            int port = u.getPort();
++            String path = uri.getRawPath(); // Raw path with original encoding preserved
++
++            // URI raw path can be null for opaque URIs, or empty. Ensure it's handled.
++            if (path == null) path = "";
++
++            // Apply IDN encoding (Punycode) to the host, null safe
++            String asciiHost = null;
++            if (host != null) {
++                 // IDN.toASCII handles conversion of internationalized domain names.
++                 // It should pass through IP addresses and regular hostnames unchanged.
++                 asciiHost = IDN.toASCII(host);
++            }
++
++            // Build the authority part string for reconstruction
++            String authorityString = null;
++            // Check if authority exists at all in the original URI (could be "" e.g. file:///)
++            if (uri.getRawAuthority() != null) {
++                StringBuilder authoritySb = StringUtil.borrowBuilder();
++                 if (userInfo != null) {
++                     authoritySb.append(userInfo).append('@');
++                 }
++                 if (asciiHost != null) {
++                     // Handle IPv6 literal address format - enclose in brackets if needed
++                     // URI correctly handles IPv6 bracketization in getHost/getAuthority,
++                     // but IDN.toASCII might return a bare IPv6 literal. Check and bracketize.
++                    if (asciiHost.indexOf(':') >= 0 && !asciiHost.startsWith("[") && !asciiHost.endsWith("]")) {
++                        authoritySb.append('[').append(asciiHost).append(']');
++                    } else {
++                        authoritySb.append(asciiHost);
++                    }
++                 }
++                 // Append port only if specified explicitly in the original URL 'u' (port != -1)
++                 if (port != -1) {
++                     authoritySb.append(':').append(port);
++                 }
++                 authorityString = StringUtil.releaseBuilder(authoritySb);
++
++                 // Handle edge case: if authority components are all null/empty (e.g., file:///),
++                 // the reconstructed authorityString might be empty. If the original raw authority
++                 // was non-null (like ""), preserve it as an empty string to ensure "//" is added.
++                 if (authorityString.isEmpty() && uri.getRawAuthority() != null) {
++                     // This keeps authorityString as "" if the raw authority was present but empty.
++                 } else if (authorityString.isEmpty() && uri.getRawAuthority() == null) {
++                     // If raw authority was null and reconstruction is empty, set authorityString back to null.
++                     authorityString = null;
++                 }
++            }
++
++
++            // Reconstruct the URL string up to the path
++            StringBuilder urlSb = StringUtil.borrowBuilder();
++            urlSb.append(scheme).append(':');
++            if (authorityString != null) { // If authority exists (including "" for file:///)
++                urlSb.append("//").append(authorityString);
++            }
++            // Append the raw path, ensuring it starts with / if authority is present and path isn't empty/absolute
++             if (authorityString != null && path.length() > 0 && path.charAt(0) != '/') {
++                 urlSb.append('/'); // Ensure path starts with slash if authority present
++             }
++            urlSb.append(path); // Append the raw path
++
++            String base = StringUtil.releaseBuilder(urlSb); // Base URL string (scheme, authority, path)
++
++            // Now, append query and fragment based on original logic
++            String normUrl;
++            // Check if we need to append query (from 'q' or original) or fragment (from 'u.getRef()' or original)
++            boolean hasQuery = (q != null || uri.getRawQuery() != null);
++            boolean hasFragment = (u.getRef() != null || uri.getRawFragment() != null);
++
++            if (hasQuery || hasFragment) {
++                 StringBuilder sb = StringUtil.borrowBuilder().append(base);
++                 if (q != null) { // Prioritize external query builder 'q'
+                      sb.append('?');
++                     // appendToAscii handles encoding the query string built in 'q'
+                      appendToAscii(StringUtil.releaseBuilder(q), true, sb);
++                 } else if (uri.getRawQuery() != null) {
++                     // Preserve the original raw query string if no external 'q' is provided
++                     sb.append('?').append(uri.getRawQuery());
+                  }
+-                if (u.getRef() != null) {
++
++                 if (u.getRef() != null) { // Prioritize external ref from 'u' (assumed decoded)
+                      sb.append('#');
++                     // appendToAscii encodes the (presumably decoded) fragment from u.getRef()
+                      appendToAscii(u.getRef(), false, sb);
++                 } else if (uri.getRawFragment() != null) {
++                     // Preserve the original raw fragment string if no ref from 'u'
++                     sb.append('#').append(uri.getRawFragment());
+                  }
+                  normUrl = StringUtil.releaseBuilder(sb);
++            } else {
++                 // Neither query nor fragment needs appending or modification
++                 normUrl = base;
+             }
++
++            // Construct the final URL object from the normalized string.
++            // The original code updated the 'u' field: u = new URL(normUrl);
++            // Assuming this side-effect is intended.
+             u = new URL(normUrl);
+             return u;
++
+         } catch (MalformedURLException | URISyntaxException | UnsupportedEncodingException e) {
+             // we assert here so that any incomplete normalization issues can be caught in devel. but in practise,
+             // the remote end will be able to handle it, so in prod we just pass the original URL.
+-            // The UnsupportedEncodingException would never happen as always UTF8
++            // The UnsupportedEncodingException would likely never happen. URISyntaxException unlikely with this approach.
+             assert Validate.assertFail(e.toString());
+-            return u;
++            return u; // Return original URL on failure
++        } catch (IllegalArgumentException e) {
++            // IDN.toASCII can throw IllegalArgumentException for invalid hostnames
++             assert Validate.assertFail(e.toString());
++             return u; // Return original URL on failure
+         }
+     }
+\ No newline at end of file

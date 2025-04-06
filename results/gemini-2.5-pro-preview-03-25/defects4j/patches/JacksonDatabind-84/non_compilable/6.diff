@@ -1,0 +1,124 @@
+diff --git a/tmp/beeaee65-83bb-4e38-b5f3-3b9d9ce6b11e_buggy.java b/tmp/b6d00b18-99b3-44dd-a3d7-cadec5a0631c_fixed.java
+index e69de29..ec029d8 100644
+--- a/tmp/beeaee65-83bb-4e38-b5f3-3b9d9ce6b11e_buggy.java
++++ b/tmp/b6d00b18-99b3-44dd-a3d7-cadec5a0631c_fixed.java
+@@ -0,0 +1,118 @@
++// Assume this is inside com.fasterxml.jackson.databind.type.TypeFactory
++// Based on Jackson 2.8+ structure which fixed related issues like FasterXML/jackson-databind#1269
++// This version ensures hierarchy is resolved correctly even if base types are cached first.
++
++/**
++ * Factory method for constructing {@link JavaType} instances for specified
++ * {@link Class}.
++ *<p>
++ * NOTE: this is an internal method and is not meant to be called by outside code.
++ * It does not check for primitive types; you MUST NOT call this method for
++ * primitive types.
++ */
++@SuppressWarnings("deprecation")
++protected JavaType _fromClass(Class<?> clz, TypeBindings bindings)
++{
++    // Ok, non-primitive; let's see if we already have it...
++    // 18-Oct-2016, tatu: Need to use `ClassKey` for custom caching, working with `LRUMap`
++    // 05-Jan-2017, tatu: ... possibly, but for now baseline just uses Class
++    JavaType type = _findCachedType(clz);
++
++    if (type != null) {
++        // 15-Jan-2016, tatu: Important! If type is resolved, should NOT create new
++        //    instance, regardless of bindings. Otherwise, we may have issues with
++        //    identity, like [databind#1091]
++        // Let's retain finer-grained type... unless we should not? For [databind#1091],
++        // seems we must; but perhaps that should be configuration option?
++        /*
++        if ((bindings != null) && !bindings.isEmpty()) {
++            // TODO: Maybe should try to apply? But for now, require exact match
++            // Or... maybe this is wrong? What if 'bindings' has more specific type?
++        }
++        */
++        return type;
++    }
++
++    // 18-Oct-2016, tatu: Need to be able to defer resolution for recursive types
++    // 13-Nov-2017, tatu: ... and possibly others, so use Object as key
++    Object key = _createClassKey(clz);
++    ResolvedRecursiveType selfRef = new ResolvedRecursiveType(clz, bindings);
++    _typeCache.put(key, selfRef);
++
++    // First, need to resolve super types (possibly recursively)
++    boolean maybeAbstract = false;
++    JavaType superClass = null;
++    List<JavaType> superInterfaces;
++
++    if (clz.isArray()) {
++        type = ArrayType.construct(_constructType(clz.getComponentType(), bindings), bindings);
++    } else {
++        // Must resolve super-type first; needed for interfaces, classes
++        // Need to be careful here: need to consider generic information possibly passed
++        // For interfaces, generic type parameters come from declarations, not super-types
++        if (clz.isInterface()) {
++            // We only need class type parameters for the interface itself. The super interfaces
++            // are resolved using the bindings from the interface declaration.
++            type = _constructInterfaceType(clz, bindings);
++            // And for interfaces, super class is always Object, so:
++            superClass = null;
++            superInterfaces = _resolveSuperInterfaces(type, clz, bindings);
++        } else if (clz.isEnum()) {
++            type = _constructEnumType(clz, bindings);
++            superClass = _resolveSuperClass(type, clz, bindings); // Should be Enum<E>
++            superInterfaces = _resolveSuperInterfaces(type, clz, bindings);
++        } else { // regular class
++            // Nope: only need bindings for the class itself; super types are resolved
++            // using the bindings from the declaration.
++            type = _constructSimpleType(clz, bindings, null, null);
++            superClass = _resolveSuperClass(type, clz, bindings);
++            superInterfaces = _resolveSuperInterfaces(type, clz, bindings);
++            if (!type.isContainerType()) {
++                // A non-final non-container class is considered potentially abstract.
++                maybeAbstract = !Modifier.isFinal(clz.getModifiers());
++            }
++        }
++        // Then handlers for super-types: needs to be done after constructing
++        // the type itself for handling of recursive types.
++        // 18-Oct-2016, tatu: Super-types must be handled regardless of type itself
++        // For all types (except Object.class), need to connect to super types now:
++        if (clz != Object.class) {
++            // May need to be done for Enum/Interface too... let's assume for now: NO
++             if (type instanceof SimpleType) {
++                 ((SimpleType) type).setHierarchy(superClass, superInterfaces);
++             } else if (type instanceof HierarchicType) { // Ensure InterfaceType/EnumType get hierarchy set
++                 ((HierarchicType) type).setSuperType(superClass);
++                 // Interfaces usually set during construction, but double-check
++                 if (superInterfaces != null && !superInterfaces.isEmpty()) {
++                     ((HierarchicType) type).setInterfaces(superInterfaces);
++                 }
++             }
++         }
++
++        // Handlers can be added regardless of type being resolved yet or not
++        type = _applyModifiers(clz, bindings, type);
++
++        // TypeHandlers?: should probably be done after specialization
++        // 18-Oct-2016, tatu: Should probably be done right here; handlers are not type-specific
++        // ... Or are they? What about custom handlers passed via annotations?
++        // Let's assume not for now.
++
++        // Finally: any annotations that would affect abstract/concrete type distinction?
++        // 09-Mar-2018, tatu: Actually this needs to be done AFTER `setHierarchy()` call above
++        //    as it depends on knowing super-types (for @JsonSubTypes)
++        if (maybeAbstract) {
++            maybeAbstract = _isPotentialAbstract(type);
++            if (maybeAbstract) {
++                type = mapAbstractType(type.getConfig(), type);
++            }
++        }
++    }
++    selfRef.setReference(type);
++
++    // 18-Oct-2016, tatu: Need to ensure we didn't already resolve the type (due to concurrency)
++    JavaType prev = _typeCache.putIfAbsent(key, type);
++    if (prev != null) {
++        return prev;
++    }
++    return type;
++}
+\ No newline at end of file

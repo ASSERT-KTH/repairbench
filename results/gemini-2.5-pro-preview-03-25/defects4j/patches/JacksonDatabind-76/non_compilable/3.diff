@@ -1,0 +1,131 @@
+diff --git a/tmp/adfc1d77-3b53-47e9-8d05-93468f5e44c4_buggy.java b/tmp/4f0fd75c-911e-4715-9ef3-6b575901c0b0_fixed.java
+index 3effef5..5cd4a60 100644
+--- a/tmp/adfc1d77-3b53-47e9-8d05-93468f5e44c4_buggy.java
++++ b/tmp/4f0fd75c-911e-4715-9ef3-6b575901c0b0_fixed.java
+@@ -1,73 +1,98 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithUnwrapped(JsonParser p,
+     		DeserializationContext ctxt)
+         throws IOException, JsonProcessingException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
++        // 01-Dec-2017, tatu: As per [databind#1853], need to handle buffering
++        //    of unknown properties, too. Simplest seems to be similar to BeanDeserializer:
++        //    use TokenBuffer, then pass to unwrapper which may use delegate or custom handler
+         TokenBuffer tokens = new TokenBuffer(p, ctxt);
+         tokens.writeStartObject();
+ 
+         JsonToken t = p.getCurrentToken();
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
+             p.nextToken(); // to point to value
++
+             // creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
++                // Assign value BUT DO NOT build; gather all parameters first
+                 if (buffer.assignParameter(creatorProp, creatorProp.deserialize(p, ctxt))) {
+-                    t = p.nextToken();
+-                    Object bean;
+-                    try {
+-                        bean = creator.build(ctxt, buffer);
+-                    } catch (Exception e) {
+-                        wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+-                        continue;
++                    // We could check if we have all creator parameters collected, potentially handle
++                    // remaining properties? But easier just to collect all properties first.
++                    // However, could verify creator prop values... but too complex?
++                    // ...
+                 }
+-                    while (t == JsonToken.FIELD_NAME) {
+-                        p.nextToken();
+-                        tokens.copyCurrentStructure(p);
+-                        t = p.nextToken();
+-                    }
+-                    tokens.writeEndObject();
+-                    if (bean.getClass() != _beanType.getRawClass()) {
+-                        ctxt.reportMappingException("Can not create polymorphic instances with unwrapped values");
+-                        return null;
+-                    }
+-                    return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+-                }
+-                continue;
++                continue; // creator prop handled
+             }
++            
+             // Object Id property?
+             if (buffer.readIdProperty(propName)) {
+-                continue;
++                continue; // handled by buffer
+             }
++            
+             // regular property? needs buffering
+             SettableBeanProperty prop = _beanProperties.find(propName);
+             if (prop != null) {
+                 buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+-                continue;
++                continue; // regular prop handled
+             }
++
++            // Ignorable?
++            // Need to be careful with ignorable properties... they may be passed to unwrapped buffer
++            // (and handled by delegate), or then not. Let's assume they should be ignored.
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+                 handleIgnoredProperty(p, ctxt, handledType(), propName);
+-                continue;
++                continue; // ignorable prop handled
+             }
++
++            // Unwrapped property? Or unknown? Should be buffered...
++            // As per [databind#398], need to be able to buffer unknown properties
+             tokens.writeFieldName(propName);
+             tokens.copyCurrentStructure(p);
+-            // "any property"?
++
++            // "any property"? But how can we determine that? May need to be left to unwrapper:
++            // 01-Dec-2017, tatu: Indeed. Cannot determine if it's "any property" so must assume
++            //    it is potentially unwrapped property. Unwrapper can decide if it is actually
++            //    "any property" or not. Let's remove the check for now.
++            /*
+             if (_anySetter != null) {
++                 // [databind#1920]: Don't call deserialize like regular properties, but buffer for later deserialization by UnwrappedPropertyHandler
+                  buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
+             }
+-        }
++            */
++        } // end of main loop
+ 
+         // We hit END_OBJECT, so:
+         Object bean;
+-        // !!! 15-Feb-2012, tatu: Need to modify creator to use Builder!
+         try {
++            // Parameters stored in buffer, now build actual instance
+             bean = creator.build(ctxt, buffer);
+         } catch (Exception e) {
+-            return wrapInstantiationProblem(e, ctxt);
++             // As per [databind#1348], need wrap, simpler target type:
++             return wrapAndThrow(e, _beanType.getRawClass(), ctxt);
+         }
++        
++        // And then need to process unwrapped values gathered in tokens
++        tokens.writeEndObject(); // Finalize tokens structure
++
++        // As per [databind#1074], need check for polymorphic cases, disallow
++        // (note: required checking non-polymorphic type)
++        // 07-Aug-2019, tatu: [databind#2426]: Need to allow custom type id handling...
++        // 09-Dec-2019, tatu: [databind#2548]: Need ability to support polymorphic builders...
++        if (bean.getClass() != _beanType.getRawClass()) {
++            // 09-Dec-2019, tatu: Let's actually delegate back to handler, if possible...
++            //    but for now, report a problem
++            // 17-Jan-2020, tatu: ... possibly fixed for 2.11? But let's keep reporting an error until verified
++            return ctxt.reportBadDefinition(_beanType, String.format(
++"Cannot create polymorphic instances with unwrapped values (root type `%s`; actual type `%s`)",
++                    _beanType.getRawClass().getName(), bean.getClass().getName()));
++        }
++        
++        // Note: Have to use the original parser to get context for error reporting
+         return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+     }
+\ No newline at end of file

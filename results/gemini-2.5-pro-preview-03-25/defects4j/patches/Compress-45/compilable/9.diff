@@ -1,0 +1,116 @@
+diff --git a/tmp/ba90ff61-15f0-44df-bffb-a24a83e5db39_buggy.java b/tmp/53102aef-27fa-488d-a4f2-8a2bc86178c1_fixed.java
+index 1bbc082..6ca82a5 100644
+--- a/tmp/ba90ff61-15f0-44df-bffb-a24a83e5db39_buggy.java
++++ b/tmp/53102aef-27fa-488d-a4f2-8a2bc86178c1_fixed.java
+@@ -1,36 +1,101 @@
+     /**
+      * Write an long integer into a buffer as an octal string if this
+      * will fit, or as a binary number otherwise.
+      *
+-     * Uses {@link #formatUnsignedOctalString} to format
++     * Uses {@link #formatLongOctalBytes} to format
+      * the value as an octal string with leading zeros.
+      * The converted number is followed by a space.
+      *
+      * @param value The value to write into the buffer.
+      * @param buf The destination buffer.
+      * @param offset The starting offset into the buffer.
+      * @param length The length of the buffer.
+      * @return The updated offset.
+      * @throws IllegalArgumentException if the value (and trailer)
+-     * will not fit in the buffer.
++     * will not fit in the buffer according to the TAR specification
++     * (requires <= length-1 octal digits or binary representation within length).
+      * @since 1.4
+      */
+     public static int formatLongOctalOrBinaryBytes(
+         final long value, final byte[] buf, final int offset, final int length) {
+ 
+-        // Check whether we are dealing with UID/GID or SIZE field
+-        final long maxAsOctalChar = length == TarConstants.UIDLEN ? TarConstants.MAXID : TarConstants.MAXSIZE;
++        // Determine the maximum value that can be represented in octal for the given field length.
++        // formatLongOctalBytes requires value <= (1L << 3 * (length - 1)) - 1
++        // This check is implicitly handled by formatLongOctalBytes, but we can optimize slightly.
++        long maxAsOctalChar;
++        // The original code used a heuristic based on typical field types (UID/Size)
++        // Let's retain that heuristic as a first check.
++        if (length == TarConstants.UIDLEN) { // UIDLEN is typically 8
++            maxAsOctalChar = TarConstants.MAXID; // 07777777 octal
++        } else {
++            // Assuming size field or other field, use MAXSIZE limit
++            // MAXSIZE is 077777777777L octal, typically for length 12
++            maxAsOctalChar = TarConstants.MAXSIZE;
++        }
+ 
+         final boolean negative = value < 0;
+-        if (!negative && value <= maxAsOctalChar) { // OK to store as octal chars
++        // Try octal if value is non-negative and fits the heuristic maximum.
++        // formatLongOctalBytes will perform the precise check for the given length.
++        if (!negative && value <= maxAsOctalChar) {
++            try {
++                // formatLongOctalBytes adds NUL/space trailer and checks if value fits length-1 digits
+                 return formatLongOctalBytes(value, buf, offset, length);
++            } catch (final IllegalArgumentException e) {
++                // If value is too large for octal representation in the given length,
++                // fall through to binary representation.
++                // This can happen if maxAsOctalChar heuristic was too large for the actual 'length'.
++            }
++        }
++
++        // Handle binary case: marker byte + (length-1) bytes of value in two's complement BE.
++        // Reference: GNU tar specification for binary numeric fields.
++        if (length < 1) {
++             throw new IllegalArgumentException("Length must be at least 1.");
++        }
++
++        final int numValueBytes = length - 1;
++        long minBinaryValue;
++        long maxBinaryValue;
++
++        // Calculate the range representable by numValueBytes in two's complement.
++        if (numValueBytes >= 8) {
++             // If length >= 9, numValueBytes >= 8, can represent full 64-bit long range.
++             minBinaryValue = Long.MIN_VALUE; // -(1L << 63)
++             maxBinaryValue = Long.MAX_VALUE; // (1L << 63) - 1
++        } else { // 0 <= numValueBytes <= 7
++             if (numValueBytes == 0) { // length = 1
++                 // Only 0 can be represented (marker byte 0x80)
++                 minBinaryValue = 0;
++                 maxBinaryValue = 0;
++             } else { // 1 <= numValueBytes <= 7 -> 8 to 56 value bits
++                 // Total bits available for value representation (including sign)
++                 final int numValueBits = numValueBytes * 8;
++                 // Min value is -(2^(numValueBits-1))
++                 minBinaryValue = -(1L << (numValueBits - 1));
++                 // Max value is 2^(numValueBits-1) - 1
++                 maxBinaryValue = (1L << (numValueBits - 1)) - 1;
++             }
++        }
++
++        // Check if the value fits within the calculated binary range.
++        if (value < minBinaryValue || value > maxBinaryValue) {
++             // Throw exception consistent with original code's message pattern
++             throw new IllegalArgumentException("Value " + value + " is too large for " + length + " byte field.");
+         }
+ 
+-        if (length < 9) {
+-            formatLongBinary(value, buf, offset, length, negative);
++        // Write the binary representation.
++        // 1. Marker byte (highest bit set indicates binary format, sign indicated by 0x80 vs 0xFF)
++        buf[offset] = (byte) (negative ? 0xFF : 0x80);
++        // 2. Value bytes (two's complement Big Endian)
++        long val = value;
++        // Iterate from the last byte of the value field down to the first byte after the marker
++        // This writes length-1 bytes.
++        for (int i = offset + length - 1; i > offset; i--) {
++            buf[i] = (byte) val;
++            // Use unsigned right shift to fill with zeros, preserving the sign bit's original position
++            // during the shift process until it's shifted out for lower bytes.
++            val >>>= 8;
+         }
+-        formatBigIntegerBinary(value, buf, offset, length, negative);
+ 
+-        buf[offset] = (byte) (negative ? 0xff : 0x80);
+         return offset + length;
+     }
+\ No newline at end of file

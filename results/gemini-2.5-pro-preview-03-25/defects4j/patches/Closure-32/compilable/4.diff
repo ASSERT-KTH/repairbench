@@ -1,0 +1,235 @@
+diff --git a/tmp/24f0945b-1a1c-46f7-903d-0aa0480d558d_buggy.java b/tmp/22ca9a0c-86b1-4c3a-99c0-947b178df27b_fixed.java
+index 4be01ab..90f1201 100644
+--- a/tmp/24f0945b-1a1c-46f7-903d-0aa0480d558d_buggy.java
++++ b/tmp/22ca9a0c-86b1-4c3a-99c0-947b178df27b_fixed.java
+@@ -1,115 +1,182 @@
+   /**
+    * Extracts the text found on the current line and all subsequent
+    * until either an annotation, end of comment or end of file is reached.
+    * Note that if this method detects an end of line as the first token, it
+    * will quit immediately (indicating that there is no text where it was
+    * expected).  Note that token = info.token; should be called after this
+    * method is used to update the token properly in the parser.
+    *
+    * @param token The start token.
+    * @param option How to handle whitespace.
+    *
+    * @return The extraction information.
+    */
++  // Note: @SuppressWarnings("fallthrough") is kept, as ANNOTATION might fall through
++  // in PRESERVE mode, although the default case handles it explicitly.
+   @SuppressWarnings("fallthrough")
+   private ExtractionInfo extractMultilineTextualBlock(JsDocToken token,
+                                                       WhitespaceOption option) {
+ 
+     if (token == JsDocToken.EOC || token == JsDocToken.EOL ||
+         token == JsDocToken.EOF) {
+       return new ExtractionInfo("", token);
+     }
+ 
+     stream.update();
+     int startLineno = stream.getLineno();
+-    int startCharno = stream.getCharno() + 1;
++    // Use 0-based charno for start. markText likely handles 0-based vs 1-based internally.
++    int startCharno = stream.getCharno();
+ 
+     // Read the content from the first line.
+     String line = stream.getRemainingJSDocLine();
+     if (option != WhitespaceOption.PRESERVE) {
++      // Trim entire line for non-preserve mode on first line.
+       line = line.trim();
+     }
+ 
+     StringBuilder builder = new StringBuilder();
+     builder.append(line);
+ 
+-    state = State.SEARCHING_ANNOTATION;
++    // We consumed the first line's content, now get the next token (usually EOL).
+     token = next();
+ 
+-    boolean ignoreStar = false;
+-
+-    // Track the start of the line to count whitespace that
+-    // the tokenizer skipped. Because this case is rare, it's easier
+-    // to do this here than in the tokenizer.
++    boolean ignoreStar = false; // True if the previous token was EOL
+ 
+     do {
++      // Loop invariant: 'token' is the token at the start of the current line segment.
++      // stream is positioned at the start of 'token'.
++
+       switch (token) {
+         case STAR:
+           if (ignoreStar) {
+-            // Mark the position after the star as the new start of the line.
+-          } else {
+-            // The star is part of the comment.
+-            if (builder.length() > 0) {
+-              builder.append(' ');
+-            }
++            // Line starts with '*', ignore it and capture the rest of the line.
++            token = next(); // Consume STAR, stream is after '*'
+ 
++            String restOfLine = stream.getRemainingJSDocLine();
++            if (option == WhitespaceOption.PRESERVE) {
++               // Preserve whitespace as is.
++               builder.append(restOfLine);
++            } else {
++               // Non-preserve mode: trim the line start similar to reading token+rest.
++               builder.append(restOfLine.trim());
++            }
++            token = next(); // Consume rest of line (EOL/EOC/EOF)
++            // We handled the line content, so the next token doesn't follow a STAR implicitly.
++            ignoreStar = false;
++          } else {
++            // Star is part of the comment text (not a leading star).
++             if (option != WhitespaceOption.PRESERVE) {
++                 // Add space only if not start of line/builder in non-preserve mode.
++                 if (builder.length() > 0 && !builder.substring(builder.length() - 1).equals("\n")) {
++                    builder.append(' ');
++                 }
++             }
++             // In PRESERVE mode, append '*' without extra leading space.
+              builder.append('*');
++             token = next(); // Consume STAR token.
++             ignoreStar = false; // Processed a content token.
+           }
+-
+-          token = next();
+-          continue;
++          continue; // Continue to next token.
+ 
+         case EOL:
+-          if (option != WhitespaceOption.SINGLE_LINE) {
++          if (option == WhitespaceOption.SINGLE_LINE) {
++             // Stop processing on first EOL if single line mode.
++             // Finalize and return EOL as the terminating token.
++             String singleLineText = builder.toString();
++             stream.update(); // Position at EOL token
++             int endLineno = stream.getLineno();
++             int endCharno = stream.getCharno();
++             // Apply final trim based on option before marking.
++             if (option != WhitespaceOption.PRESERVE) {
++               singleLineText = singleLineText.trim();
++             }
++             if (singleLineText.length() > 0) {
++                 jsdocBuilder.markText(singleLineText, startLineno, startCharno,
++                                      endLineno, endCharno);
++             }
++             // Return EOL token, as this is where we stopped.
++             return new ExtractionInfo(singleLineText, token);
++          }
++
++          // Multiline mode, append newline.
+           builder.append("\n");
++          ignoreStar = true; // Expect a star or beginning of text on the next line.
++          token = next(); // Consume EOL, move to next token.
++          continue; // Continue to next token.
++
++        case EOF: // Termination condition
++        case EOC: // Termination condition
++          // Terminate loop, handle finalization below.
++          break; // Exit switch
++
++        case ANNOTATION:
++          if (option != WhitespaceOption.PRESERVE) {
++            // Annotation terminates unless preserving whitespace.
++            break; // Exit switch, terminate loop.
+           }
++          // If preserving, ANNOTATION is treated as text, fallthrough to default.
++
++        default: // Includes ANNOTATION if option == PRESERVE
++          boolean startingNewLine = ignoreStar; // Were we expecting a star (i.e., last token was EOL)?
++          ignoreStar = false; // We are processing content, so reset flag.
++
++          this.state = State.SEARCHING_ANNOTATION; // Set parser state (assuming needed by caller context)
+ 
+-          ignoreStar = true;
+-          token = next();
+-          continue;
++          if (option == WhitespaceOption.PRESERVE) {
++              // Preserve mode: Append the raw text starting from the current token position.
++              if (startingNewLine) {
++                  // We had EOL, but the current token is not STAR.
++                  // Capture the entire line from the current stream position, preserving all leading whitespace.
++                  String restOfLine = stream.getRemainingJSDocLine();
++                  builder.append(restOfLine);
++                  token = next(); // Consume the line content (EOL/EOC/EOF).
++              } else {
++                  // Content is not at the start of a line (or it's the very first line part).
++                  // Append the token's string value and the rest of the line.
++                  // Assumes toString() gives a reasonable representation and getRemaining handles the rest.
++                  builder.append(toString(token));
++                  String restOfLine = stream.getRemainingJSDocLine();
++                  builder.append(restOfLine);
++                  token = next(); // Consume token + rest of line.
++              }
++          } else { // Not PRESERVE
++             // Original non-PRESERVE logic: Add space, append toString(), append trimEnd(rest).
++             if (builder.length() > 0 && !builder.substring(builder.length() - 1).equals("\n")) {
++                builder.append(' ');
++             }
++             builder.append(toString(token));
++             String restOfLine = stream.getRemainingJSDocLine();
++             // Only trim the end of the remaining part of the line.
++             restOfLine = trimEnd(restOfLine);
++             builder.append(restOfLine);
++             token = next(); // Consume token + rest of line.
++          }
++          continue; // Go to next token processing.
++      } // End switch
+ 
+-        default:
+-          ignoreStar = false;
+-          state = State.SEARCHING_ANNOTATION;
++      // If we reached here by break, it means loop termination condition met (EOC, EOF, or ANNOTATION).
++      break; // Exit do-while loop.
+ 
+-              // All tokens must be separated by a space.
++    } while (true);
+ 
+-          if (token == JsDocToken.EOC ||
+-              token == JsDocToken.EOF ||
+-              // When we're capturing a license block, annotations
+-              // in the block are ok.
+-              (token == JsDocToken.ANNOTATION &&
+-               option != WhitespaceOption.PRESERVE)) {
++    // Finalization (after loop termination by EOC, EOF, or ANNOTATION)
+     String multilineText = builder.toString();
+ 
++    // Apply final trim if not preserving whitespace.
+     if (option != WhitespaceOption.PRESERVE) {
+       multilineText = multilineText.trim();
+     }
+ 
++    // End position is the beginning of the terminating token.
++    stream.update(); // Ensure stream position is current.
+     int endLineno = stream.getLineno();
+     int endCharno = stream.getCharno();
+ 
+     if (multilineText.length() > 0) {
+       jsdocBuilder.markText(multilineText, startLineno, startCharno,
+           endLineno, endCharno);
+     }
+ 
++    // Return the extracted text and the token that terminated the extraction.
+     return new ExtractionInfo(multilineText, token);
+   }
+\ No newline at end of file
+-
+-          if (builder.length() > 0) {
+-            builder.append(' ');
+-          }
+-          builder.append(toString(token));
+-
+-          line = stream.getRemainingJSDocLine();
+-
+-          if (option != WhitespaceOption.PRESERVE) {
+-            line = trimEnd(line);
+-          }
+-
+-          builder.append(line);
+-          token = next();
+-      }
+-    } while (true);
+-  }

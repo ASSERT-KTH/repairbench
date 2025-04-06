@@ -1,0 +1,450 @@
+diff --git a/tmp/bfc5c2e4-261c-4e01-ad72-09203f9f2774_buggy.java b/tmp/ddaec004-cfb1-421c-9832-8a11b4914a7c_fixed.java
+index 5501a49..4d883ea 100644
+--- a/tmp/bfc5c2e4-261c-4e01-ad72-09203f9f2774_buggy.java
++++ b/tmp/ddaec004-cfb1-421c-9832-8a11b4914a7c_fixed.java
+@@ -1,177 +1,342 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+         buf.readUnsignedByte(); // header
+         int flags = buf.readUnsignedByte();
+-        buf.readUnsignedShortLE(); // length
++        int length = buf.readUnsignedShortLE(); // length of payload after type
+         buf.readUnsignedShortLE(); // checksum
+         int index = buf.readUnsignedShortLE();
+         int type = buf.readUnsignedByte();
+ 
++        int startIndex = buf.readerIndex(); // Index at the start of data payload
++        int endIndexOverall = startIndex + length; // Index right after the data payload as defined by length field
++
++        // Ensure the calculated end index is not beyond the actual buffer writer index
++        if (endIndexOverall > buf.writerIndex()) {
++            Log.warning("Declared length (" + length + ") exceeds buffer readable bytes ("
++                    + buf.readableBytes() + " remaining) in Minifinder2 message. Truncating to buffer size.");
++            endIndexOverall = buf.writerIndex(); // Adjust to prevent read errors
++        }
++
++
+         if (BitUtil.check(flags, 4)) {
+-            sendResponse(channel, remoteAddress, index, type, buf);
++            // Assuming sendResponse doesn't modify the buffer's reader index
++            sendResponse(channel, remoteAddress, index, type, buf.retainedDuplicate());
+         }
+ 
+         if (type == MSG_DATA) {
+ 
+             List<Position> positions = new LinkedList<>();
+-            Set<Integer> keys = new HashSet<>();
+-            boolean hasLocation = false;
+-            Position position = new Position(getProtocolName());
++            DeviceSession deviceSession = null; // Determined by first 0x01 key
++            Position currentPosition = null; // Holds the position being built
++            Set<Integer> currentKeys = null; // Keys for the current position
++            boolean currentHasLocation = false;
+ 
+-            DeviceSession deviceSession = null;
++            while (buf.readerIndex() < endIndexOverall) {
++                // Check if there are enough bytes for block length and key (at least 2 bytes)
++                if (endIndexOverall - buf.readerIndex() < 2) {
++                    if (endIndexOverall > buf.readerIndex()) { // Log if there were unexpected leftover bytes
++                         Log.warning("Truncated block header (" + (endIndexOverall - buf.readerIndex())
++                                 + " bytes remaining) in Minifinder2 message. Stopping parse.");
++                    }
++                    break; // Not enough data for a valid block header
++                }
+ 
+-            while (buf.isReadable()) {
+-                int endIndex = buf.readUnsignedByte() + buf.readerIndex();
++                int blockStartIndex = buf.readerIndex();
++                int blockLength = buf.readUnsignedByte(); // Length includes key byte + value bytes
++
++                if (blockLength == 0) {
++                    Log.warning("Zero block length encountered in Minifinder2 message, stopping parse.");
++                    break; // Avoid potential infinite loop or reading past end
++                }
++
++                // Calculate expected reader index after processing this block
++                int nextBlockReaderIndex = blockStartIndex + blockLength;
++
++                // Check if block length is valid within overall payload boundaries
++                if (nextBlockReaderIndex > endIndexOverall) {
++                    Log.warning("Block length " + blockLength + " exceeds remaining packet length ("
++                            + (endIndexOverall - blockStartIndex) + ") in Minifinder2 message, stopping parse.");
++                    break; // Avoid reading past declared payload end
++                }
++
++                // We've already checked blockLength > 0. blockLength=1 means only key, no value bytes.
+                 int key = buf.readUnsignedByte();
++                int valueLength = blockLength - 1; // Calculate length of the value data
+ 
+-                if (keys.contains(key)) {
+-                    if (!hasLocation) {
+-                        getLastLocation(position, null);
++                // Check if buffer actually contains enough bytes for the declared value length *before* the next block
++                // (This check prevents IndexOutOfBounds if a case tries to read valueLength bytes)
++                if (buf.readerIndex() + valueLength > nextBlockReaderIndex) {
++                    // This implies an internal inconsistency or buffer truncation issues not caught earlier.
++                     Log.warning("Buffer underflow or inconsistency: needed " + valueLength + " value bytes for key "
++                             + String.format("0x%02X", key) + ", but block ends at " + nextBlockReaderIndex
++                             + " (current index " + buf.readerIndex() + "). Stopping parse.");
++                     break;
+                 }
+-                    positions.add(position);
+-                    keys.clear();
+-                    hasLocation = false;
+-                    position = new Position(getProtocolName());
++
++                // Define end index for value reading within the switch cases if needed, relative to current reader index
++                int valueEndIndex = buf.readerIndex() + valueLength;
++
++                // Logic to start a new position or use the existing one
++                if (currentPosition == null || (currentKeys != null && currentKeys.contains(key))) {
++                    // Finalize the previous position if it exists and seems valid
++                    if (currentPosition != null && currentKeys != null) {
++                        if (deviceSession != null) { // Ensure deviceId is set from session if available
++                            currentPosition.setDeviceId(deviceSession.getDeviceId());
++                        }
++                        // A position is valid if it has a deviceId and either time or location info
++                        if (currentPosition.getDeviceId() != 0) {
++                            if (!currentHasLocation) { // If no location data was explicitly parsed...
++                                 // Try to fetch last known location, using time as a hint if available
++                                 getLastLocation(currentPosition, currentPosition.getFixTime());
++                                 // Update currentHasLocation if getLastLocation succeeded
++                                 if (currentPosition.getLatitude() != 0.0 || currentPosition.getLongitude() != 0.0) {
++                                    currentHasLocation = true;
++                                 }
++                            }
++                            // Add position if it has time or location info
++                            if (currentPosition.getFixTime() != null || currentHasLocation) {
++                                positions.add(currentPosition);
++                            } else { Log.info("Discarding incomplete position (no time/location) before key " + String.format("0x%02X", key) + " repetition"); }
++                        } else { Log.info("Discarding position block (no deviceId) before key " + String.format("0x%02X", key) + " repetition"); }
++                    }
++                    // Start a new position object
++                    currentPosition = new Position(getProtocolName());
++                    currentKeys = new HashSet<>();
++                    currentHasLocation = false;
++                    if (deviceSession != null) { // Carry over device session if already known
++                        currentPosition.setDeviceId(deviceSession.getDeviceId());
++                    }
++                }
++                // Add the current key to the set for the position being built
++                 if (currentKeys != null) {
++                    currentKeys.add(key);
++                 } else {
++                     // This state should be unreachable if currentPosition is handled correctly
++                     Log.error("Internal state error: currentKeys is null when processing key " + String.format("0x%02X", key));
++                     buf.readerIndex(nextBlockReaderIndex); // Attempt to skip block and continue
++                     continue;
+                  }
+-                keys.add(key);
+ 
++                 // Process key-value pair based on the key
++                 try { // Add try-catch around switch for robustness against parsing errors within cases
+                      switch (key) {
+-                    case 0x01:
+-                        deviceSession = getDeviceSession(
+-                                channel, remoteAddress, buf.readCharSequence(15, StandardCharsets.US_ASCII).toString());
+-
+-                        position.setDeviceId(deviceSession.getDeviceId());
+-                        break;
+-                    case 0x02:
++                         case 0x01: // IMEI / Device ID
++                             if (valueLength >= 15) {
++                                 String imei = buf.readCharSequence(15, StandardCharsets.US_ASCII).toString();
++                                 if (deviceSession == null) { // Get session only once per message if possible
++                                     deviceSession = getDeviceSession(channel, remoteAddress, imei);
++                                 }
++                                 if (deviceSession != null) {
++                                     currentPosition.setDeviceId(deviceSession.getDeviceId());
++                                 } else { Log.warning("Device session not found for IMEI: " + imei); }
++                             } else {
++                                 Log.warning("Incorrect length (" + valueLength + ") for IMEI field (0x01) in Minifinder2");
++                             }
++                             break; // Rely on index setting below to handle exact position
++                         case 0x02: // Alarm / Bark event
++                             if (valueLength >= 4) {
+                                  long alarm = buf.readUnsignedIntLE();
+-                        position.set(Position.KEY_ALARM, decodeAlarm(alarm));
++                                 currentPosition.set(Position.KEY_ALARM, decodeAlarm(alarm));
+                                  if (BitUtil.check(alarm, 31)) {
+-                            position.set("bark", true);
++                                     currentPosition.set("bark", true); // Special flag for bark alarm
+                                  }
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Alarm field (0x02) in Minifinder2"); }
+                              break;
+-                    case 0x14:
+-                        position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+-                        position.set(Position.KEY_BATTERY, buf.readUnsignedShortLE() * 0.001);
++                         case 0x14: // Battery Info
++                             if (valueLength >= 3) {
++                                 currentPosition.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte()); // Percentage
++                                 currentPosition.set(Position.KEY_BATTERY, buf.readUnsignedShortLE() * 0.001); // Voltage
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Battery field (0x14) in Minifinder2"); }
+                              break;
+-                    case 0x20:
+-                        hasLocation = true;
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShortLE()));
+-                        position.setCourse(buf.readUnsignedShortLE());
+-                        position.setAltitude(buf.readShortLE());
++                         case 0x20: // Location Data
++                              if (valueLength >= 21) {
++                                  currentHasLocation = true;
++                                  currentPosition.setLatitude(buf.readIntLE() * 0.0000001);
++                                  currentPosition.setLongitude(buf.readIntLE() * 0.0000001);
++                                  currentPosition.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShortLE()));
++                                  currentPosition.setCourse(buf.readUnsignedShortLE());
++                                  currentPosition.setAltitude(buf.readShortLE());
+                                   int hdop = buf.readUnsignedShortLE();
+-                        position.setValid(hdop > 0);
+-                        position.set(Position.KEY_HDOP, hdop * 0.1);
+-                        position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
+-                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                                  currentPosition.setValid(hdop > 0 && hdop < 500); // Use HDOP for validity (threshold might need adjustment)
++                                  currentPosition.set(Position.KEY_HDOP, hdop * 0.1);
++                                  currentPosition.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
++                                  currentPosition.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                              } else { Log.warning("Incorrect length (" + valueLength + ") for Location field (0x20) in Minifinder2"); }
+                               break;
+-                    case 0x21:
++                         case 0x21: // Cell Tower Data
++                              if (valueLength >= 3) { // Need MCC(2) + MNC(1) at minimum
+                                   int mcc = buf.readUnsignedShortLE();
+                                   int mnc = buf.readUnsignedByte();
+-                        if (position.getNetwork() == null) {
+-                            position.setNetwork(new Network());
++                                  if (currentPosition.getNetwork() == null) {
++                                      currentPosition.setNetwork(new Network());
+                                   }
+-                        while (buf.readerIndex() < endIndex) {
++                                  // Each cell tower record: rssi(1) + lac(2) + cid(2) = 5 bytes
++                                  while (buf.readerIndex() <= valueEndIndex - 5) {
+                                       int rssi = buf.readByte();
+-                            position.getNetwork().addCellTower(CellTower.from(
+-                                    mcc, mnc, buf.readUnsignedShortLE(), buf.readUnsignedShortLE(), rssi));
++                                      int lac = buf.readUnsignedShortLE();
++                                      int cid = buf.readUnsignedShortLE();
++                                      // Basic validation for cell info
++                                      if (mcc >= 100 && mcc <= 999 && mnc >= 0 && mnc <= 999 && lac > 0 && lac < 65535 && cid > 0) {
++                                         currentPosition.getNetwork().addCellTower(CellTower.from(mcc, mnc, lac, cid, rssi));
++                                      } else {
++                                         Log.warning("Invalid cell data skipped: MCC=" + mcc + ", MNC=" + mnc + ", LAC=" + lac + ", CID=" + cid);
++                                      }
++                                  }
++                              } else if (valueLength > 0) { // Log if not empty but too short for MCC/MNC
++                                  Log.warning("Incorrect length (" + valueLength + ") for Cell field (0x21) in Minifinder2");
+                               }
+                              break;
+-                    case 0x22:
+-                        if (position.getNetwork() == null) {
+-                            position.setNetwork(new Network());
++                         case 0x22: // WiFi Access Points
++                              // Each AP record: rssi(1) + mac(6) = 7 bytes
++                              if (valueLength >= 7 && (valueLength % 7 == 0)) { // Check if length is multiple of 7
++                                  if (currentPosition.getNetwork() == null) {
++                                      currentPosition.setNetwork(new Network());
+                                   }
+-                        while (buf.readerIndex() < endIndex) {
++                                  while (buf.readerIndex() <= valueEndIndex - 7) {
+                                       int rssi = buf.readByte();
++                                      // Read MAC and format it
+                                       String mac = ByteBufUtil.hexDump(buf.readSlice(6)).replaceAll("(..)", "$1:");
+-                            position.getNetwork().addWifiAccessPoint(WifiAccessPoint.from(
++                                      currentPosition.getNetwork().addWifiAccessPoint(WifiAccessPoint.from(
+                                               mac.substring(0, mac.length() - 1), rssi));
+                                   }
++                              } else if (valueLength > 0) { // Log if not empty but not a multiple of 7
++                                  Log.warning("Incorrect length (" + valueLength + ") for WiFi field (0x22) in Minifinder2");
++                              }
+                              break;
+-                    case 0x23:
+-                        position.set("tagId", readTagId(buf));
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setValid(true);
+-                        hasLocation = true;
++                         case 0x23: // Tag Location (e.g., BLE tag reported by device)
++                             if (valueLength >= 14) { // Expects tagId (6) + lat (4) + long (4)
++                                 currentPosition.set("tagId", readTagId(buf)); // Assuming readTagId reads 6 bytes
++                                 currentPosition.setLatitude(buf.readIntLE() * 0.0000001);
++                                 currentPosition.setLongitude(buf.readIntLE() * 0.0000001);
++                                 currentPosition.setValid(true); // Assume reported tag location is valid
++                                 currentHasLocation = true; // This contributes location info
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Tag Location field (0x23) in Minifinder2"); }
+                              break;
+-                    case 0x24:
+-                        position.setTime(new Date(buf.readUnsignedIntLE() * 1000));
++                         case 0x24: // Time and Status
++                             if (valueLength >= 8) { // Expects time (4) + status (4)
++                                 currentPosition.setTime(new Date(buf.readUnsignedIntLE() * 1000));
+                                  long status = buf.readUnsignedIntLE();
+-                        position.set(Position.KEY_BATTERY_LEVEL, BitUtil.from(status, 24));
+-                        position.set(Position.KEY_STATUS, status);
++                                 // Original code used BitUtil.from(status, 24) - assuming it meant 8 bits from bit 24
++                                 currentPosition.set(Position.KEY_BATTERY_LEVEL, (int)((status >> 24) & 0xFF));
++                                 currentPosition.set(Position.KEY_STATUS, status);
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Time/Status field (0x24) in Minifinder2"); }
+                              break;
+-                    case 0x28:
++                         case 0x28: // BLE Beacon Data (as seen by device)
++                              if (valueLength >= 9) { // flags (1) + tagId (6) + rssi (1) + 1mRssi (1) = 9 bytes minimum
+                                   int beaconFlags = buf.readUnsignedByte();
+-                        position.set("tagId", readTagId(buf));
+-                        position.set("tagRssi", (int) buf.readByte());
+-                        position.set("tag1mRssi", (int) buf.readByte());
+-                        if (BitUtil.check(beaconFlags, 7)) {
+-                            position.setLatitude(buf.readIntLE() * 0.0000001);
+-                            position.setLongitude(buf.readIntLE() * 0.0000001);
+-                            position.setValid(true);
+-                            hasLocation = true;
++                                  currentPosition.set("tagId", readTagId(buf));
++                                  currentPosition.set("tagRssi", (int) buf.readByte());
++                                  currentPosition.set("tag1mRssi", (int) buf.readByte()); // Tx Power / Calibrated RSSI
++                                  if (BitUtil.check(beaconFlags, 7)) { // Location might follow
++                                      if (buf.readerIndex() <= valueEndIndex - 8) { // Check for lat(4) + long(4)
++                                          currentPosition.setLatitude(buf.readIntLE() * 0.0000001);
++                                          currentPosition.setLongitude(buf.readIntLE() * 0.0000001);
++                                          currentPosition.setValid(true); // Assume valid if provided
++                                          currentHasLocation = true;
++                                      } else { Log.warning("Not enough bytes for Beacon Lat/Lon in field 0x28"); }
+                                   }
+-                        if (BitUtil.check(beaconFlags, 6)) {
+-                            position.set("description", buf.readCharSequence(
+-                                    endIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString());
++                                  if (BitUtil.check(beaconFlags, 6)) { // Description might follow
++                                      int remaining = valueEndIndex - buf.readerIndex();
++                                      if (remaining > 0) {
++                                          // Read description, ensure not reading past valueEndIndex
++                                          currentPosition.set("description", buf.readCharSequence(remaining, StandardCharsets.US_ASCII).toString());
+                                       }
++                                  }
++                              } else { Log.warning("Incorrect length (" + valueLength + ") for Beacon field (0x28) in Minifinder2"); }
+                              break;
+-                    case 0x2A:
+-                        buf.readUnsignedByte(); // flags
+-                        buf.skipBytes(6); // mac
+-                        buf.readUnsignedByte(); // rssi
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setValid(true);
+-                        hasLocation = true;
++                         case 0x2A: // WiFi Location (reported by device based on an AP?)
++                              if (valueLength >= 16) { // flags (1) + mac (6) + rssi (1) + lat (4) + long (4) = 16 bytes
++                                  buf.readUnsignedByte(); // flags - ignore?
++                                  buf.skipBytes(6); // mac - ignore? could store it: position.set("wifiApMac", ByteBufUtil.hexDump(buf.readSlice(6))...)
++                                  buf.readUnsignedByte(); // rssi - ignore? could store it: position.set("wifiApRssi", buf.readByte())
++                                  currentPosition.setLatitude(buf.readIntLE() * 0.0000001);
++                                  currentPosition.setLongitude(buf.readIntLE() * 0.0000001);
++                                  currentPosition.setValid(true); // Assume valid
++                                  currentHasLocation = true;
++                              } else { Log.warning("Incorrect length (" + valueLength + ") for field 0x2A in Minifinder2"); }
+                               break;
+-                    case 0x30:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        position.set(Position.KEY_STEPS, buf.readUnsignedIntLE());
++                         case 0x30: // Step Count Data
++                             if (valueLength >= 8) { // Assuming timestamp (4) + steps (4)
++                                 buf.readUnsignedIntLE(); // Read and ignore timestamp? Could store if needed.
++                                 currentPosition.set(Position.KEY_STEPS, buf.readUnsignedIntLE());
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Steps field (0x30) in Minifinder2"); }
+                              break;
+-                    case 0x31:
++                         case 0x31: // Activity Data (e.g., walking/running time/count)
++                              if (valueLength >= 8 && (valueLength % 8 == 0)) { // Each entry: time(4) + activity(4) = 8 bytes
+                                  int i = 1;
+-                        while (buf.readerIndex() < endIndex) {
+-                            position.set("activity" + i + "Time", buf.readUnsignedIntLE());
+-                            position.set("activity" + i, buf.readUnsignedIntLE());
++                                 while (buf.readerIndex() <= valueEndIndex - 8) {
++                                     currentPosition.set("activity" + i + "Time", buf.readUnsignedIntLE()); // Duration? Timestamp?
++                                     currentPosition.set("activity" + i, buf.readUnsignedIntLE()); // Count? Type?
+                                      i += 1;
+                                  }
++                              } else if (valueLength > 0) { // Log if not empty but not multiple of 8
++                                   Log.warning("Incorrect length (" + valueLength + ") for Activity field (0x31) in Minifinder2");
++                              }
+                              break;
+-                    case 0x40:
+-                        buf.readUnsignedIntLE(); // timestamp
++                         case 0x37: // Bark Count Data (added based on test case)
++                             if (valueLength >= 8) { // Assuming timestamp (4) + count (4) structure
++                                 buf.readUnsignedIntLE(); // Read and ignore timestamp?
++                                 // Test expects Long, read unsigned int and cast
++                                 currentPosition.set("barkCount", buf.readUnsignedIntLE());
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Bark Count field (0x37) in Minifinder2"); }
++                             break;
++                         case 0x40: // Heart Rate Data
++                             if (valueLength >= 5) { // Assuming timestamp (4) + heartRate (1)
++                                 buf.readUnsignedIntLE(); // Read and ignore timestamp?
+                                  int heartRate = buf.readUnsignedByte();
+-                        if (heartRate > 1) {
+-                            position.set(Position.KEY_HEART_RATE, heartRate);
++                                 if (heartRate > 1 && heartRate < 255) { // Basic sanity check for heart rate
++                                     currentPosition.set(Position.KEY_HEART_RATE, heartRate);
+                                  }
++                             } else { Log.warning("Incorrect length (" + valueLength + ") for Heart Rate field (0x40) in Minifinder2"); }
+                              break;
+                          default:
++                             Log.info("Unknown Minifinder2 key: " + String.format("0x%02X", key) + " with value length " + valueLength);
++                             // Value bytes will be skipped by setting reader index below
+                              break;
+                      }
+-                buf.readerIndex(endIndex);
++                 } catch (Exception e) {
++                      Log.warning("Error parsing Minifinder2 key " + String.format("0x%02X", key) + ": " + e.getMessage(), e);
++                      // Attempt to recover by skipping to the next block
+                  }
+ 
+-            if (!hasLocation) {
+-                getLastLocation(position, null);
++                // Ensure reader index is positioned correctly for the next block,
++                // even if a case read too much, too little, skipped due to error, or didn't read full valueLength.
++                if (buf.readerIndex() > nextBlockReaderIndex) {
++                     Log.warning("Decoder for key " + String.format("0x%02X", key) + " read past intended block boundary (" + buf.readerIndex() + " > " + nextBlockReaderIndex + "). Resetting index.");
++                } else if (buf.readerIndex() < nextBlockReaderIndex) {
++                    Log.info("Decoder for key " + String.format("0x%02X", key) + " did not read full value length (" + buf.readerIndex() + " < " + nextBlockReaderIndex + "). Advancing index.");
+                 }
+-            positions.add(position);
++                // Set reader index rigorously to the calculated end of the current block
++                buf.readerIndex(nextBlockReaderIndex);
+ 
++            } // End while loop parsing blocks
++
++            // Finalize the last position that was being built
++            if (currentPosition != null) {
+                 if (deviceSession != null) {
+-                for (Position p : positions) {
+-                    p.setDeviceId(deviceSession.getDeviceId());
++                    currentPosition.setDeviceId(deviceSession.getDeviceId());
+                 }
+-            } else {
+-                return null;
++                // Check validity again before adding
++                if (currentPosition.getDeviceId() != 0) {
++                     if (!currentHasLocation) {
++                         getLastLocation(currentPosition, currentPosition.getFixTime());
++                         if (currentPosition.getLatitude() != 0.0 || currentPosition.getLongitude() != 0.0) {
++                            currentHasLocation = true;
++                         }
++                     }
++                     if (currentPosition.getFixTime() != null || currentHasLocation) {
++                        positions.add(currentPosition);
++                    } else { Log.info("Discarding final incomplete position (no time/location)"); }
++                } else { Log.info("Discarding final position block (no deviceId)"); }
+             }
+ 
+-            return positions;
++            return positions.isEmpty() ? null : positions;
+ 
+-        }
++        } // End if (type == MSG_DATA)
+ 
+-        return null;
++        return null; // Return null if type was not MSG_DATA or if no positions were generated
+     }
+\ No newline at end of file

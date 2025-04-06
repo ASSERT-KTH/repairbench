@@ -1,0 +1,127 @@
+diff --git a/tmp/0b2dd574-268d-4b5f-991f-3ce111c0296b_buggy.java b/tmp/b86c10b9-a6d4-479b-ba2f-184d7103dfc5_fixed.java
+index 0a8838d..c8a29a8 100644
+--- a/tmp/0b2dd574-268d-4b5f-991f-3ce111c0296b_buggy.java
++++ b/tmp/b86c10b9-a6d4-479b-ba2f-184d7103dfc5_fixed.java
+@@ -1,61 +1,104 @@
+     private List<Position> parseData(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int locationPacketId, String... imei) {
+         List<Position> positions = new LinkedList<>();
+ 
+-        if (!connectionless) {
+-            buf.readUnsignedInt(); // data length
+-        }
++        // The length field is handled before this method is called.
++        // Removed: if (!connectionless) { buf.readUnsignedInt(); }
+ 
+         int codec = buf.readUnsignedByte();
+         int count = buf.readUnsignedByte();
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+         if (deviceSession == null) {
+             return null;
+         }
+-        String model = getCacheManager().getObject(Device.class, deviceSession.getDeviceId()).getModel();
++        // Model might be needed for decodeLocation, ensure it's available
++        Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
++        String model = (device != null) ? device.getModel() : null;
+ 
+         for (int i = 0; i < count; i++) {
+             Position position = new Position(getProtocolName());
+ 
+             position.setDeviceId(deviceSession.getDeviceId());
+-            position.setValid(true);
++            // Validity is set within the specific decoding logic below
+ 
+             if (codec == CODEC_13) {
+-                buf.readUnsignedByte(); // type
+-                int length = buf.readInt() - 4;
+-                getLastLocation(position, new Date(buf.readUnsignedInt() * 1000));
++                buf.readUnsignedByte(); // command type
++                int length = buf.readInt() - 4; // Length includes 4 bytes for timestamp
++                getLastLocation(position, new Date(buf.readUnsignedInt() * 1000)); // Read timestamp, sets outdated=true
++
++                // Basic validation for length and readable bytes
++                if (length < 0 || buf.readableBytes() < length) {
++                    if (length > 0) {
++                        buf.skipBytes(Math.min(length, buf.readableBytes())); // Consume safely if possible
++                    }
++                    continue; // Skip this malformed record
++                }
++
++                buf.markReaderIndex();
+                 if (isPrintable(buf, length)) {
+-                    position.set(Position.KEY_RESULT,
+-                            buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim());
++                    String data = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim();
++                    if (data.startsWith("GTSL")) {
++                        // Specific handling for GTSL command response (often iButton/Driver ID)
++                        String[] parts = data.split("\\|");
++                        if (parts.length >= 5) {
++                            // Assuming the 5th part (index 4) is the iButton/Driver ID
++                            position.set(Position.KEY_DRIVER_UNIQUE_ID, parts[4]);
++                            position.setValid(true); // Considered valid as we extracted specific data
+                         } else {
++                            // Unexpected GTSL format, store raw data
++                            position.set(Position.KEY_RESULT, data);
++                            position.setValid(true); // Still store it, mark valid
++                        }
++                    } else {
++                         // Other printable text data from CODEC_13
++                         position.set(Position.KEY_RESULT, data);
++                         position.setValid(true); // Mark valid as we stored the result
++                    }
++                } else {
++                    // Non-printable data
++                    buf.resetReaderIndex();
+                     position.set(Position.KEY_RESULT,
+                             ByteBufUtil.hexDump(buf.readSlice(length)));
++                    position.setValid(true); // Mark valid as we stored the result
+                 }
+             } else if (codec == CODEC_12) {
+                 decodeSerial(channel, remoteAddress, deviceSession, position, buf);
++                // decodeSerial is responsible for setting position.setValid()
+             } else {
++                // Assume this handles location data (Codec 8, 8E, etc.)
+                 decodeLocation(position, buf, codec, model);
++                // decodeLocation is responsible for setting position.setValid()
+             }
+ 
+-            if (!position.getOutdated() || !position.getAttributes().isEmpty()) {
++            // Add position if it's marked valid OR if it has any attributes (even if outdated/no coordinates)
++            // This ensures command responses (like CODEC_13 results) are kept.
++            // getLastLocation sets outdated=true, so for CODEC_13 we rely on setValid(true) or attributes being present.
++            if (position.getValid() || !position.getAttributes().isEmpty()) {
+                positions.add(position);
+             }
+         }
+ 
++        // Send ACK response if applicable (not Codec 12 or 13)
+         if (channel != null && codec != CODEC_12 && codec != CODEC_13) {
+             ByteBuf response = Unpooled.buffer();
+             if (connectionless) {
+-                response.writeShort(5);
+-                response.writeShort(0);
+-                response.writeByte(0x01);
+-                response.writeByte(locationPacketId);
+-                response.writeByte(count);
++                // UDP ACK structure
++                response.writeShort(5); // Packet Length (constant for this ACK type)
++                response.writeShort(0); // Packet ID (0 for ACK)
++                response.writeByte(0x01); // Packet Type (Response to Data Packet)
++                response.writeByte(locationPacketId); // AVL Packet ID being acknowledged
++                response.writeByte(count); // Number of records accepted
+             } else {
+-                response.writeInt(count);
++                // TCP ACK structure (just the count)
++                response.ensureWritable(4);
++                response.writeInt(count); // Number of records accepted
+             }
++            // Check remoteAddress for UDP case before flushing
++            if (remoteAddress != null || !connectionless) {
+                 channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+             }
++        }
+ 
+         return positions.isEmpty() ? null : positions;
+     }
+\ No newline at end of file

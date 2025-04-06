@@ -1,0 +1,158 @@
+diff --git a/tmp/01ee4f9e-e571-4722-830b-7554305777d3_buggy.java b/tmp/718bd700-26fd-4f9b-83dd-f0c17d88dba5_fixed.java
+index ee599aa..34dd626 100644
+--- a/tmp/01ee4f9e-e571-4722-830b-7554305777d3_buggy.java
++++ b/tmp/718bd700-26fd-4f9b-83dd-f0c17d88dba5_fixed.java
+@@ -1,50 +1,142 @@
++import io.netty.buffer.ByteBuf;
++import org.traccar.helper.BitUtil;
++import org.traccar.model.Network;
++import org.traccar.model.Position;
++import org.traccar.model.CellTower;
++
++// Assume necessary constants like MSG_GPS_LBS_6, MSG_LBS_ALARM, MSG_GPS_LBS_7 are defined elsewhere
++// For the fix, we only need the function signature and its content.
++
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+         int length = 0;
++        int bytesReadForLbsStructure = 0; // Keep track of bytes read for the LBS structure itself
++
+         if (hasLength) {
+-            length = buf.readUnsignedByte();
++            // Check if buffer has at least 1 byte for length
++            if (!buf.isReadable()) {
++                 return false; // Cannot read length
++            }
++            length = buf.readUnsignedByte(); // Read length byte
++
+             if (length == 0) {
++                // Length 0 indicates no LBS data follows or potentially padding.
++                // The original code had complex zero-padding check logic here.
++                // If length is 0, we cannot read MCC/MNC etc., so return false.
++                // Revisit if specific device padding needs handling.
+                 boolean zeroedData = true;
+-                for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
++                int checkEnd = Math.min(buf.writerIndex(), buf.readerIndex() + 45); // Original check range up to 45
++                for (int i = buf.readerIndex(); i < checkEnd; i++) { // Check from current index
+                     if (buf.getByte(i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+                 if (zeroedData) {
++                    // If the following bytes are all zero, skip them as padding
+                     buf.skipBytes(Math.min(buf.readableBytes(), 45));
+                 }
++                return false; // Return false as LBS data is considered absent or invalid
++            }
++
++            // Minimum possible LBS structure size (MCC+MNC+LAC+CID = 2+1+2+3 = 8 bytes)
++            final int MINIMUM_LBS_LENGTH = 8;
++            if (length < MINIMUM_LBS_LENGTH) {
++                 // Declared length is too small for any valid LBS structure.
++                 // Skip the declared number of bytes as they don't form valid LBS.
++                 buf.skipBytes(Math.min(length, buf.readableBytes()));
+                  return false;
+             }
++            // If length >= 8, proceed, but still need to check against specific structure size and buffer readability.
+         }
+ 
++        // Check if buffer has enough bytes for MCC
++        if (buf.readableBytes() < 2) {
++            // Not enough data even for MCC
++            return false;
++        }
+         int mcc = buf.readUnsignedShort();
++        bytesReadForLbsStructure += 2;
++
++        // Determine the expected size of the rest of the structure based on MCC and type
++        int remainingBytesNeeded = 0;
++        // Use constants directly if available, otherwise rely on their integer values if known.
++        // Assuming MSG_GPS_LBS_6 = 0xA2, MSG_LBS_ALARM = 0x19, MSG_GPS_LBS_7 = 0xA7 based on typical GT06 usage
++        final int MSG_GPS_LBS_6 = 0xA2;   // Example value, replace with actual if different
++        final int MSG_LBS_ALARM = 0x19;   // Example value
++        final int MSG_GPS_LBS_7 = 0xA7;   // Example value
++
++        boolean mccHighBit = BitUtil.check(mcc, 15);
++        boolean mncIsShort = !(mccHighBit || type == MSG_GPS_LBS_6); // True if MNC is 1 byte
++        boolean lacIsInt = (type == MSG_LBS_ALARM);
++        boolean cidIsLong = (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7);
++        boolean cidIsInt = (type == MSG_GPS_LBS_6);
++
++        remainingBytesNeeded += mncIsShort ? 1 : 2; // MNC size
++        remainingBytesNeeded += lacIsInt ? 4 : 2;   // LAC size
++        if (cidIsLong) {
++            remainingBytesNeeded += 8; // CID size
++        } else if (cidIsInt) {
++            remainingBytesNeeded += 4; // CID size
++        } else {
++            remainingBytesNeeded += 3; // CID size (medium)
++        }
++
++        int totalLbsBytesNeeded = 2 + remainingBytesNeeded;
++
++        // If length was provided, verify it's sufficient for the determined structure
++        if (hasLength && length < totalLbsBytesNeeded) {
++             // Declared length is too small for the structure required by type/MCC.
++             // Skip the remaining declared bytes (length - 2, since MCC was read).
++             buf.skipBytes(Math.min(length - 2, buf.readableBytes()));
++             return false;
++        }
++
++        // Check if buffer has enough readable bytes for the rest of the structure
++        if (buf.readableBytes() < remainingBytesNeeded) {
++            // Not enough data in buffer for the required MNC, LAC, CID.
++            return false;
++        }
++
++        // Read MNC, LAC, CID
+         int mnc;
+-        if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
+-            mnc = buf.readUnsignedShort();
+-        } else {
++        if (mncIsShort) {
+             mnc = buf.readUnsignedByte();
++            bytesReadForLbsStructure += 1;
++        } else {
++            mnc = buf.readUnsignedShort();
++            bytesReadForLbsStructure += 2;
+         }
++
+         int lac;
+-        if (type == MSG_LBS_ALARM) {
++        if (lacIsInt) {
+             lac = buf.readInt();
++            bytesReadForLbsStructure += 4;
+         } else {
+             lac = buf.readUnsignedShort();
++            bytesReadForLbsStructure += 2;
+         }
++
+         long cid;
+-        if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
++        if (cidIsLong) {
+             cid = buf.readLong();
+-        } else if (type == MSG_GPS_LBS_6) {
++            bytesReadForLbsStructure += 8;
++        } else if (cidIsInt) {
+             cid = buf.readUnsignedInt();
++            bytesReadForLbsStructure += 4;
+         } else {
+             cid = buf.readUnsignedMedium();
++            bytesReadForLbsStructure += 3;
+         }
+ 
++        // Successfully read the LBS structure
+         position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
++        // If length was provided, skip any remaining bytes specified by 'length'
++        // that were not part of the standard LBS structure we just read.
++        if (hasLength && length > bytesReadForLbsStructure) {
++            buf.skipBytes(Math.min(length - bytesReadForLbsStructure, buf.readableBytes()));
+         }
+ 
+         return true;
+     }
+\ No newline at end of file

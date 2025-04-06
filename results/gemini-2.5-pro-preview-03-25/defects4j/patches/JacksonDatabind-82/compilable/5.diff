@@ -1,0 +1,202 @@
+diff --git a/tmp/2a7bf5ad-e090-45f7-80db-768c56e24bf0_buggy.java b/tmp/10552e15-cfc4-43c9-9f67-6c7b469f2488_fixed.java
+index ee10759..8a546ce 100644
+--- a/tmp/2a7bf5ad-e090-45f7-80db-768c56e24bf0_buggy.java
++++ b/tmp/10552e15-cfc4-43c9-9f67-6c7b469f2488_fixed.java
+@@ -1,151 +1,184 @@
+     /**
+      * Method called to figure out settable properties for the
+      * bean deserializer to use.
+      *<p>
+      * Note: designed to be overridable, and effort is made to keep interface
+      * similar between versions.
+      */
+     protected void addBeanProps(DeserializationContext ctxt,
+             BeanDescription beanDesc, BeanDeserializerBuilder builder)
+         throws JsonMappingException
+     {
+         final boolean isConcrete = !beanDesc.getType().isAbstract();
++        // 12-Aug-2013, tatu: Need to ensure we have constructor parameters available,
++        //    if we are to use them... Seems unnecessarily early, but has to be done
++        //    before realigning things.
+         final SettableBeanProperty[] creatorProps = isConcrete
+                 ? builder.getValueInstantiator().getFromObjectArguments(ctxt.getConfig())
+                 : null;
+         final boolean hasCreatorProps = (creatorProps != null);
+         
+         // 01-May-2016, tatu: Which base type to use here gets tricky, since
+         //   it may often make most sense to use general type for overrides,
+         //   but what we have here may be more specific impl type. But for now
+         //   just use it as is.
+         JsonIgnoreProperties.Value ignorals = ctxt.getConfig()
+                 .getDefaultPropertyIgnorals(beanDesc.getBeanClass(),
+                         beanDesc.getClassInfo());
++        // Also, keep track of explicitly ignored ones...
+         Set<String> ignored;
+ 
+         if (ignorals != null) {
+             boolean ignoreAny = ignorals.getIgnoreUnknown();
+             builder.setIgnoreUnknownProperties(ignoreAny);
+-            // Or explicit/implicit definitions?
+-            ignored = ignorals.getIgnored();
++
++            ignored = ignorals.findIgnoredForDeserialization();
+             for (String propName : ignored) {
+                 builder.addIgnorable(propName);
+             }
+         } else {
+             ignored = Collections.emptySet();
+         }
+ 
+         // Also, do we have a fallback "any" setter?
+         AnnotatedMethod anySetterMethod = beanDesc.findAnySetter();
++        // 15-Jun-2017, tatu: Make fields work too, for [#1627]
+         AnnotatedMember anySetterField = null;
+         if (anySetterMethod != null) {
+             builder.setAnySetter(constructAnySetter(ctxt, beanDesc, anySetterMethod));
+         }
++        // but if not method, maybe field?
+         else {
+         	anySetterField = beanDesc.findAnySetterField();
+         	if(anySetterField != null) {
+         		builder.setAnySetter(constructAnySetter(ctxt, beanDesc, anySetterField));
+         	}
+         }
+-        // NOTE: we do NOT add @JsonIgnore'd properties into blocked ones if there's any-setter
+-        // Implicit ones via @JsonIgnore and equivalent?
++        
++        // If no any setter, need to ignore explicit defined ignored properties... unless already ignored
++        // 28-Mar-2017, tatu: As per [databind#1595], should NOT add these if there's an Any Setter
+         if (anySetterMethod == null && anySetterField == null) {
+             Collection<String> ignored2 = beanDesc.getIgnoredPropertyNames();
+             if (ignored2 != null) {
++                // 18-Nov-2017, tatu: Let's not add these blindly, need to consider Ignored Set...
+                 for (String propName : ignored2) {
+-                    // allow ignoral of similarly named JSON property, but do not force;
+-                    // latter means NOT adding this to 'ignored':
+-                    builder.addIgnorable(propName);
++                    // Allow ignoral of similarly named JSON property, but do not force;
++                    // latter means NOT adding this to `ignored`, let caller filter.
++                    // Forcing means adding it to builder's list
++                    //
++                    // 18-Nov-2017, tatu: But wait... this seems plain wrong. Why would we call
++                    //    this method? It will just add entries to internal `_ignoredPropertyNames`,
++                    //    which may or may not be ignored from actual definition. It seems that
++                    //    the filtering should occur later on...
++                    //    So: Let's comment this out for 2.10.
++//                    builder.addIgnorable(propName);
+                 }
+             }
+         }
+         final boolean useGettersAsSetters = ctxt.isEnabled(MapperFeature.USE_GETTERS_AS_SETTERS)
+                 && ctxt.isEnabled(MapperFeature.AUTO_DETECT_GETTERS);
+ 
+-        // Ok: let's then filter out property definitions
++        // Ok: let's then filter out property definitions defined either by explicit annotations
++        // or implicit autodiscovery, AND merge in creator properties, to end up
++        // with actual set of properties to deserialize. Note that this will also result
++        // in determination of ObjectId property, if any.
+         List<BeanPropertyDefinition> propDefs = filterBeanProps(ctxt,
+                 beanDesc, builder, beanDesc.findProperties(), ignored);
+ 
+         // After which we can let custom code change the set
+         if (_factoryConfig.hasDeserializerModifiers()) {
+             for (BeanDeserializerModifier mod : _factoryConfig.deserializerModifiers()) {
+                 propDefs = mod.updateProperties(ctxt.getConfig(), beanDesc, propDefs);
+             }
+         }
+         
+         // At which point we still have all kinds of properties; not all with mutators:
+         for (BeanPropertyDefinition propDef : propDefs) {
+             SettableBeanProperty prop = null;
+             /* 18-Oct-2013, tatu: Although constructor parameters have highest precedence,
+              *   we need to do linkage (as per [databind#318]), and so need to start with
+              *   other types, and only then create constructor parameter, if any.
+              */
++            // Does it have a mutator?
+             if (propDef.hasSetter()) {
+                 JavaType propertyType = propDef.getSetter().getParameterType(0);
+                 prop = constructSettableProperty(ctxt, beanDesc, propDef, propertyType);
+             } else if (propDef.hasField()) {
+                 JavaType propertyType = propDef.getField().getType();
+                 prop = constructSettableProperty(ctxt, beanDesc, propDef, propertyType);
+             } else if (useGettersAsSetters && propDef.hasGetter()) {
++                // 16-Nov-2015, tatu: To support "setterless collection deserialization"
+                 /* May also need to consider getters
+                  * for Map/Collection properties; but with lowest precedence
+                  */
+                 AnnotatedMethod getter = propDef.getGetter();
+                 // should only consider Collections and Maps, for now?
+                 Class<?> rawPropertyType = getter.getRawType();
+                 if (Collection.class.isAssignableFrom(rawPropertyType)
+                         || Map.class.isAssignableFrom(rawPropertyType)) {
+                     prop = constructSetterlessProperty(ctxt, beanDesc, propDef);
+                 }
+             }
+-            // 25-Sep-2014, tatu: No point in finding constructor parameters for abstract types
+-            //   (since they are never used anyway)
++
++            // [databind#318], need to ensure that Creator properties are properly matched
++            // with setters and fields. But FIELD has precedence over SETTER for this purpose? Oh well.
+             if (hasCreatorProps && propDef.hasConstructorParameter()) {
+                 /* If property is passed via constructor parameter, we must
+                  * handle things in special way. Not sure what is the most optimal way...
+                  * for now, let's just call a (new) method in builder, which does nothing.
+                  */
+                 // but let's call a method just to allow custom builders to be aware...
+                 final String name = propDef.getName();
+                 CreatorProperty cprop = null;
+                 if (creatorProps != null) {
+                     for (SettableBeanProperty cp : creatorProps) {
++                        // Need to ensure name AND type match: type for "implicitly named" parameters
++                        // is `null`
+                         if (name.equals(cp.getName()) && (cp instanceof CreatorProperty)) {
+                             cprop = (CreatorProperty) cp;
+                             break;
+                         }
+                     }
+                 }
++                // Uh oh... should we report an error? Let's assume for now that it's ok?
+                 if (cprop == null) {
++                    // 08-Sep-2017, tatu: Let's verify we get an injectable value...
++                    // 17-Oct-2017, tatu: ... maybe not? Could expect implicit value. Check later.
++//                    ValueInjector vi = builder.getValueInstantiator().findValueInjector(ctxt.getConfig(), cprop.getInjectableValueId());
++
+                     List<String> n = new ArrayList<>();
+                     for (SettableBeanProperty cp : creatorProps) {
+                         n.add(cp.getName());
+                     }
+                     ctxt.reportBadPropertyDefinition(beanDesc, propDef,
+                             "Could not find creator property with name '%s' (known Creator properties: %s)",
+                             name, n);
+-                    continue;
++                    continue; // ??
+                 }
++                // Ok, we must have a match between creator prop and regular prop;
++                // link the two
+                 if (prop != null) {
+                     cprop.setFallbackSetter(prop);
+                 }
+                 prop = cprop;
+-                builder.addCreatorProperty(cprop);
++                // And add to builder, continue to next property
++                builder.addCreatorProperty(prop);
+                 continue;
+             }
+ 
++            // Otherwise, means we are dealing with a regular property, which has a mutator
++            // method or field. For these, we add to builder, if not previously ignored.
+             if (prop != null) {
+                 Class<?>[] views = propDef.findViews();
+                 if (views == null) {
+                     // one more twist: if default inclusion disabled, need to force empty set of views
+                     if (!ctxt.isEnabled(MapperFeature.DEFAULT_VIEW_INCLUSION)) {
+                         views = NO_VIEWS;
+                     }
+                 }
+                 // one more thing before adding to builder: copy any metadata
+                 prop.setViews(views);
+                 builder.addProperty(prop);
+             }
+         }
+     }
+\ No newline at end of file

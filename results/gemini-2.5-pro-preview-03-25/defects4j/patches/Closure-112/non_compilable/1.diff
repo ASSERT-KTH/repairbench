@@ -1,0 +1,114 @@
+diff --git a/tmp/8941632a-2923-4388-8819-2ab5a6e9d858_buggy.java b/tmp/1a65bc50-8e5c-4153-a103-7470f748eab7_fixed.java
+index 63641d0..0645bcd 100644
+--- a/tmp/8941632a-2923-4388-8819-2ab5a6e9d858_buggy.java
++++ b/tmp/1a65bc50-8e5c-4153-a103-7470f748eab7_fixed.java
+@@ -1,33 +1,94 @@
++import com.google.common.base.Preconditions;
++import com.google.common.collect.ImmutableList;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.jstype.FunctionType;
++import com.google.javascript.rhino.jstype.JSType;
++import com.google.javascript.rhino.jstype.JSTypeRegistry;
++import com.google.javascript.rhino.jstype.ModificationVisitor;
++import com.google.javascript.rhino.jstype.TemplateType;
++import com.google.javascript.rhino.jstype.TemplateTypeMap;
++import java.util.Map;
++
++// NOTE: This code snippet assumes it's part of a larger class that has access
++// to a JSTypeRegistry instance named 'registry'. Imports are included for clarity.
++
+   /**
+    * For functions with function(this: T, ...) and T as parameters, type
+    * inference will set the type of this on a function literal argument to the
+    * the actual type of T.
++   *
++   * <p>This function is also responsible for specializing template types based on the call context.
++   * It infers template types from arguments and potentially the 'this' type, then applies
++   * these inferred types to the function signature, updating the types on the call-related AST
++   * nodes.
+    */
+   private boolean inferTemplatedTypesForCall(
+       Node n, FunctionType fnType) {
+-    final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+-        .getTemplateKeys();
+-    if (keys.isEmpty()) {
++    final TemplateTypeMap fnTemplateTypeMap = fnType.getTemplateTypeMap();
++    if (fnTemplateTypeMap.isEmpty()) {
+       return false;
+     }
+ 
+-    // Try to infer the template types
++    // Try to infer the template types based on the arguments and potentially 'this' type.
++    // The result is a map from template types to the JSTypes they should be replaced with.
+     Map<TemplateType, JSType> inferred =
+         inferTemplateTypesFromParameters(fnType, n);
+ 
++    // If no template types were resolved/inferred, no specialization is needed based on parameters.
++    // Note: Resolution based purely on 'this' type might still be desirable but is complex.
++    // For now, if the parameter-based inference yields nothing, we stop.
++    if (inferred.isEmpty()) {
++      return false;
++    }
+ 
+-    // Replace all template types. If we couldn't find a replacement, we
+-    // replace it with UNKNOWN.
+-    TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+-        registry, inferred);
++    // Visitor that replaces template types found in the map, leaving others unchanged.
++    // This prevents prematurely replacing uninferred template types with UNKNOWN,
++    // allowing them to be potentially resolved later or remain generic.
++    class PartialTemplateTypeReplacer extends ModificationVisitor {
++      private final Map<TemplateType, JSType> replacements;
++      boolean madeChanges = false;
++
++      PartialTemplateTypeReplacer(JSTypeRegistry registry, Map<TemplateType, JSType> replacements) {
++        super(registry);
++        this.replacements = replacements;
++      }
++
++      @Override
++      JSType caseTemplateType(TemplateType type) {
++        if (replacements.containsKey(type)) {
++          JSType replacement = replacements.get(type);
++          // Check that the replacement is non-null and actually different from the
++          // original template type before marking changes. Using equals avoids marking
++          // a change when a template type resolves to itself.
++          if (replacement != null && !replacement.equals(type)) {
++             madeChanges = true;
++             return replacement;
++          }
++        }
++        // Return the original template type if it's not in the map or the replacement is null/same.
++        return type;
++      }
++    }
++
++    PartialTemplateTypeReplacer replacer = new PartialTemplateTypeReplacer(registry, inferred);
++
++    // Apply the inferred replacements to the function type signature.
++    JSType replaced = fnType.visit(replacer);
++
++    // The result of visiting a FunctionType should still be a FunctionType.
++    FunctionType replacementFnType = replaced.toMaybeFunctionType();
++    Preconditions.checkNotNull(replacementFnType, "Could not resolve to function type after substitution");
++
++
++    // Only update AST types if the replacer actually made effective changes.
++    if (!replacer.madeChanges) {
++      return false;
++    }
++
++    // Update the types on the relevant AST nodes (the call target and the call itself).
+     Node callTarget = n.getFirstChild();
+-
+-    FunctionType replacementFnType = fnType.visit(replacer)
+-        .toMaybeFunctionType();
+-    Preconditions.checkNotNull(replacementFnType);
+-
+     callTarget.setJSType(replacementFnType);
+     n.setJSType(replacementFnType.getReturnType());
+ 
+-    return replacer.madeChanges;
++    return true; // Indicate that types were successfully inferred and updated.
+   }
+\ No newline at end of file

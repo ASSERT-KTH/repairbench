@@ -1,0 +1,158 @@
+diff --git a/tmp/2eea1c35-e42a-409c-9fe4-f2733643d796_buggy.java b/tmp/7f613525-17df-41ed-b149-e36016f1747e_fixed.java
+index 31af44b..bf4c4cd 100644
+--- a/tmp/2eea1c35-e42a-409c-9fe4-f2733643d796_buggy.java
++++ b/tmp/7f613525-17df-41ed-b149-e36016f1747e_fixed.java
+@@ -1,107 +1,142 @@
+     /**
+      * Counts the number of direct (full) references to an object.
+      * Specifically, we check for references of the following type:
+      * <pre>
+      *   x;
+      *   x.fn();
+      * </pre>
+      */
+     private boolean isInlinableObject(List<Reference> refs) {
+       boolean ret = false;
++      // Keep track of properties that are known to be defined on the object.
++      // Initially, this includes properties defined in the object literal.
++      // It can be expanded by assignments to properties of the object.
+       Set<String> validProperties = Sets.newHashSet();
+       for (Reference ref : refs) {
+         Node name = ref.getNode();
+         Node parent = ref.getParent();
+         Node gramps = ref.getGrandparent();
+ 
+         // Ignore most indirect references, like x.y (but not x.y(),
+         // since the function referenced by y might reference 'this').
+         //
+         if (parent.isGetProp()) {
+           Preconditions.checkState(parent.getFirstChild() == name);
+           // A call target may be using the object as a 'this' value.
+           if (gramps.isCall()
+               && gramps.getFirstChild() == parent) {
++            // e.g. x.y()
+             return false;
+           }
+ 
+           // Deleting a property has different semantics from deleting
+           // a variable, so deleted properties should not be inlined.
++          if (gramps.isDelProp()) {
++             // e.g. delete x.y
++            return false;
++          }
+ 
+           // NOTE(nicksantos): This pass's object-splitting algorithm has
+           // a blind spot. It assumes that if a property isn't defined on an
+           // object, then the value is undefined. This is not true, because
+           // Object.prototype can have arbitrary properties on it.
+           //
+           // We short-circuit this problem by bailing out if we see a reference
+-          // to a property that isn't defined on the object literal. This
+-          // isn't a perfect algorithm, but it should catch most cases.
++          // to a property that isn't defined on the object literal OR assigned
++          // later. This isn't a perfect algorithm, but it should catch most cases.
+           String propName = parent.getLastChild().getString();
+           if (!validProperties.contains(propName)) {
+-            if (NodeUtil.isVarOrSimpleAssignLhs(parent, gramps)) {
++            // The property is not known to be defined. Check if it's being
++            // assigned to in this reference. If so, add it to the known
++            // properties. Otherwise, bail out.
++            // e.g. x.y = 1; (gramps is ASSIGN, parent is GETPROP x.y)
++            // or var z = x.y = 1; (gramps is ASSIGN, parent is GETPROP x.y)
++            // or x.y += 1; (gramps is ASSIGN_*, parent is GETPROP x.y)
++            if (NodeUtil.isAssignmentOp(gramps) && gramps.getFirstChild() == parent) {
++              validProperties.add(propName);
++            } else if (NodeUtil.isVarOrSimpleAssignLhs(parent, gramps)) {
++              // This case handles var x = {a:1}; x.b = 2;
++              // Here parent=x.b, gramps=ASSIGN
+               validProperties.add(propName);
+             } else {
++              // Property is referenced but not defined/assigned in a way
++              // we can track.
++              // e.g. alert(x.y); where y was not in the original literal
++              // or assigned via x.y = ...;
+               return false;
+             }
+           }
++          // This reference is a property access that is safe to inline.
+           continue;
+         }
+ 
+-        // Only rewrite VAR declarations or simple assignment statements
++        // If the reference is not part of a GETPROP, it must be a direct
++        // reference like `x` itself. We only allow these if they are the LHS
++        // of a VAR declaration or a simple assignment.
+         if (!isVarOrAssignExprLhs(name)) {
++           // e.g. alert(x); or x;
+            return false;
+         }
+ 
+         Node val = ref.getAssignedValue();
+         if (val == null) {
+-          // A var with no assignment.
++          // A var declaration with no assignment, e.g., var x;
++          // This is allowed, but doesn't contribute to making ret = true.
+           continue;
+         }
+ 
+         // We're looking for object literal assignments only.
++        // e.g. x = {a: 1, b: 2};
+         if (!val.isObjectLit()) {
++          // e.g. x = other_var; or x = 1;
+           return false;
+         }
+ 
+         // Make sure that the value is not self-referential. IOW,
+         // disallow things like x = {b: x.a}.
+         //
+-        // TODO: Only exclude unorderable self-referential
++        // TODO(b/116314996): Only exclude unorderable self-referential
+         // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+         // but x = {a: 1, b: x.a} is.
+         //
+         // Also, ES5 getters/setters aren't handled by this pass.
+         for (Node child = val.getFirstChild(); child != null;
+              child = child.getNext()) {
+           if (child.isGetterDef() ||
+               child.isSetterDef()) {
+             // ES5 get/set not supported.
+             return false;
+           }
+ 
++          // Record the property defined in the object literal.
+           validProperties.add(child.getString());
+ 
+           Node childVal = child.getFirstChild();
+           // Check if childVal is the parent of any of the passed in
+           // references, as that is how self-referential assignments
+-          // will happen.
++          // will happen. e.g. x = { a: x.b }
+           for (Reference t : refs) {
+             Node refNode = t.getParent();
+-            while (!NodeUtil.isStatementBlock(refNode)) {
++            // Traverse up from the reference's parent to see if it's contained
++            // within the value expression of a property in the current object literal.
++            while (refNode != null && refNode != gramps && !NodeUtil.isStatementBlock(refNode)) {
+               if (refNode == childVal) {
+                 // There's a self-referential assignment
+                 return false;
+               }
+               refNode = refNode.getParent();
+             }
+           }
+         }
+ 
+ 
+         // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
++        // long as there are no other assignments or disallowed references
++        // that mess things up, we can inline.
+         ret = true;
+       }
++      // The object is inlinable only if we found at least one valid
++      // object literal assignment (`ret = true`) and none of the references
++      // invalidated the possibility (returned false).
+       return ret;
+     }
+\ No newline at end of file

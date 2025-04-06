@@ -1,0 +1,120 @@
+diff --git a/tmp/05a236a8-c198-4c78-a0ae-898b94384088_buggy.java b/tmp/15814f32-8aa2-43f2-985d-e2056ab396d9_fixed.java
+index afcc27c..7614860 100644
+--- a/tmp/05a236a8-c198-4c78-a0ae-898b94384088_buggy.java
++++ b/tmp/15814f32-8aa2-43f2-985d-e2056ab396d9_fixed.java
+@@ -1,61 +1,112 @@
+     /**
+      * Variant called when creation of the POJO involves buffering of creator properties
+      * as well as property-based creator.
+      */
+     public Object complete(JsonParser p, DeserializationContext ctxt,
+             PropertyValueBuffer buffer, PropertyBasedCreator creator)
+         throws IOException
+     {
+         // first things first: deserialize all data buffered:
+         final int len = _properties.length;
+         Object[] values = new Object[len];
+         for (int i = 0; i < len; ++i) {
+             String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
+             if (typeId == null) {
+                 // let's allow missing both type and property (may already have been set, too)
+                 if (_tokens[i] == null) {
+                     continue;
+                 }
+                 // but not just one
+                 // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
+                 if (!extProp.hasDefaultType()) {
++                    // 11-Sep-2019, tatu: Probably could decent default value but...
+                     ctxt.reportInputMismatch(_beanType,
+                             "Missing external type id property '%s'",
+                             extProp.getTypePropertyName());
++                    // fall through just in case we ignore error
+                 } else {
+                     typeId = extProp.getDefaultTypeId();
+                 }
+             } else if (_tokens[i] == null) {
+                 SettableBeanProperty prop = extProp.getProperty();
++                // 11-Sep-2019, tatu: Need to allow default value, if any, for property too
++                if (prop.isRequired() || ctxt.isEnabled(DeserializationFeature.FAIL_ON_MISSING_EXTERNAL_TYPE_ID_PROPERTY)) {
+                     ctxt.reportInputMismatch(_beanType,
+                         "Missing property '%s' for external type id '%s'",
+-                        prop.getName(), _properties[i].getTypePropertyName());
++                        prop.getName(), extProp.getTypePropertyName());
++                } else {
++                    // Important: support default value for the property.
++                    values[i] = prop.getNullValueProvider().getNullValue(ctxt);
++                    // We don't actually have the property token, so null is fine?
++                    // Or should we retain the typeId somehow?
++                    // NNO! Cannot skip processing as we may need this for creator call.
++                    // continue;
+                 }
++            }
++
++            // 11-Sep-2019, tatu: May need this for default value too
++            if (values[i] == null) {
+                 values[i] = _deserialize(p, ctxt, i, typeId);
++            }
+ 
+             final SettableBeanProperty prop = extProp.getProperty();
+             // also: if it's creator prop, fill in
+             if (prop.getCreatorIndex() >= 0) {
+                 buffer.assignParameter(prop, values[i]);
+ 
+                 // [databind#999] And maybe there's creator property for type id too?
+                 SettableBeanProperty typeProp = extProp.getTypeProperty();
+                 // for now, should only be needed for creator properties, too
+                 if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
++                    Object typeValueToAssign;
+                     // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
+                     //    apply deserializer... fun fun.
+-                    buffer.assignParameter(typeProp, typeId);
++                    // 10-Jun-2020, tatu: As per [databind#2733], may need conversion based on
++                    //    target type; not just Enum but other scalar types too.
++                    final Class<?> typeMeta = typeProp.getType().getRawClass();
++                    if (typeMeta.isAssignableFrom(String.class)) {
++                       typeValueToAssign = typeId;
++                    } else {
++                        // Use TokenBuffer to wrap the String typeId and parse it using the property's deserializer
++                        com.fasterxml.jackson.databind.util.TokenBuffer tb = new com.fasterxml.jackson.databind.util.TokenBuffer(p, ctxt);
++                        tb.writeString(typeId);
++
++                        // important: need to use existing parser, context
++                        JsonDeserializer<Object> deser = typeProp.getValueDeserializer();
++                        // 10-Jun-2020, tatu: Should not really happen but...
++                        if (deser == null) {
++                            ctxt.reportInputMismatch(typeProp,
++                                    "Missing JsonDeserializer for type id property '%s' (type %s)",
++                                    typeProp.getName(), typeProp.getType());
++                            // should perhaps not assign? Or what? For now, null? Seems suboptimal
++                            typeValueToAssign = null; // Or... String? null seems safer if there's error
++                        } else {
++                            try (JsonParser p2 = tb.asParserOnFirstToken()) { // requires p2.nextToken()
++                                // Need to advance parser to the first token
++                                if (p2.nextToken() == null) {
++                                    // Should not happen if we wrote a string
++                                    ctxt.reportInputMismatch(typeProp, "Internal error: failed parsing type id '%s' for property '%s'",
++                                            typeId, typeProp.getName());
++                                    typeValueToAssign = null;
++                                } else {
++                                    typeValueToAssign = deser.deserialize(p2, ctxt);
++                                }
++                            }
++                        }
++                        tb.close();
++                    }
++                    buffer.assignParameter(typeProp, typeValueToAssign);
+                 }
+             }
+         }
+         Object bean = creator.build(ctxt, buffer);
+         // third: assign non-creator properties
+         for (int i = 0; i < len; ++i) {
+             SettableBeanProperty prop = _properties[i].getProperty();
+             if (prop.getCreatorIndex() < 0) {
+                 prop.set(bean, values[i]);
+             }
+         }
+         return bean;
+     }
+\ No newline at end of file

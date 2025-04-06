@@ -1,0 +1,267 @@
+diff --git a/tmp/5e87a064-2dec-4855-9d78-3a654296a5f5_buggy.java b/tmp/36d2886e-2bbd-4043-9691-660298afe1db_fixed.java
+index 032fa8e..ce9b587 100644
+--- a/tmp/5e87a064-2dec-4855-9d78-3a654296a5f5_buggy.java
++++ b/tmp/36d2886e-2bbd-4043-9691-660298afe1db_fixed.java
+@@ -1,108 +1,224 @@
++import org.apache.commons.math.FunctionEvaluationException;
++import org.apache.commons.math.ConvergenceException;
++import org.apache.commons.math.analysis.UnivariateRealFunction;
++import org.apache.commons.math.analysis.solvers.BrentSolver;
++import org.apache.commons.math.ode.DerivativeException;
++import org.apache.commons.math.ode.sampling.StepInterpolator;
++import java.lang.Math; // For nextafter, abs, ceil
++
++// No other imports seem necessary based on the original code and the fix.
++
++// Class definition and other methods are omitted
++
+     /** Evaluate the impact of the proposed step on the event handler.
+      * @param interpolator step interpolator for the proposed step
+      * @return true if the event handler triggers an event before
+      * the end of the proposed step (this implies the step should be
+      * rejected)
+      * @exception DerivativeException if the interpolator fails to
+      * compute the switching function somewhere within the step
+      * @exception EventException if the switching function
+      * cannot be evaluated
+      * @exception ConvergenceException if an event cannot be located
+      */
+     public boolean evaluateStep(final StepInterpolator interpolator)
+         throws DerivativeException, EventException, ConvergenceException {
+ 
+         try {
+ 
+             forward = interpolator.isForward();
+             final double t1 = interpolator.getCurrentTime();
+-            final int    n  = Math.max(1, (int) Math.ceil(Math.abs(t1 - t0) / maxCheckInterval));
+-            final double h  = (t1 - t0) / n;
++            final double dt = t1 - t0;
++            if (Math.abs(dt) < convergence) {
++                // we cannot select a time range shorter than convergence
++                return false;
++            }
++            final int    n  = Math.max(1, (int) Math.ceil(Math.abs(dt) / maxCheckInterval));
++            final double h  = dt / n;
+ 
+             double ta = t0;
+             double ga = g0;
+-            double tb = t0 + (interpolator.isForward() ? convergence : -convergence);
++
+             for (int i = 0; i < n; ++i) {
+ 
+                 // evaluate handler value at the end of the substep
+-                tb += h;
++                final double tb = t0 + (i + 1) * h;
+                 interpolator.setInterpolatedTime(tb);
+                 final double gb = handler.g(tb, interpolator.getInterpolatedState());
+ 
+-                // check events occurrence
++                // check events occurrence: sign change relative to the beginning of the *step* (t0)
+                 if (g0Positive ^ (gb >= 0)) {
+-                    // there is a sign change: an event is expected during this step
+-
+-                        // this is a corner case:
+-                        // - there was an event near ta,
+-                        // - there is another event between ta and tb
+-                        // - when ta was computed, convergence was reached on the "wrong side" of the interval
+-                        // this implies that the real sign of ga is the same as gb, so we need to slightly
+-                        // shift ta to make sure ga and gb get opposite signs and the solver won't complain
+-                        // about bracketing
+-                            // this should never happen
+-                         
+-                    // variation direction, with respect to the integration direction
+-                    increasing = gb >= ga;
++                    // there is a sign change: an event is expected during this substep [ta, tb]
+ 
++                    // create a function wrapper for the G function
+                     final UnivariateRealFunction f = new UnivariateRealFunction() {
+                         public double value(final double t) throws FunctionEvaluationException {
+                             try {
+                                 interpolator.setInterpolatedTime(t);
+                                 return handler.g(t, interpolator.getInterpolatedState());
+                             } catch (DerivativeException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             } catch (EventException e) {
+                                 throw new FunctionEvaluationException(e, t);
++                            } catch (ConvergenceException e) {
++                                // It is not clear how ConvergenceException can be triggered within handler.g
++                                // but we wrap it for safety, following the original pattern.
++                                throw new FunctionEvaluationException(e, t);
+                             }
+                         }
+                     };
++
+                     final BrentSolver solver = new BrentSolver();
+                     solver.setAbsoluteAccuracy(convergence);
+                     solver.setMaximalIterationCount(maxIterationCount);
+-                    final double root = (ta <= tb) ? solver.solve(f, ta, tb) : solver.solve(f, tb, ta);
+-                    if ((Math.abs(root - ta) <= convergence) &&
+-                         (Math.abs(root - previousEventTime) <= convergence)) {
+-                        // we have either found nothing or found (again ?) a past event, we simply ignore it
++
++                    // Define interval endpoints for solver, ensuring tMin < tMax
++                    double tMin = ta;
++                    double tMax = tb;
++                    double gMin = ga;
++                    double gMax = gb;
++                    if (!forward) { // Integration is backward
++                        tMin = tb; tMax = ta;
++                        gMin = gb; gMax = ga;
++                    }
++
++                    // Adjust interval if endpoints have zero values, to ensure bracketing for the solver.
++                    if (gMin == 0.0) {
++                        // Avoid starting search from a known root. Move start slightly into the interval.
++                        double tMinOrig = tMin;
++                        tMin = Math.nextafter(tMin, tMax);
++                        // Check if interval became invalid
++                        if (tMin >= tMax) {
++                             // Cannot create a positive-width interval. The sub-step is tiny.
++                             // Skip this sub-step as no root can be reliably found.
++                             ta = tb; ga = gb; continue;
++                        }
++                        gMin = f.value(tMin);
++                        // If gMin is still 0, the function is likely flat zero - solver cannot work.
++                        if (gMin == 0.0) {
++                            throw new ConvergenceException("Function seems to be zero near event time {0}", tMinOrig);
++                        }
++                    }
++                    if (gMax == 0.0) {
++                        // Avoid ending search at a known root. Move end slightly into the interval.
++                        double tMaxOrig = tMax;
++                        tMax = Math.nextafter(tMax, tMin);
++                         // Check if interval became invalid
++                         if (tMax <= tMin) {
++                            // Cannot create a positive-width interval.
++                            ta = tb; ga = gb; continue;
++                         }
++                        gMax = f.value(tMax);
++                         // If gMax is still 0, the function is likely flat zero.
++                        if (gMax == 0.0) {
++                            throw new ConvergenceException("Function seems to be zero near event time {0}", tMaxOrig);
++                        }
++                    }
++
++                    // After potential shifts for zero endpoints, check bracketing again.
++                    if ((gMin > 0) == (gMax > 0)) {
++                        // Signs are the same. This implies a problem unless it's the known corner case.
++                        // Corner case: ta == t0 is a previous root, and g0Positive is misleading relative to gb.
++                        // It happens if the previous step search landed exactly on the root, and g0 was set to 0.
++                        // The check g0Positive ^ (gb >= 0) might pass, but ga=0, gb has the 'wrong' sign for bracketing.
++                        boolean cornerCase = (ta == t0 && !Double.isNaN(previousEventTime) && Math.abs(ta - previousEventTime) <= convergence);
++
++                        if (cornerCase) {
++                             // The interval start ta was the root found previously. ga is 0.
++                             // We must shift ta slightly towards tb to see if the function changes sign as expected.
++                             double ta_orig = ta; // Original start of sub-interval (previous root)
++
++                             // Shift ta slightly into the interval [ta, tb] or [tb, ta]
++                             ta = Math.nextafter(ta_orig, tb);
++
++                             // Check if shift was effective and didn't jump over tb
++                             if (ta == ta_orig || (forward && ta >= tb) || (!forward && ta <= tb)) {
++                                 // Shift failed or interval too small
++                                 throw new ConvergenceException("Cannot shift start of interval in corner case at time {0}", ta_orig);
++                             }
++                             ga = f.value(ta); // Recompute ga at the shifted point
++                             if (ga == 0.0) { // Still zero after shift? Problematic function.
++                                 throw new ConvergenceException("Function is zero after shifting start of interval in corner case at time {0}", ta_orig);
++                             }
++
++                             // Re-assign solver variables based on the shifted ta/ga
++                             // Note: tb and gb remain the same.
++                             if (forward) {
++                                tMin = ta; tMax = tb; gMin = ga; gMax = gb;
++                             } else {
++                                tMin = tb; tMax = ta; gMin = gb; gMax = ga;
++                             }
++
++                             // Check bracketing one last time after corner case shift
++                             if ((gMin > 0) == (gMax > 0)) {
++                                   // Even after shifting away from the problematic start point, no bracket found.
++                                   // This indicates the g0Positive ^ (gb>=0) check was misleading, function might be tangent.
++                                   throw new ConvergenceException("Cannot bracket root even after trying corner case fix. g({0})={1}, g({2})={3}", tMin, gMin, tMax, gMax);
++                             }
++                             // Bracketing holds now, proceed to solver below.
++                         } else {
++                             // Not the specific corner case, but signs are the same.
++                             // This should not happen if g0Positive ^ (gb >= 0) was true and ga, gb are non-zero.
++                             throw new ConvergenceException("Interval endpoints do not bracket the root despite sign change detection relative to previous event. g({0})={1}, g({2})={3}", tMin, gMin, tMax, gMax);
++                         }
++                    }
++
++                    // Determine the crossing direction based on the final interval ends gMin/gMax.
++                    // This is needed for stepAccepted() later.
++                    // gMax corresponds to tMax, gMin to tMin, and tMax > tMin. g increases if gMax >= gMin.
++                    increasing = gMax >= gMin;
++
++                    // Solve for the root in the (potentially adjusted) bracketing interval [tMin, tMax]
++                    final double root = solver.solve(f, tMin, tMax);
++
++                    // Check if the found root is the same as the previous event
++                    if (!Double.isNaN(previousEventTime) && (Math.abs(root - previousEventTime) <= convergence)) {
++                        // Root is essentially the previous event; ignore it and proceed to next sub-interval.
++                        // Update the start of the next sub-interval.
+                         ta = tb;
+                         ga = gb;
+-                    } else if (Double.isNaN(previousEventTime) ||
+-                               (Math.abs(previousEventTime - root) > convergence)) {
++                        // Do NOT change g0Positive here. It reflects the state at t0.
++                    } else {
++                        // Found a new event (or the first event).
+                         pendingEventTime = root;
+                         if (pendingEvent && (Math.abs(t1 - pendingEventTime) <= convergence)) {
+-                            // we were already waiting for this event which was
+-                            // found during a previous call for a step that was
+-                            // rejected, this step must now be accepted since it
+-                            // properly ends exactly at the event occurrence
+-                            return false;
++                            // This step ends precisely at an event we previously detected
++                            // but couldn't accept (because the step was rejected). Now we can accept it.
++                            return false; // Accept the step.
+                         }
+-                        // either we were not waiting for the event or it has
+-                        // moved in such a way the step cannot be accepted
++                        // We found a new event before the end of the proposed step t1.
++                        // Store it and reject the step.
+                         pendingEvent = true;
+-                        return true;
++                        return true; // Reject the step.
+                     }
+ 
+                 } else {
+-                    // no sign change: there is no event for now
++                    // no sign change detected in this substep using g0Positive: regular advance
+                     ta = tb;
+                     ga = gb;
+                 }
++            } // End of sub-interval loop
+ 
+-            }
+-
+-            // no event during the whole step
++            // no event detected during the whole step
+             pendingEvent     = false;
+             pendingEventTime = Double.NaN;
+             return false;
+ 
+         } catch (FunctionEvaluationException e) {
++            // Handle exceptions potentially wrapped by the function evaluation
+             final Throwable cause = e.getCause();
+             if ((cause != null) && (cause instanceof DerivativeException)) {
+                 throw (DerivativeException) cause;
+             } else if ((cause != null) && (cause instanceof EventException)) {
+                 throw (EventException) cause;
++            } else if ((cause != null) && (cause instanceof ConvergenceException)) {
++                 throw (ConvergenceException) cause;
+             }
++            // Wrap other exceptions from function evaluation (like potential RuntimeException)
+             throw new EventException(e);
++        } catch (ConvergenceException ce) {
++             // Catch convergence exceptions potentially thrown directly by the solver
++             throw ce;
+         }
+ 
+-    }
++    } // End of evaluateStep method
+\ No newline at end of file

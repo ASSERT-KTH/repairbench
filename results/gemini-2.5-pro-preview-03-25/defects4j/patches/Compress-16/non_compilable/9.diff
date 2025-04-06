@@ -1,0 +1,168 @@
+diff --git a/tmp/3bdb7154-4f15-4f40-b813-8c7033e1ce83_buggy.java b/tmp/a039bdd4-1ecf-4254-9ced-c981f7b980ef_fixed.java
+index 2ce28b5..acd06b5 100644
+--- a/tmp/3bdb7154-4f15-4f40-b813-8c7033e1ce83_buggy.java
++++ b/tmp/a039bdd4-1ecf-4254-9ced-c981f7b980ef_fixed.java
+@@ -1,72 +1,133 @@
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++import org.apache.commons.compress.archivers.ar.ArArchiveInputStream;
++import org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream;
++import org.apache.commons.compress.archivers.dump.DumpArchiveInputStream;
++import org.apache.commons.compress.archivers.jar.JarArchiveInputStream;
++import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
++import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
++
++// Assuming the class context is ArchiveStreamFactory
++public class ArchiveStreamFactory {
++    //... other methods ...
++
+     /**
+      * Create an archive input stream from an input stream, autodetecting
+      * the archive type from the first few bytes of the stream. The InputStream
+      * must support marks, like BufferedInputStream.
+      *
+      * @param in the input stream
+      * @return the archive input stream
+-     * @throws ArchiveException if the archiver name is not known
++     * @throws ArchiveException if the archiver name is not known or the stream doesn't contain a recognized archive
+      * @throws IllegalArgumentException if the stream is null or does not support mark
+      */
+     public ArchiveInputStream createArchiveInputStream(final InputStream in)
+             throws ArchiveException {
+         if (in == null) {
+             throw new IllegalArgumentException("Stream must not be null.");
+         }
+ 
+         if (!in.markSupported()) {
+             throw new IllegalArgumentException("Mark is not supported.");
+         }
+ 
+-        final byte[] signature = new byte[12];
+-        in.mark(signature.length);
++        // Buffer size needs to be large enough for TAR header (512 bytes)
++        // Other formats require less buffer size.
++        final byte[] signature = new byte[512];
++        in.mark(signature.length); // Mark the current position before reading signature
++        int signatureLength = 0;
++
+         try {
+-            int signatureLength = in.read(signature);
+-            in.reset();
++            // Read up to signature.length bytes into the buffer
++            int bytesRead;
++            while (signatureLength < signature.length) {
++                bytesRead = in.read(signature, signatureLength, signature.length - signatureLength);
++                if (bytesRead < 0) { // Reached EOF
++                    break;
++                }
++                signatureLength += bytesRead;
++            }
++
++            in.reset(); // Reset the stream to the marked position
++
++            // Check known archive signatures in a sensible order
++
++            // Zip and Jar Check (common)
+             if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+                 return new ZipArchiveInputStream(in);
+-            } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
++            }
++            if (JarArchiveInputStream.matches(signature, signatureLength)) {
+                 return new JarArchiveInputStream(in);
+-            } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
++            }
++
++            // Ar Check
++            if (ArArchiveInputStream.matches(signature, signatureLength)) {
+                 return new ArArchiveInputStream(in);
+-            } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
++            }
++
++            // Cpio Check - matches() is basic, constructor does more validation.
++            if (CpioArchiveInputStream.matches(signature, signatureLength)) {
++                // Attempt to create the CPIO stream; it might fail if the header is invalid.
++                // The stream 'in' is already reset, so CpioArchiveInputStream starts from the beginning.
++                try {
+                     return new CpioArchiveInputStream(in);
++                } catch (IOException e) {
++                    // If constructor fails, it wasn't a valid CPIO stream start. Ignore and continue detection.
++                }
+             }
+ 
+-            // Dump needs a bigger buffer to check the signature;
+-            final byte[] dumpsig = new byte[32];
+-            in.mark(dumpsig.length);
+-            signatureLength = in.read(dumpsig);
+-            in.reset();
+-            if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
++            // Dump Check (needs at least 32 bytes)
++            if (signatureLength >= 32) {
++                if (DumpArchiveInputStream.matches(signature, signatureLength)) {
+                     return new DumpArchiveInputStream(in);
+                 }
++            }
+ 
+-            // Tar needs an even bigger buffer to check the signature; read the first block
+-            final byte[] tarheader = new byte[512];
+-            in.mark(tarheader.length);
+-            signatureLength = in.read(tarheader);
+-            in.reset();
+-            if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
++            // Tar Check using standard magic bytes (e.g., "ustar")
++            // matches() checks specific offsets, ensure enough bytes were read
++            if (TarArchiveInputStream.matches(signature, signatureLength)) {
+                  return new TarArchiveInputStream(in);
+             }
+-            // COMPRESS-117 - improve auto-recognition
++
++            // Fallback Tar check (COMPRESS-117, COMPRESS-191) for TARs without standard magic
++            // Requires 512 bytes to check the header structure and checksum.
+             if (signatureLength >= 512) {
++                TarArchiveInputStream tais = null;
+                 try {
+-                    TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+-                    // COMPRESS-191 - verify the header checksum
+-                    tais.getNextEntry();
++                    // Use a temporary stream on the read buffer to avoid consuming 'in'
++                    tais = new TarArchiveInputStream(new ByteArrayInputStream(signature));
++                    // Try to read the first entry. This validates the header and checksum.
++                    // Crucially, check if it actually found an entry (non-null).
++                    // This prevents matching zero blocks or other non-standard tar formats
++                    // that might accidentally pass the checksum validation.
++                    if (tais.getNextEntry() != null) {
++                        // If an entry is found, assume it's a TAR file.
++                        // Return a new Tar stream based on the original input stream 'in'.
+                         return new TarArchiveInputStream(in);
+-                } catch (Exception e) { // NOPMD
+-                    // can generate IllegalArgumentException as well
+-                    // as IOException
+-                    // autodetection, simply not a TAR
+-                    // ignored
++                    }
++                    // else: getNextEntry() returned null (e.g., empty TAR, zero block) or threw an exception.
++                    // Treat these cases as "not a TAR" for the purpose of this fallback detection.
++                } catch (Exception e) { // NOPMD - Catches IOException, IllegalArgumentException etc. from parsing
++                    // Header validation failed (e.g., bad checksum, invalid format). Ignore.
++                } finally {
++                    // Ensure temporary stream is closed
++                    if (tais != null) {
++                        try {
++                            tais.close();
++                        } catch (IOException ignored) { // NOSONAR
++                            // Ignore exception from closing ByteArrayInputStream
++                        }
++                    }
+                 }
+             }
+         } catch (IOException e) {
++            // Catch I/O errors during the initial read/mark/reset operations
+             throw new ArchiveException("Could not use reset and mark operations.", e);
+         }
+ 
++        // If none of the above checks identified an archive format
+         throw new ArchiveException("No Archiver found for the stream signature");
+     }
++}
+\ No newline at end of file

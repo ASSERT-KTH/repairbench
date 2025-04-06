@@ -1,0 +1,110 @@
+diff --git a/tmp/b0389e83-45fa-4c49-924f-86b21e67fce1_buggy.java b/tmp/38d9ed81-8c1b-470d-8854-897044296144_fixed.java
+index afcc27c..71632d6 100644
+--- a/tmp/b0389e83-45fa-4c49-924f-86b21e67fce1_buggy.java
++++ b/tmp/38d9ed81-8c1b-470d-8854-897044296144_fixed.java
+@@ -1,61 +1,101 @@
+     /**
+      * Variant called when creation of the POJO involves buffering of creator properties
+      * as well as property-based creator.
+      */
+     public Object complete(JsonParser p, DeserializationContext ctxt,
+             PropertyValueBuffer buffer, PropertyBasedCreator creator)
+         throws IOException
+     {
+         // first things first: deserialize all data buffered:
+         final int len = _properties.length;
+         Object[] values = new Object[len];
+         for (int i = 0; i < len; ++i) {
+             String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
+             if (typeId == null) {
+                 // let's allow missing both type and property (may already have been set, too)
+                 if (_tokens[i] == null) {
+                     continue;
+                 }
+                 // but not just one
+                 // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
+                 if (!extProp.hasDefaultType()) {
++                    // 13-Dec-2015, tatu: Let's allow special case of property being injectable...
++                    //    (although that seems odd)
++                     if (extProp.getProperty().getInjectableValueId() != null) {
++                         // allow missing type id for injected props
++                         continue;
++                     }
+                     ctxt.reportInputMismatch(_beanType,
+                             "Missing external type id property '%s'",
+                             extProp.getTypePropertyName());
+                 } else {
+                     typeId = extProp.getDefaultTypeId();
+                 }
+             } else if (_tokens[i] == null) {
+                 SettableBeanProperty prop = extProp.getProperty();
++                // 13-Dec-2015, tatu: Let's allow special case of property being injectable...
++                Object injectableValueId = prop.getInjectableValueId();
++                if (injectableValueId != null) {
++                    buffer.inject(prop);
++                    continue; // property will be injected, no need to do anything here
++                }
++                // ... normally fine, although we have default impl case to consider too...
++                // -> Let's assume this is an error; missing property is not ok
+                  ctxt.reportInputMismatch(_beanType,
+                         "Missing property '%s' for external type id '%s'",
+-                        prop.getName(), _properties[i].getTypePropertyName());
++                        prop.getName(), extProp.getTypePropertyName());
+             }
+             values[i] = _deserialize(p, ctxt, i, typeId);
+ 
+             final SettableBeanProperty prop = extProp.getProperty();
+             // also: if it's creator prop, fill in
+             if (prop.getCreatorIndex() >= 0) {
+                 buffer.assignParameter(prop, values[i]);
+ 
+                 // [databind#999] And maybe there's creator property for type id too?
+                 SettableBeanProperty typeProp = extProp.getTypeProperty();
+                 // for now, should only be needed for creator properties, too
+                 if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
++                    Object typeValue = typeId;
++                    JavaType typePropType = typeProp.getType();
+                     // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
+                     //    apply deserializer... fun fun.
+-                    buffer.assignParameter(typeProp, typeId);
++                    // If target type is not String, attempt conversion
++                    if (!typePropType.hasRawClass(String.class)) {
++                        Object codec = ctxt.getParser().getCodec();
++                        if (!(codec instanceof ObjectMapper)) {
++                             // Fail hard here, as conversion is impossible without ObjectMapper
++                             throw ctxt.mappingException(
++                                     "Cannot convert external type id '%s' for creator property '%s' of type %s: `ObjectMapper` not available",
++                                             typeId, typeProp.getName(), typePropType);
++                        }
++                        ObjectMapper mapper = (ObjectMapper) codec;
++                        try {
++                            // Use convertValue for robust conversion from basic String id
++                            typeValue = mapper.convertValue(typeId, typePropType);
++                        } catch (IllegalArgumentException e0) {
++                            // Need the property name (`typeProp.getName()`) and target type (`typePropType`)
++                            // We are essentially failing to bind the String `typeId` to the creator parameter `typeProp`
++                            throw ctxt.reportInputMismatch(typeProp,
++                                    "Cannot convert external type id '%s' into type %s for creator parameter '%s' (property '%s'): %s",
++                                        typeId, typePropType, typeProp.getName(), extProp.getTypePropertyName(), e0.getMessage());
++                            // Note: `reportInputMismatch` throws the exception, no need to return
++                        }
++                    }
++                    buffer.assignParameter(typeProp, typeValue);
+                 }
+             }
+         }
+         Object bean = creator.build(ctxt, buffer);
+         // third: assign non-creator properties
+         for (int i = 0; i < len; ++i) {
+             SettableBeanProperty prop = _properties[i].getProperty();
+-            if (prop.getCreatorIndex() < 0) {
++             // 13-Dec-2015, tatu: Make sure we don't call setter for injected properties,
++             //    could perhaps optimize more and not even buffer? For now seems ok tho.
++            if (prop.getCreatorIndex() < 0 && prop.getInjectableValueId() == null) {
+                 prop.set(bean, values[i]);
+             }
+         }
+         return bean;
+     }
+\ No newline at end of file

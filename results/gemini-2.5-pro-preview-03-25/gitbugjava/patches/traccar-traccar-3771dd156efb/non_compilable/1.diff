@@ -1,0 +1,191 @@
+diff --git a/tmp/e34c5c53-483a-4eed-b925-118344c62db6_buggy.java b/tmp/0208d799-c522-4656-89d9-1bd087e57ad6_fixed.java
+index 3da904d..3c43684 100644
+--- a/tmp/e34c5c53-483a-4eed-b925-118344c62db6_buggy.java
++++ b/tmp/0208d799-c522-4656-89d9-1bd087e57ad6_fixed.java
+@@ -1,73 +1,170 @@
+     private Position decodePosition(DeviceSession deviceSession, String data) {
+ 
+         Parser parser = new Parser(PATTERN_POSITION, data);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         position.setTime(parser.nextDateTime(Parser.DateTimeFormat.DMY_HMS));
+ 
+         position.setValid(parser.next().equals("A"));
+         position.setLatitude(parser.nextCoordinate(Parser.CoordinateFormat.DEG_HEM));
+         position.setLongitude(parser.nextCoordinate(Parser.CoordinateFormat.DEG_HEM));
+         position.setSpeed(UnitsConverter.knotsFromKph(parser.nextDouble(0)));
+         position.setCourse(parser.nextDouble(0));
+         position.setAltitude(parser.nextDouble(0));
+ 
+         position.set(Position.KEY_SATELLITES, parser.nextInt(0));
+         position.set(Position.KEY_RSSI, parser.nextInt(0));
+         position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt(0));
+ 
+         position.set(Position.KEY_STEPS, parser.nextInt(0));
+ 
+         int status = parser.nextHexInt(0);
+         position.set(Position.KEY_ALARM, decodeAlarm(status));
+         if (BitUtil.check(status, 4)) {
+             position.set(Position.KEY_MOTION, true);
+         }
+ 
+-        String[] values = parser.next().split(",");
++        String networkData = parser.next();
++        if (networkData == null || networkData.isEmpty()) {
++            // No network data, return the position as is
++            return position;
++        }
++
++        String[] values = networkData.split(",", -1); // Use -1 limit to keep trailing empty strings
+         int index = 0;
+ 
+         Network network = new Network();
+ 
+-        int cellCount = Integer.parseInt(values[index++]);
++        // Cell Tower Parsing
++        if (index < values.length && !values[index].isEmpty()) {
++            int cellCount;
++            try {
++                cellCount = Integer.parseInt(values[index++]);
++            } catch (NumberFormatException e) {
++                // Invalid cell count, cannot parse network info reliably
++                return position;
++            }
++
+             if (cellCount > 0) {
+-            index += 1; // timing advance
+-            int mcc = !values[index].isEmpty() ? Integer.parseInt(values[index++]) : 0;
+-            int mnc = !values[index].isEmpty() ? Integer.parseInt(values[index++]) : 0;
++                if (index >= values.length) return position; // Missing timing advance
++                index += 1; // skip timing advance
++
++                if (index >= values.length) return position; // Missing MCC
++                String mccString = values[index++];
++                if (index >= values.length) return position; // Missing MNC
++                String mncString = values[index++];
++
++                int mcc = 0, mnc = 0;
++                if (!mccString.isEmpty()) {
++                    mcc = parseHexOrDecimalInt(mccString);
++                }
++                if (!mncString.isEmpty()) {
++                    mnc = parseHexOrDecimalInt(mncString);
++                }
+ 
+                 for (int i = 0; i < cellCount; i++) {
+-                int lac = Integer.parseInt(values[index++]);
+-                int cid = Integer.parseInt(values[index++]);
+-                String rssi = values[index++];
+-                if (!rssi.isEmpty()) {
+-                    network.addCellTower(CellTower.from(mcc, mnc, lac, cid, Integer.parseInt(rssi)));
++                    if (index >= values.length) break; // Missing LAC
++                    String lacString = values[index++];
++                    if (index >= values.length) break; // Missing CID
++                    String cidString = values[index++];
++                    if (index >= values.length) break; // Missing RSSI
++                    String rssiString = values[index++];
++
++                    int lac = 0, cid = 0;
++                    if (!lacString.isEmpty()) {
++                        lac = parseHexOrDecimalInt(lacString);
++                    }
++                    if (!cidString.isEmpty()) {
++                        cid = parseHexOrDecimalInt(cidString);
++                    }
++
++                    // Only add tower if it has some identification
++                    if (mcc != 0 || mnc != 0 || lac != 0 || cid != 0) {
++                        if (!rssiString.isEmpty()) {
++                            try {
++                                network.addCellTower(CellTower.from(mcc, mnc, lac, cid, Integer.parseInt(rssiString)));
++                            } catch (NumberFormatException e) {
++                                // Log invalid RSSI? Add tower without RSSI
++                                network.addCellTower(CellTower.from(mcc, mnc, lac, cid));
++                            }
+                         } else {
+                             network.addCellTower(CellTower.from(mcc, mnc, lac, cid));
+                         }
+                     }
+                 }
++            }
++        } else {
++             // If cellCount field is missing or empty, skip cell processing
++             index++; // Assume it was meant to be zero or is missing, move index forward
++        }
++
+ 
++        // WiFi Access Point Parsing
+         if (index < values.length && !values[index].isEmpty()) {
+-            int wifiCount = Integer.parseInt(values[index++]);
++            int wifiCount;
++             try {
++                 wifiCount = Integer.parseInt(values[index++]);
++             } catch (NumberFormatException e) {
++                 // Invalid wifi count, stop parsing network info
++                 if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
++                    position.setNetwork(network);
++                 }
++                 return position;
++             }
++
+ 
+             for (int i = 0; i < wifiCount; i++) {
+-                index += 1; // wifi name
++                if (index >= values.length) break; // Missing wifi name
++                index += 1; // skip wifi name
++
++                if (index >= values.length) break; // Missing MAC Address
+                 String macAddress = values[index++];
+-                String rssi = values[index++];
+-                if (!macAddress.isEmpty() && !macAddress.equals("0") && !rssi.isEmpty()) {
+-                    network.addWifiAccessPoint(WifiAccessPoint.from(macAddress, Integer.parseInt(rssi)));
++
++                if (index >= values.length) break; // Missing RSSI
++                String rssiString = values[index++];
++
++                if (!macAddress.isEmpty() && !macAddress.equals("0") && !rssiString.isEmpty()) {
++                    try {
++                        network.addWifiAccessPoint(WifiAccessPoint.from(
++                                macAddress.replace('-', ':'), // Normalize MAC address format
++                                Integer.parseInt(rssiString)));
++                    } catch (NumberFormatException e) {
++                        // Log invalid RSSI? Skip this AP
++                    }
+                 }
+             }
+         }
+ 
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+         return position;
+     }
++
++    // Helper method to parse integer that might be decimal or hexadecimal
++    private int parseHexOrDecimalInt(String value) {
++        try {
++            if (value.matches("^[0-9]+$")) {
++                // If it contains only digits, parse as decimal
++                long longValue = Long.parseLong(value);
++                // Check for potential overflow if value exceeds Integer limits
++                if (longValue > Integer.MAX_VALUE || longValue < Integer.MIN_VALUE) {
++                    // Handle appropriately, e.g., log warning or clamp. Returning 0 for now.
++                    return 0;
++                }
++                return (int) longValue;
++            } else {
++                // Otherwise, assume hexadecimal (potentially large CIDs need Long)
++                return (int) Long.parseLong(value, 16);
++            }
++        } catch (NumberFormatException e) {
++            // Log error or return a default value if parsing fails
++            return 0;
++        }
++    }
+\ No newline at end of file

@@ -1,0 +1,125 @@
+diff --git a/tmp/aab55bf2-312e-4b0b-bfae-a47c30af1334_buggy.java b/tmp/d84743c6-f716-40d5-af07-c4c46b4846fd_fixed.java
+index ee599aa..432a7c0 100644
+--- a/tmp/aab55bf2-312e-4b0b-bfae-a47c30af1334_buggy.java
++++ b/tmp/d84743c6-f716-40d5-af07-c4c46b4846fd_fixed.java
+@@ -1,50 +1,110 @@
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+         int length = 0;
++        int startIndex = buf.readerIndex(); // Mark position before reading LBS length or data
++
+         if (hasLength) {
+-            length = buf.readUnsignedByte();
++            if (!buf.isReadable()) {
++                return false; // Cannot read length byte
++            }
++            length = buf.readUnsignedByte(); // Read length byte
+             if (length == 0) {
++                // Handle zero length case: original logic preserved, assuming it's correct for specific contexts
+                 boolean zeroedData = true;
+-                for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
++                int checkStart = buf.readerIndex() + 9;
++                int checkEnd = buf.readerIndex() + 45;
++                // Ensure check range is valid within the buffer
++                checkEnd = Math.min(checkEnd, buf.writerIndex());
++                checkStart = Math.min(checkStart, checkEnd); // ensure start <= end
++
++                for (int i = checkStart; i < checkEnd; i++) {
++                    // Use getByte to avoid modifying readerIndex
+                     if (buf.getByte(i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+                 if (zeroedData) {
++                    // If zeroed, skip a block of size 45 (or less if buffer ends)
+                     buf.skipBytes(Math.min(buf.readableBytes(), 45));
+                 }
++                // Whether zeroed or not, if length == 0, return false as per original logic.
+                 return false;
+             }
++            // If length > 0, the LBS data follows. 'length' is the size of this data block.
++            startIndex = buf.readerIndex(); // Re-mark start index *after* reading length byte
+         }
+ 
++        // Calculate minimum possible bytes needed for LBS data based on type and check buffer
++        // Smallest: mcc(2)+mnc(1)+lac(2)+cid(3)=8
++        // Check before reading MCC
++        if (buf.readableBytes() < 2) {
++             return false; // Not enough data for MCC
++        }
+         int mcc = buf.readUnsignedShort();
++
+         int mnc;
+-        if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
++        // Use local constants for message types if needed, assuming they exist in the class scope
++        // e.g., static import or Gt06ProtocolDecoder.MSG_GPS_LBS_6 etc.
++        boolean largeMnc = BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6;
++        if (largeMnc) {
++            if (buf.readableBytes() < 2) return false; // Check before reading 2-byte MNC
+             mnc = buf.readUnsignedShort();
+         } else {
++            if (buf.readableBytes() < 1) return false; // Check before reading 1-byte MNC
+             mnc = buf.readUnsignedByte();
+         }
++
+         int lac;
+-        if (type == MSG_LBS_ALARM) {
++        boolean largeLac = type == MSG_LBS_ALARM;
++        if (largeLac) {
++            if (buf.readableBytes() < 4) return false; // Check before reading 4-byte LAC
+             lac = buf.readInt();
+         } else {
++            if (buf.readableBytes() < 2) return false; // Check before reading 2-byte LAC
+             lac = buf.readUnsignedShort();
+         }
++
+         long cid;
+-        if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
++        boolean longCid = type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7;
++        boolean intCid = type == MSG_GPS_LBS_6;
++        if (longCid) {
++            if (buf.readableBytes() < 8) return false; // Check before reading 8-byte CID
+             cid = buf.readLong();
+-        } else if (type == MSG_GPS_LBS_6) {
++        } else if (intCid) {
++            if (buf.readableBytes() < 4) return false; // Check before reading 4-byte CID
+             cid = buf.readUnsignedInt();
+         } else {
++            if (buf.readableBytes() < 3) return false; // Check before reading 3-byte CID
+             cid = buf.readUnsignedMedium();
+         }
+ 
++        // Calculate bytes actually read for the MCC/MNC/LAC/CID part
++        int bytesRead = buf.readerIndex() - startIndex;
++
++        // Set network info in position
+         position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
++        // If length was provided (hasLength = true), validate it against bytesRead and skip any remainder.
++        if (hasLength) {
++            if (length > bytesRead) {
++                int remainingBytes = length - bytesRead;
++                if (buf.readableBytes() >= remainingBytes) {
++                    buf.skipBytes(remainingBytes);
++                } else {
++                    // Buffer doesn't contain enough bytes as specified by 'length'. Message is corrupt.
++                    buf.skipBytes(buf.readableBytes()); // Consume the rest of the buffer
++                    return false; // Indicate failure
+                 }
++            } else if (length < bytesRead) {
++                // Declared length is smaller than what we read based on type. Message format inconsistency.
++                // We have already read beyond the declared boundary.
++                // Consider logging this error.
++                return false; // Indicate failure
++            }
++            // If length == bytesRead, no skipping is necessary.
++        }
++        // If hasLength is false, we didn't read a length byte, so no length-based skipping occurs.
+ 
+-        return true;
++        return true; // Successfully processed LBS data
+     }
+\ No newline at end of file

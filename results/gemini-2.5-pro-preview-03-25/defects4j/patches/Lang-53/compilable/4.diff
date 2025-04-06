@@ -1,0 +1,259 @@
+diff --git a/tmp/bc3f5ec0-c74d-40cc-98a2-c17531ae2375_buggy.java b/tmp/0b1ecb9a-1b37-4750-87e8-52a55405956b_fixed.java
+index f96e1af..5930cc9 100644
+--- a/tmp/bc3f5ec0-c74d-40cc-98a2-c17531ae2375_buggy.java
++++ b/tmp/0b1ecb9a-1b37-4750-87e8-52a55405956b_fixed.java
+@@ -1,133 +1,194 @@
+     /**
+      * <p>Internal calculation method.</p>
+      * 
+      * @param val  the calendar
+      * @param field  the field constant
+      * @param round  true to round, false to truncate
+      * @throws ArithmeticException if the year is over 280 million
+      */
+     private static void modify(Calendar val, int field, boolean round) {
++        //LANG-645 Field values are compared using ==. Identity comparison should not be used for Integers.
++        // Comment: This is not applicable here as 'field' is an int primitive and Calendar constants are final ints.
++
+         if (val.get(Calendar.YEAR) > 280000000) {
+             throw new ArithmeticException("Calendar value too large for accurate calculations");
+         }
+         
+         if (field == Calendar.MILLISECOND) {
+             return;
+         }
+ 
+-        // ----------------- Fix for LANG-59 ---------------------- START ---------------
++        // ----------------- Fix for LANG-59 / LANG-346 --------------- START ---------------
+         // see http://issues.apache.org/jira/browse/LANG-59
++        // see http://issues.apache.org/jira/browse/LANG-346
+         //
+         // Manually truncate milliseconds, seconds and minutes, rather than using
+-        // Calendar methods.
++        // Calendar methods. Field specific rounding is handled later.
++        // This is because of previous issues with Calendar implementation bugs (LANG-140).
+ 
+         Date date = val.getTime();
+         long time = date.getTime();
+         boolean done = false;
+ 
++        // Store original values needed for rounding decisions and truncation
++        int originalMillis = val.get(Calendar.MILLISECOND);
++        int originalSeconds = val.get(Calendar.SECOND);
++        int originalMinutes = val.get(Calendar.MINUTE);
++        // Use HOUR_OF_DAY for rounding calculations involving hours (e.g. rounding up DAY)
++        // Store original value for AM/PM rounding check.
++        int originalHourOfDay = val.get(Calendar.HOUR_OF_DAY);
++
++
++        // Pre-calculate roundUp decisions based on original values
++        // Use >= for rounding up @ midpoint. Original code used > offset which is equivalent.
++        boolean roundUpMillis = round && originalMillis >= 500;
++        boolean roundUpSeconds = round && originalSeconds >= 30;
++        boolean roundUpMinutes = round && originalMinutes >= 30;
++
+         // truncate milliseconds
+-        int millisecs = val.get(Calendar.MILLISECOND);
+-        if (!round || millisecs < 500) {
+-            time = time - millisecs;
++        if (originalMillis > 0) {
++           time = time - originalMillis; // Subtract original milliseconds
++        }
++        // Stop truncation if processing the field immediately above the target field
+         if (field == Calendar.SECOND) {
+-            done = true;
+-            }
++            done = true; // If target is SECOND, don't truncate seconds/minutes
+         }
+ 
+         // truncate seconds
+-        int seconds = val.get(Calendar.SECOND);
+-        if (!done && (!round || seconds < 30)) {
+-            time = time - (seconds * 1000L);
++        if (!done) {
++            if (originalSeconds > 0) {
++                time = time - (originalSeconds * 1000L); // Subtract original seconds in milliseconds
++            }
++        }
+         if (field == Calendar.MINUTE) {
+-            done = true;
+-            }
++            done = true; // If target is MINUTE, don't truncate minutes
+         }
+ 
+         // truncate minutes
+-        int minutes = val.get(Calendar.MINUTE);
+-        if (!done && (!round || minutes < 30)) {
+-            time = time - (minutes * 60000L);
++        if (!done) {
++           // done logic implies field is HOUR or larger
++           if (originalMinutes > 0) {
++                time = time - (originalMinutes * 60000L); // Subtract original minutes in milliseconds
++           }
+         }
+ 
+-        // reset time
++        // reset time only if modified
+         if (date.getTime() != time) {
+-            date.setTime(time);
+-            val.setTime(date);
++            date.setTime(time); // date now represents the time truncated below the target field (or minute/hour)
++            val.setTime(date); // val is updated with truncated values for ms, second, minute
+         }
+-        // ----------------- Fix for LANG-59 ----------------------- END ----------------
++        // ----------------- Fix for LANG-59 / LANG-346 --------------- END -----------------
+ 
+-        boolean roundUp = false;
++        boolean roundUp = false; // This flag carries the round-up decision from the previous field iteration
+         for (int i = 0; i < fields.length; i++) {
++            int currentFieldGroup = fields[i][0]; // The primary field for this group (e.g., Calendar.MILLISECOND)
++
++            // Determine roundUp decision to apply to the current field group, based on the *previous* field processed.
++            // Use pre-calculated values for fields affected by the initial truncation block.
++            boolean useCalculatedRoundUp = false;
++            if (currentFieldGroup == Calendar.SECOND) { // Current field is SECOND, roundUp is based on MILLISECOND
++                 roundUp = roundUpMillis;
++                 useCalculatedRoundUp = true;
++            } else if (currentFieldGroup == Calendar.MINUTE) { // Current field is MINUTE, roundUp is based on SECOND
++                 roundUp = roundUpSeconds;
++                 useCalculatedRoundUp = true;
++            } else if (currentFieldGroup == Calendar.HOUR_OF_DAY) { // Current field is HOUR_OF_DAY, roundUp is based on MINUTE
++                 roundUp = roundUpMinutes;
++                 useCalculatedRoundUp = true;
++                 // Note: HOUR is an alias in fields[i], HOUR_OF_DAY is primary (fields[i][0])
++            }
++
++            // Check if the target field is in the current group
+             for (int j = 0; j < fields[i].length; j++) {
+                 if (fields[i][j] == field) {
+-                    //This is our field... we stop looping
++                    // This is our target field. Apply roundUp calculated in the previous iteration (or derived from pre-calculated values).
+                     if (round && roundUp) {
+                         if (field == DateUtils.SEMI_MONTH) {
+-                            //This is a special case that's hard to generalize
+-                            //If the date is 1, we round up to 16, otherwise
+-                            //  we subtract 15 days and add 1 month
++                            // Special case: SEMI_MONTH
++                            // If date is 1, round up to 16. Otherwise (presumably 16 after truncation/rounding), subtract 15 and add 1 month.
+                             if (val.get(Calendar.DATE) == 1) {
+                                 val.add(Calendar.DATE, 15);
+                             } else {
+                                 val.add(Calendar.DATE, -15);
+                                 val.add(Calendar.MONTH, 1);
+                             }
+                         } else {
+-                            //We need at add one to this field since the
+-                            //  last number causes us to round up
++                            // General case: add 1 to the primary field of the group
++                            // Note: This potentially rolls over adjacent fields (e.g. minute to hour) automatically.
+                             val.add(fields[i][0], 1);
+                         }
+                     }
++                    // We've processed the target field (or decided not to round it), return.
+                     return;
+                 }
+-            }
+-            //We have various fields that are not easy roundings
++            } // End inner loop (checking aliases for target field)
++
++            // --- Process fields smaller than the target field ---
++
++            // We need to calculate `roundUp` for the *next* iteration (if applicable) based on the current field group,
++            // and ensure the current field is set to its minimum value (zeroed out).
++
+             int offset = 0;
+-            boolean offsetSet = false;
+-            //These are special types of fields that require different rounding rules
+-            switch (field) {
++            boolean offsetSet = false; // Tracks if offset/roundUp calculation was handled by special case
++
++            // Special rounding rules for SEMI_MONTH and AM_PM targets affect how roundUp is calculated
++            // when processing DATE or HOUR_OF_DAY respectively.
++            switch (field) { // Check the *target* field
+                 case DateUtils.SEMI_MONTH:
+-                    if (fields[i][0] == Calendar.DATE) {
+-                        //If we're going to drop the DATE field's value,
+-                        //  we want to do this our own way.
+-                        //We need to subtrace 1 since the date has a minimum of 1
+-                        offset = val.get(Calendar.DATE) - 1;
+-                        //If we're above 15 days adjustment, that means we're in the
+-                        //  bottom half of the month and should stay accordingly.
++                    if (currentFieldGroup == Calendar.DATE) { // Current field group is DATE, target is SEMI_MONTH
++                        // Calculate offset based on current DATE in val (which should be 1 after truncation/rounding effects)
++                        offset = val.get(Calendar.DATE) - 1; // val.getActualMinimum(Calendar.DATE) is 1
++                        // This offset is relative to the start of the month. Adjust for semi-month boundary.
+                         if (offset >= 15) {
+-                            offset -= 15;
++                            offset -= 15; // Offset within the second half (0-15 typically)
+                         }
+-                        //Record whether we're in the top or bottom half of that range
+-                        roundUp = offset > 7;
+-                        offsetSet = true;
++                        // Calculate roundUp for SEMI_MONTH based on DATE's position within its half-month. Midpoint is 7.5 days. Round up if offset > 7?
++                        roundUp = offset > 7; // This roundUp flag will be used when i loops to MONTH/SEMI_MONTH group
++                        offsetSet = true; // Mark that roundUp is calculated for the next step
+                     }
+                     break;
+                 case Calendar.AM_PM:
+-                    if (fields[i][0] == Calendar.HOUR_OF_DAY) {
+-                        //If we're going to drop the HOUR field's value,
+-                        //  we want to do this our own way.
+-                        offset = val.get(Calendar.HOUR_OF_DAY);
++                    if (currentFieldGroup == Calendar.HOUR_OF_DAY) { // Current field group is HOUR_OF_DAY, target is AM_PM
++                        // Calculate offset based on original HOUR_OF_DAY for AM/PM rounding decision
++                        offset = originalHourOfDay; // Use original hour
+                         if (offset >= 12) {
+-                            offset -= 12;
++                            offset -= 12; // Offset within the AM/PM half (0-11)
+                         }
+-                        roundUp = offset > 6;
+-                        offsetSet = true;
++                        // Calculate roundUp for AM_PM based on HOUR's position. Midpoint is 6 hours. Round up if offset > 6?
++                        roundUp = offset > 6; // This roundUp flag will be used when i loops to DATE/AM_PM group
++                        offsetSet = true; // Mark that roundUp is calculated for the next step
+                     }
+                     break;
+             }
+-            if (!offsetSet) {
+-                int min = val.getActualMinimum(fields[i][0]);
+-                int max = val.getActualMaximum(fields[i][0]);
+-                //Calculate the offset from the minimum allowed value
+-                offset = val.get(fields[i][0]) - min;
+-                //Set roundUp if this is more than half way between the minimum and maximum
+-                roundUp = offset > ((max - min) / 2);
++
++            // Calculate roundUp for the general case (for the next field group up)
++            // unless roundUp was determined by pre-calculated values (useCalculatedRoundUp) or special cases (offsetSet).
++            if (!useCalculatedRoundUp && !offsetSet) {
++                 int min = val.getActualMinimum(currentFieldGroup);
++                 int max = val.getActualMaximum(currentFieldGroup);
++                 // Calculate offset based on the *current* value in val (which should be minimum if field < HOUR).
++                 // This determines if the current field's original value was past the midpoint, to round the next higher field.
++                 offset = val.get(currentFieldGroup) - min;
++                 // Check if offset is more than half the range. (> rather than >= is correct here for rounding up).
++                 roundUp = offset > ((max - min) / 2); // Set roundUp flag for next iteration
+             }
+-            //We need to remove this field
+-            if (offset != 0) {
+-                val.set(fields[i][0], val.get(fields[i][0]) - offset);
++            // If useCalculatedRoundUp=true, roundUp was already set correctly based on original values of lower fields.
++            // If offsetSet=true, roundUp was already set correctly by special SEMI_MONTH/AM_PM logic based on DATE/HOUR.
++
++            // Ensure the current field group is set to its minimum value (zeroed out).
++            // The initial truncation block handled fields below HOUR_OF_DAY.
++            // This loop needs to zero out fields from HOUR_OF_DAY up to the one below the target field.
++            if (currentFieldGroup >= Calendar.HOUR_OF_DAY) {
++                // Check if the field is already at its minimum value.
++                int min = val.getActualMinimum(currentFieldGroup);
++                if (val.get(currentFieldGroup) != min) {
++                    val.set(currentFieldGroup, min); // Set to minimum
+                 }
+             }
++
++        } // End main loop
++
++        // Should never normally reach here, means field is not supported.
+         throw new IllegalArgumentException("The field " + field + " is not supported");
+ 
+     }
+\ No newline at end of file

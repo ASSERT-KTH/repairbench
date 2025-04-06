@@ -1,0 +1,163 @@
+diff --git a/tmp/44e651fc-2177-4af1-a696-b025150c67ce_buggy.java b/tmp/17b21e99-11c9-4594-af94-f59a42d6fbca_fixed.java
+index 4b7e1e4..aee1338 100644
+--- a/tmp/44e651fc-2177-4af1-a696-b025150c67ce_buggy.java
++++ b/tmp/17b21e99-11c9-4594-af94-f59a42d6fbca_fixed.java
+@@ -1,52 +1,117 @@
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+-        final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+-        // Format is "length keyword=value\n";
+-        while(true){ // get length
++        final Map<String, String> headers = new HashMap<>(globalPaxHeaders);
++        // Format is "length keyword=value\n"; Length is the decimal value of the total size of the record, including the length field itself.
++        while (true) {
+             int ch;
+-            int len = 0;
+-            int read = 0;
++            long lenL = 0;
++            int lenDigits = 0;
++
++            // 1. Read Length Field: skip leading blank lines, read digits until space.
+             while ((ch = i.read()) != -1) {
+-                read++;
+-                if (ch == ' '){
+-                    // Get keyword
+-                    final ByteArrayOutputStream coll = new ByteArrayOutputStream();
++                // Skip leading blank lines (only if we haven't read any digits yet)
++                if (lenDigits == 0 && ch == '\n') {
++                    continue;
++                }
++                if (ch == ' ') { // End of length field
++                    // Ensure we read some digits before the space
++                    if (lenDigits == 0) {
++                        throw new IOException("PAX header record starts with space.");
++                    }
++                    break; // Found space after digits
++                }
++                if (ch < '0' || ch > '9') {
++                    throw new IOException("Unexpected character reading PAX header length: '" + (char) ch + "'");
++                }
++                // Check for potential overflow before multiplication
++                final int digit = ch - '0';
++                // Check for potential overflow: lenL * 10 + digit > Long.MAX_VALUE
++                if (lenL > (Long.MAX_VALUE - digit) / 10) {
++                     throw new IOException("Paxheader length overflow detected.");
++                }
++                lenL = lenL * 10 + digit;
++                lenDigits++;
++            }
++
++            if (ch == -1) { // EOF encountered
++                if (lenDigits == 0) { // Normal EOF after reading all headers (or empty stream/only newlines)
++                    // No more headers found.
++                    return headers;
++                }
++                // EOF after digits but before space
++                throw new IOException("Unexpected EOF reading PAX header length/space.");
++            }
++            // Current char 'ch' is space ' '.
++
++            // Check if length fits in int (needed for array allocation and IOUtils.readFully)
++            if (lenL > Integer.MAX_VALUE) {
++                throw new IOException("PAX header length " + lenL + " exceeds maximum allowed size");
++            }
++            final int recordLen = (int) lenL;
++            // Bytes read for length field + space
++            final int lenAndSpaceBytes = lenDigits + 1;
++
++            // 2. Read Keyword field until '='
++            final ByteArrayOutputStream keywordBytes = new ByteArrayOutputStream();
++            int bytesReadInKeyword = 0;
+             while ((ch = i.read()) != -1) {
+-                        read++;
+-                        if (ch == '='){ // end of keyword
+-                            final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
++                bytesReadInKeyword++;
++                if (ch == '=') { // End of keyword
++                    break;
++                }
++                keywordBytes.write((byte) ch);
++            }
++
++            if (ch == -1) { // EOF while reading keyword
++                throw new IOException("Unexpected EOF reading PAX header keyword.");
++            }
++            // Current char 'ch' is equals '='.
++
++            final String keyword = keywordBytes.toString(CharsetNames.UTF_8);
++            if (keyword.isEmpty()) {
++                throw new IOException("PAX header record has empty keyword.");
++            }
++
++            // 3. Read Value field (including trailing newline)
++            // Total bytes read for the fixed part of the header (length, space, keyword, '=')
++            final int headerPrefixLen = lenAndSpaceBytes + bytesReadInKeyword;
++            // Calculate the expected length of the value + newline part
++            final int expectedValueAndNLLen = recordLen - headerPrefixLen;
++
++            if (expectedValueAndNLLen < 0) {
++                // This indicates declared recordLen is smaller than the actual prefix read
++                throw new IOException("Corrupted PAX header: length " + recordLen
++                                      + " is smaller than header prefix length " + headerPrefixLen);
++            }
++
++            // Read the value bytes (value + newline)
++            final byte[] valueAndNL = new byte[expectedValueAndNLLen];
++            final int got = IOUtils.readFully(i, valueAndNL);
++            if (got != expectedValueAndNLLen) {
++                throw new IOException("Failed to read PAX header value. Expected "
++                                      + expectedValueAndNLLen + " bytes, read " + got);
++            }
++
++            // The value part must end with a newline. PAX spec implies expectedValueAndNLLen must be >= 1.
++            if (expectedValueAndNLLen == 0) {
++                 // This state should not be possible if recordLen >= headerPrefixLen and the format requires a final newline.
++                 // Example "8 path=\n": recordLen=8, headerPrefixLen=7 ("8 path="). expectedValueAndNLLen=1.
++                 throw new IOException("Corrupted PAX header: value length is zero, but header must end in newline");
++            }
++            if (valueAndNL[expectedValueAndNLLen - 1] != '\n') {
++                 throw new IOException("PAX header record does not end in newline.");
++            }
++
++            // Process record: remove entry if value consists only of NL, otherwise put entry
++            if (expectedValueAndNLLen == 1) { // Only the newline was present after '='
++                // This corresponds to the PAX command to delete the entry
+                 headers.remove(keyword);
+             } else {
+-                                final byte[] rest = new byte[restLen];
+-                                final int got = IOUtils.readFully(i, rest);
+-                                if (got != restLen) {
+-                                    throw new IOException("Failed to read "
+-                                                          + "Paxheader. Expected "
+-                                                          + restLen
+-                                                          + " bytes, read "
+-                                                          + got);
+-                                }
+-                                // Drop trailing NL
+-                                final String value = new String(rest, 0,
+-                                                          restLen - 1, CharsetNames.UTF_8);
++                // Value is the buffer excluding the final newline
++                final String value = new String(valueAndNL, 0, expectedValueAndNLLen - 1, CharsetNames.UTF_8);
+                 headers.put(keyword, value);
+             }
+-                            break;
++            // Loop for the next header record
+         }
+-                        coll.write((byte) ch);
+-                    }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
+-            }
+-        }
+-        return headers;
+     }
+\ No newline at end of file

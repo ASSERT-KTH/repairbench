@@ -1,0 +1,140 @@
+diff --git a/tmp/d139aa95-19ed-4bb4-a8d0-0cad92b255ec_buggy.java b/tmp/961e69b8-327b-41ee-94dd-3b373553bc84_fixed.java
+index e69de29..02e910a 100644
+--- a/tmp/d139aa95-19ed-4bb4-a8d0-0cad92b255ec_buggy.java
++++ b/tmp/961e69b8-327b-41ee-94dd-3b373553bc84_fixed.java
+@@ -0,0 +1,134 @@
++// Fixed function: com.fasterxml.jackson.databind.type.TypeFactory._fromClass
++// Based on Jackson databind 2.9.x codebase structure, incorporating the fix.
++@Override
++protected JavaType _fromClass(Class<?> cl, TypeBindings bindings)
++{
++    // Core types handled by caller (_constructType) typically
++    // But maybe direct calls possible? Check for main ones
++
++    // 18-Feb-2017, tatu: Should be fine to handle Object.class handled here?
++    if (cl == Object.class) {
++         return CORE_TYPE_OBJECT;
++    }
++    // Some other trivial types that are always same
++    // 19-Oct-2015, tatu: Should not cache arrays (components may differ)
++    // 18-Feb-2017, tatu: Caching arrays is problematic if component type is placeholder...
++//        if (cl.isArray()) { ... }
++    if (cl == String.class) { return CORE_TYPE_STRING; }
++    // primitives should be handled by caller... but just in case?
++    if (cl == Boolean.class) { return CORE_TYPE_BOOLEAN; }
++    if (cl == Integer.class) { return CORE_TYPE_INTEGER; }
++    if (cl == Long.class) { return CORE_TYPE_LONG; }
++
++    // 28-Jun-2017, tatu: How about NO bindings? Or can we combine keys?
++    // 23-Jan-2018, tatu: Note; empty bindings are NOT same as null bindings.
++    //   Usually TypeFactory passes non-null bindings. Let's assume non-null for now.
++    Object key = (bindings == null || bindings.isEmpty()) ? cl : bindings.asKey(cl);
++
++    // Note: synchronization needs to be handled by caller; this method is NOT thread-safe
++    JavaType type = _findCachedType(key); // NOTE: key is Class OR ClassKey
++
++    if (type != null) {
++        // [databind#1909]: Need to ensure that type modifiers are NOT added more than once
++        // A bit ugly fix, but best that can be done for 2.9... requires actual fix in 3.0
++        // Also: only apply if we do NOT have recursive type marker
++        if ((_modifiers != null) && !type.hasHandlers() && !(type instanceof ResolvedRecursiveType)) {
++            // Important: if we did find a match, but not with modifiers we expected, need
++            // to add modifiers. Let's do this by calling type handler itself, not directly
++            List<TypeModifier> mods = _modifiers;
++            _modifiers = null; // so we won't recursively try to apply same mods
++            type = _applyModifiers(type, mods);
++            _modifiers = mods;
++        }
++
++        // START FIX: Refinement logic for cached generic types with differing bindings
++        // [databind#1647] Ensure that cached generic types are refined if bindings differ
++        // Skip if type is the recursive placeholder (`ResolvedRecursiveType`)
++        if (!(type instanceof ResolvedRecursiveType) && type.hasGenericTypes() && bindings != null && !bindings.isEmpty()) {
++            // `TypeBindings.equals()` should correctly compare bindings.
++            if (!type.getBindings().equals(bindings)) {
++                 // Create specialized type instance using existing hierarchy but new bindings.
++                 // `refine` uses existing hierarchy if nulls are passed for supertypes.
++                 return type.refine(cl, bindings, null, null);
++            }
++        }
++        // END FIX
++
++        return type;
++    }
++
++    // If not found in cache, will create. But!: When creating recursive types, need
++    // placeholder to handle back-references.
++    ResolvedRecursiveType selfRef = new ResolvedRecursiveType(cl, bindings);
++    _typeCache.put(key, selfRef);
++
++    // 14-Mar-2016, tatu: Need to resolve types for hierarchy first...
++    // Ok, then: need to resolve super types (if any)
++    JavaType[] superInterfaces = NO_TYPES;
++    JavaType superClass = null;
++
++    // Must resolve hierarchy first, before constructing type instances
++    try {
++        // 25-Oct-2017, tatu: As per [databind#1774], need to be careful to use
++        //    correct bindings when resolving supertypes
++        if (cl.isArray()) { // No super-types for arrays
++            // 16-Mar-2017, tatu: Need bindings for elements, optionally
++            type = ArrayType.construct(_constructType(cl.getComponentType(), bindings), bindings);
++        } else {
++            // For other types, super-class and interfaces need resolving
++            // Need to be careful when dealing with bindings... (was relevant for #117)
++            // 14-Mar-2016, tatu: Ok, does this actually work? Need to see...
++            TypeBindings parentBindings;
++            // 23-Jan-2018, tatu: Argh. `bindings` may be null -- must check.
++            if (bindings == null) {
++                 parentBindings = TypeBindings.emptyBindings();
++            } else {
++                 parentBindings = bindings;
++            }
++
++            if (cl.isInterface()) {
++                superInterfaces = _resolveSuperInterfaces(cl, parentBindings);
++            } else {
++                superClass = _resolveSuperClass(cl, parentBindings);
++                superInterfaces = _resolveSuperInterfaces(cl, parentBindings);
++            }
++            // and then construct the type itself.
++            if (cl.isEnum()) {
++                // 18-Oct-2017, tatu: Need to ensure we resolve Enum hierarchy too
++                //    (esp for EnumMap/Set) -- [databind#1771]
++                // 08-Nov-2017, tatu: Bindings may be needed for Enum subtypes?
++                type = EnumType.construct(cl, parentBindings, superClass, superInterfaces);
++            } else { // Plain bean class?
++                // 08-Nov-2017, tatu: Bindings needed here too
++                type = SimpleType.construct(cl, parentBindings, superClass, superInterfaces);
++                // 25-Oct-2017, tatu: As per [databind#1774], this may require further refining,
++                //   in case type parameters were resolved during construction
++                // 08-Nov-2017, tatu: Actually I think this is wrong; we should NOT pass
++                //   parentBindings, but rather resulting bindings... for now, comment out:
++//                type = type.refine(cl, bindings, superClass, superInterfaces);
++            }
++        }
++    // 10-Mar-2017, tatu: Put this in `finally` block to ensure placeholder removed
++    } finally {
++        // 23-Jan-2018, tatu: Ok fine, bring back placeholder removal but make it optional
++        //   as it seems problematic for some cases. Start with old behavior. Need to expose
++        //   config setting if necessary...
++        JavaType prev = _typeCache.remove(key);
++        // sanity check; should be the placeholder we added; but if not, maybe override?
++        if (prev != selfRef && prev != null) {
++             // 15-Jan-2019, tatu: Let's NOT throw but report... possibly via `MapperFeature`? (for now, std Report)
++            //throw new IllegalStateException("Internal error: while resolving type "+cl.getName()+" removed mismatching type "+prev);
++            reportIllegalTypeRecursion(cl, prev);
++         }
++    }
++    selfRef.setReference(type);
++
++    // And ONLY THEN apply modifiers, if any
++    if (_modifiers != null && !type.hasHandlers()) {
++        List<TypeModifier> mods = _modifiers;
++        _modifiers = null;
++        type = _applyModifiers(type, mods);
++        _modifiers = mods;
++    }
++    return type;
++}
+\ No newline at end of file

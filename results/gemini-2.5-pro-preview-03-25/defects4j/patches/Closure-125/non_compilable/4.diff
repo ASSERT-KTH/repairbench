@@ -1,0 +1,122 @@
+diff --git a/tmp/66f2b0b4-5748-4603-ab80-041699ff5f6c_buggy.java b/tmp/e1771ba7-c4d2-41c7-8bd4-8c3fdaf0ad03_fixed.java
+index 7e43c1c..409c823 100644
+--- a/tmp/66f2b0b4-5748-4603-ab80-041699ff5f6c_buggy.java
++++ b/tmp/e1771ba7-c4d2-41c7-8bd4-8c3fdaf0ad03_fixed.java
+@@ -1,19 +1,115 @@
+   /**
+    * Visits a NEW node.
+    */
+   private void visitNew(NodeTraversal t, Node n) {
+     Node constructor = n.getFirstChild();
++    // restrictByNotNullOrUndefined handles the case where the constructor expression
++    // itself might evaluate to null or undefined. 'new' would typically throw in this case,
++    // but from a type perspective, we analyze the type assuming it's not null/undefined.
+     JSType type = getJSType(constructor).restrictByNotNullOrUndefined();
+-    if (type.isConstructor() || type.isEmptyType() || type.isUnknownType()) {
++
++    // Case 1: Direct constructor function type
++    // A JSType can be both isConstructor() and isInterface() (e.g. FunctionType).
++    // We handle constructors first as they are the primary target for 'new'.
++    if (type.isConstructor()) {
+       FunctionType fnType = type.toMaybeFunctionType();
++      // This check is likely redundant if type.isConstructor() is true, but safe.
+       if (fnType != null) {
+         visitParameterList(t, n, fnType);
+         ensureTyped(t, n, fnType.getInstanceType());
+       } else {
++        // Should be unreachable. Fallback to unknown type.
+         ensureTyped(t, n);
+       }
++    }
++    // Case 2: Empty or Unknown type
++    else if (type.isEmptyType() || type.isUnknownType()) {
++      // Cannot check parameters, result is unknown.
++      ensureTyped(t, n);
++    }
++    // Case 3: Union type - This is where the original code failed for Issue 1002
++    else if (type.isUnionType()) {
++      // If the type is a union, 'new' could potentially operate on any of the alternates.
++      // We need to find the LUB (Least Upper Bound) of the instance types produced by
++      // the constructable alternates.
++      JSType instanceType = typeRegistry.getNativeType(JSTypeNative.NO_TYPE);
++      FunctionType firstConstructor = null; // Use the first *constructor* found for param checks
++      boolean errorReported = false;
++
++      for (JSType alt : type.toMaybeUnionType().getAlternates()) {
++        alt = alt.restrictByNotNullOrUndefined();
++        FunctionType altFn = alt.toMaybeFunctionType(); // Represents constructor or interface function types
++
++        // Check if the alternate is something that can be used with 'new'
++        if (altFn != null && (altFn.isConstructor() || altFn.isInterface())) {
++          // Record the first *constructor* for parameter checking.
++          // Interfaces usually don't define constructor sigs in the same way.
++          if (firstConstructor == null && altFn.isConstructor()) {
++             firstConstructor = altFn;
++          }
++          // Calculate the LUB of instance types produced by new'ing the alternates.
++          JSType altInstanceType = altFn.getInstanceType();
++          if (instanceType.isNoType()) {
++            instanceType = altInstanceType;
++          } else {
++            // Compute the LUB. If any alternate leads to an unknown instance type (e.g., from
++            // an unknown constructor), the LUB might become unknown.
++            instanceType = JSType.getLeastSupertype(instanceType, altInstanceType);
++          }
++        } else if (alt.isEmptyType() || alt.isUnknownType()) {
++          // Presence of empty/unknown makes the overall result potentially unknown.
++          // Update the LUB to include UNKNOWN.
++          instanceType = JSType.getLeastSupertype(instanceType, typeRegistry.getNativeType(UNKNOWN_TYPE));
+         } else {
++          // Alternate is definitely not constructable (e.g. number, string, ordinary function).
++          // Report error once.
++          if (!errorReported) {
++              report(t, n, NOT_A_CONSTRUCTOR);
++              errorReported = true;
++          }
++          // The result type must accommodate the possibility of error/unknown. Make it UNKNOWN.
++          instanceType = typeRegistry.getNativeType(UNKNOWN_TYPE);
++          // If a non-constructable path exists, we cannot reliably check parameters.
++          firstConstructor = null;
++          // We know the result is definitely UNKNOWN now, no need to check other alternates for type.
++          break;
++        }
++      }
++
++      // After checking all alternates:
++      if (instanceType.isNoType()) {
++        // No constructable types (constructor/interface/empty/unknown) found at all in the union.
++        if (!errorReported) {
+              report(t, n, NOT_A_CONSTRUCTOR);
++        }
++        ensureTyped(t, n); // Ensure Unknown result type
++      } else {
++        // We have a resulting instance type (possibly Unknown or a LUB).
++        // Check params using the first valid constructor signature found, if any.
++        if (firstConstructor != null) {
++          visitParameterList(t, n, firstConstructor);
++        }
++        ensureTyped(t, n, instanceType);
++      }
++    }
++    // Case 4: Interface type (standalone, not in union)
++    // Check after UnionType, as a Union could contain interfaces.
++    // Check after Constructor, as a FunctionType can be both.
++    else if (type.isInterface()) {
++        FunctionType interfaceFnType = type.toMaybeFunctionType();
++        if (interfaceFnType != null) {
++            // Treat 'new Interface()' as potentially valid (e.g. if aliased to a constructor),
++            // yielding an instance of the interface type.
++            // Skip parameter check as interfaces don't define constructor params directly.
++            ensureTyped(t, n, interfaceFnType.getInstanceType());
++        } else {
++            // Should not happen if type.isInterface() is true? Fallback.
+              ensureTyped(t, n);
+         }
+     }
++    // Case 5: Definitely not constructable (e.g., primitive, object literal, ordinary function)
++    else {
++      report(t, n, NOT_A_CONSTRUCTOR);
++      ensureTyped(t, n); // Ensure Unknown result type
++    }
++  }
+\ No newline at end of file

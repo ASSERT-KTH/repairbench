@@ -1,0 +1,196 @@
+diff --git a/tmp/b478df15-01be-4c2d-9188-6a02ef8be6c7_buggy.java b/tmp/ab42482b-1e97-4140-8436-6e1866de0dc6_fixed.java
+index 4b7e1e4..7c71480 100644
+--- a/tmp/b478df15-01be-4c2d-9188-6a02ef8be6c7_buggy.java
++++ b/tmp/ab42482b-1e97-4140-8436-6e1866de0dc6_fixed.java
+@@ -1,52 +1,152 @@
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.commons.compress.utils.CharsetNames;
++import org.apache.commons.compress.utils.IOUtils;
++
++// Assume globalPaxHeaders is a field or accessible variable:
++// Map<String, String> globalPaxHeaders;
++
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
++    // Fix based on POSIX standard for PAX format:
++    // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html#tag_20_92_13_03
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+-        final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+-        // Format is "length keyword=value\n";
+-        while(true){ // get length
++        // Use globalPaxHeaders if available, otherwise start fresh.
++        final Map<String, String> headers = new HashMap<>(globalPaxHeaders);
++
++        OuterLoop:
++        while(true){
+             int ch;
+             int len = 0;
+-            int read = 0;
++            int read = 0; // bytes read for the current logical record line
++            final StringBuilder lenBuffer = new StringBuilder();
++
++            // 1. Read length field (decimal digits)
+             while((ch = i.read()) != -1) {
+                 read++;
+-                if (ch == ' '){
+-                    // Get keyword
+-                    final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+-                    while((ch = i.read()) != -1) {
+-                        read++;
+-                        if (ch == '='){ // end of keyword
+-                            final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
++                if (ch == ' ') { // End of length field
++                    // If buffer is empty, it means line started with ' '. Invalid.
++                    if (lenBuffer.length() == 0) {
++                        throw new IOException("Invalid PAX header format: Line starts with space.");
++                    }
++                    break; // Length field successfully read, break inner loop
++                } else if (ch >= '0' && ch <= '9') {
++                    lenBuffer.append((char)ch);
++                    // Check for potential integer overflow? PAX spec doesn't mention limit,
++                    // but practically, lengths are file sizes or metadata. Assume fits in int for now.
++                    if (lenBuffer.length() > 9) { // Protection against excessively long length field
++                         try {
++                             Integer.parseInt(lenBuffer.substring(0, 9)); // Check first 9 digits
++                         } catch (final NumberFormatException e) {
++                             // Should not happen if digits, but helps detect issues early.
++                             throw new IOException("Invalid PAX header length: " + lenBuffer.toString(), e);
++                         }
++                    }
++                } else {
++                    // Encountered a non-digit, non-space character.
++                    // If we haven't read any digits yet, it might be a blank line or end of PAX block.
++                    if (lenBuffer.length() == 0) {
++                        if (ch == '\n') {
++                            // Treat as blank line, skip and continue with the next line.
++                            continue OuterLoop;
++                        }
++                        // Any other non-digit character at the start means this is not a
++                        // valid PAX header line. Assume end of PAX headers.
++                        // We consumed 'ch', which might belong to the next tar entry.
++                        // This parsing logic assumes it's called only when expecting PAX headers.
++                        // If a non-PAX line is found, stop parsing here.
++                        break OuterLoop; // Non-PAX line encountered
++                    } else {
++                        // Had digits, but then encountered non-space/non-digit before space. Invalid format.
++                        throw new IOException("Invalid PAX header format. Encountered character '" + (char)ch
++                                              + "' ("+ch+") after reading digits for length.");
++                    }
++                }
++            }
++
++            // Check why the inner loop terminated
++            if (ch == -1) { // EOF encountered
++                // If we were reading digits, it's unexpected EOF.
++                if (lenBuffer.length() > 0) {
++                    throw new IOException("Invalid PAX header: Unexpected EOF while reading length.");
++                }
++                // If buffer is empty, it means EOF occurred at the start of a line (or after a blank line).
++                // This is a valid end of headers.
++                break OuterLoop;
++            }
++
++            // If we are here, the inner loop broke because ch == ' '.
++            // Parse the length string.
++            try {
++                len = Integer.parseInt(lenBuffer.toString());
++            } catch (final NumberFormatException e) {
++                throw new IOException("Invalid PAX header length: '" + lenBuffer.toString() + "'", e);
++            }
++            // POSIX: "The length field shall be the number of octets in the record,
++            // including the trailing <newline>." Length must cover itself + space + key=value + newline.
++            // Smallest possible length seems to be 5 for "5 k=\n".
++            if (len < 5) {
++                throw new IOException("Invalid PAX header length: " + len + " < 5");
++            }
++
++
++            // 2. Read the rest of the record (keyword=value\n)
++            // Bytes remaining = total length - bytes already read (length digits + space)
++            final int headerDataLen = len - read;
++            if (headerDataLen < 0) {
++                // This implies len was smaller than the number of bytes read for the length field + space,
++                // which shouldn't happen if the format is correct.
++                 throw new IOException("Invalid PAX header length calculation (len=" + len + ", read=" + read + ")");
++            }
++
++            final byte[] headerData = new byte[headerDataLen];
++            final int got = IOUtils.readFully(i, headerData);
++            if (got != headerDataLen) {
++                 throw new IOException("Failed to read PAX header data. Expected " + headerDataLen
++                                        + " bytes, read " + got);
++            }
++
++            // POSIX: "The record shall be terminated by a single <newline> character."
++            if (headerDataLen == 0 || headerData[headerDataLen - 1] != '\n') {
++                 // headerDataLen == 0 check is redundant due to len < 5 check earlier.
++                throw new IOException("Invalid PAX header format: Record does not end with newline character.");
++            }
++
++            // 3. Parse "keyword=value" from headerData (excluding trailing '\n')
++            int eqPos = -1;
++            for (int j = 0; j < headerDataLen - 1; j++) { // Scan up to byte before '\n'
++                if (headerData[j] == '=') {
++                    eqPos = j;
++                    break;
++                }
++                // POSIX: "The keyword shall not contain an equals sign."
++            }
++
++            // POSIX: "There shall be one equals sign separating the keyword and value"
++            // eqPos == 0 means empty keyword. eqPos == -1 means no '=' found. Both invalid.
++            if (eqPos < 1) {
++                throw new IOException("Invalid PAX header format: No '=' separator or empty keyword found in record.");
++            }
++
++            final String keyword = new String(headerData, 0, eqPos, CharsetNames.UTF_8);
++
++            // Value is from after '=' to before '\n'
++            final int valueLen = headerDataLen - eqPos - 2; // length of bytes between '=' and '\n'
++            // valueLen can be 0 for "k=\n"
++
++            final String value = new String(headerData, eqPos + 1, valueLen, CharsetNames.UTF_8);
++
++            // POSIX: "If the value field is zero length, it shall delete any header block entry for this keyword"
++            if (valueLen == 0) {
+                 headers.remove(keyword);
+             } else {
+-                                final byte[] rest = new byte[restLen];
+-                                final int got = IOUtils.readFully(i, rest);
+-                                if (got != restLen) {
+-                                    throw new IOException("Failed to read "
+-                                                          + "Paxheader. Expected "
+-                                                          + restLen
+-                                                          + " bytes, read "
+-                                                          + got);
+-                                }
+-                                // Drop trailing NL
+-                                final String value = new String(rest, 0,
+-                                                          restLen - 1, CharsetNames.UTF_8);
+                 headers.put(keyword, value);
+             }
+-                            break;
+-                        }
+-                        coll.write((byte) ch);
+-                    }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
+-            }
++            // Finished processing this record, continue outer loop for the next one.
+         }
++
+         return headers;
+     }
+\ No newline at end of file

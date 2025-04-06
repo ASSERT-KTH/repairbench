@@ -1,0 +1,230 @@
+diff --git a/tmp/3cb539e6-5cad-4a7d-bdb0-1a709ac9f5b9_buggy.java b/tmp/377aff19-d9e4-42d9-b474-20b0f0b5eb04_fixed.java
+index eb491d5..1d6168d 100644
+--- a/tmp/3cb539e6-5cad-4a7d-bdb0-1a709ac9f5b9_buggy.java
++++ b/tmp/377aff19-d9e4-42d9-b474-20b0f0b5eb04_fixed.java
+@@ -1,170 +1,195 @@
+   /** {@inheritDoc} */
+   @Override
+   public double integrate(final FirstOrderDifferentialEquations equations,
+                           final double t0, final double[] y0,
+                           final double t, final double[] y)
+   throws DerivativeException, IntegratorException {
+ 
+     sanityChecks(equations, t0, y0, t, y);
+     setEquations(equations);
+     resetEvaluations();
+     final boolean forward = t > t0;
+ 
+     // create some internal working arrays
+     final int stages = c.length + 1;
+     if (y != y0) {
+       System.arraycopy(y0, 0, y, 0, y0.length);
+     }
+     final double[][] yDotK = new double[stages][y0.length];
+     final double[] yTmp = new double[y0.length];
+ 
+     // set up an interpolator sharing the integrator arrays
+     AbstractStepInterpolator interpolator;
+     if (requiresDenseOutput() || (! eventsHandlersManager.isEmpty())) {
+       final RungeKuttaStepInterpolator rki = (RungeKuttaStepInterpolator) prototype.copy();
+       rki.reinitialize(this, yTmp, yDotK, forward);
+       interpolator = rki;
+     } else {
+       interpolator = new DummyStepInterpolator(yTmp, forward);
+     }
+     interpolator.storeTime(t0);
+ 
+     // set up integration control objects
+     stepStart         = t0;
+     double  hNew      = 0;
+-    boolean firstTime = true;
++    // Use a flag for the very first step evaluation, to avoid recomputing K1
++    boolean firstStepAttempt = true;
++
+     for (StepHandler handler : stepHandlers) {
+         handler.reset();
+     }
+     CombinedEventsManager manager = addEndTimeChecker(t0, t, eventsHandlersManager);
+     boolean lastStep = false;
+ 
+     // main integration loop
+     while (!lastStep) {
+ 
+       interpolator.shift();
+ 
+       double error = 0;
+       for (boolean loop = true; loop;) {
+ 
+-        if (firstTime || !fsal) {
+-          // first stage
++        // First stage computation: compute yDotK[0] = f(stepStart, y)
++        // This is always needed if it's the first step attempt OR if FSAL is not enabled.
++        // If FSAL is enabled and it's not the first step attempt, yDotK[0] should
++        // already hold the derivative from the end of the previous successful step.
++        if (firstStepAttempt || !fsal) {
+           computeDerivatives(stepStart, y, yDotK[0]);
+         }
+ 
+-        if (firstTime) {
++        int kStart = 1; // Default starting index for stage computations (k=1 corresponds to yDotK[1])
++        if (firstStepAttempt) {
++          // Initialize the step size hNew on the very first attempt
+           final double[] scale;
+           if (vecAbsoluteTolerance == null) {
+               scale = new double[y0.length];
+               java.util.Arrays.fill(scale, scalAbsoluteTolerance);
+             } else {
+               scale = vecAbsoluteTolerance;
+             }
++          // initializeStep computes the first step size hNew
++          // and it internally computes the second derivative estimate yDotK[1]
+           hNew = initializeStep(equations, forward, getOrder(), scale,
+                                 stepStart, y, yDotK[0], yTmp, yDotK[1]);
+-          firstTime = false;
++
++          // Since initializeStep computed yDotK[1], the stages loop below
++          // should start from k=2 for this first attempt to avoid redundant computation.
++          kStart = 2;
++
++          // Mark that the first step initialization is done.
++          // This flag should remain false even if the first attempt is rejected.
++          firstStepAttempt = false;
+         }
+-
++        // stepSize is the size to be used for the current attempt
+         stepSize = hNew;
+ 
+-        // next stages
+-        for (int k = 1; k < stages; ++k) {
++        // compute next stages (yDotK[kStart] ... yDotK[stages-1])
++        for (int k = kStart; k < stages; ++k) {
+ 
+           for (int j = 0; j < y0.length; ++j) {
+             double sum = a[k-1][0] * yDotK[0][j];
+             for (int l = 1; l < k; ++l) {
+               sum += a[k-1][l] * yDotK[l][j];
+             }
+             yTmp[j] = y[j] + stepSize * sum;
+           }
+ 
+           computeDerivatives(stepStart + c[k-1] * stepSize, yTmp, yDotK[k]);
+ 
+         }
+ 
+         // estimate the state at the end of the step
+         for (int j = 0; j < y0.length; ++j) {
+           double sum    = b[0] * yDotK[0][j];
+           for (int l = 1; l < stages; ++l) {
+             sum    += b[l] * yDotK[l][j];
+           }
+           yTmp[j] = y[j] + stepSize * sum;
+         }
+ 
+         // estimate the error at the end of the step
+         error = estimateError(yDotK, y, yTmp, stepSize);
+         if (error <= 1.0) {
+ 
+-          // discrete events handling
++          // Step is within error tolerance. Check for events.
+           interpolator.storeTime(stepStart + stepSize);
+           if (manager.evaluateStep(interpolator)) {
++              // An event occurred during the step. Need to handle it.
+               final double dt = manager.getEventTime() - stepStart;
+               if (Math.abs(dt) <= Math.ulp(stepStart)) {
+-                  // rejecting the step would lead to a too small next step, we accept it
+-                  loop = false;
++                  // Event occurs very close to the start. Accept the current step to avoid ultra-small steps.
++                  // Might slightly overshoot the event time.
++                  loop = false; // Accept step and exit inner loop
+               } else {
+-                  // reject the step to match exactly the next switch time
++                  // Event occurs within the step. Reject the current step size
++                  // and retry with a new step size hNew = dt to hit the event time exactly.
+                   hNew = dt;
++                  // loop remains true, inner loop continues with the new hNew
+               }
+           } else {
+-            // accept the step
+-            loop = false;
++            // No event detected. Accept the step.
++            loop = false; // Exit inner loop
+           }
+ 
+         } else {
+-          // reject the step and attempt to reduce error by stepsize control
++          // Error is too large. Reject the step and reduce step size.
+           final double factor =
+               Math.min(maxGrowth,
+                        Math.max(minReduction, safety * Math.pow(error, exp)));
+           hNew = filterStep(stepSize * factor, forward, false);
++          // loop remains true, inner loop continues with the reduced hNew
+         }
+ 
+-      }
++      } // End of inner step control loop (exits when a step is accepted)
+ 
+-      // the step has been accepted
+-      final double nextStep = stepStart + stepSize;
+-      System.arraycopy(yTmp, 0, y, 0, y0.length);
++      // The step has been accepted (error is acceptable, and events are handled)
++      final double nextStep = stepStart + stepSize; // stepSize is the size of the accepted step
++      System.arraycopy(yTmp, 0, y, 0, y0.length); // Update the state array y
+       manager.stepAccepted(nextStep, y);
+-      lastStep = manager.stop();
++      lastStep = manager.stop(); // Check if the integration should stop
+ 
+       // provide the step data to the step handler
+       interpolator.storeTime(nextStep);
+       for (StepHandler handler : stepHandlers) {
+           handler.handleStep(interpolator, lastStep);
+       }
+-      stepStart = nextStep;
++      stepStart = nextStep; // Advance stepStart to the end of the accepted step
+ 
+       if (fsal) {
+-        // save the last evaluation for the next step
++        // If First Same As Last optimization applies, save the last evaluation
++        // f(t_n+1, y_n+1) = yDotK[stages - 1] for use as the first evaluation
++        // f(t_{n+1}, y_{n+1}) = yDotK[0] in the next step.
+         System.arraycopy(yDotK[stages - 1], 0, yDotK[0], 0, y0.length);
+       }
+ 
+       if (manager.reset(stepStart, y) && ! lastStep) {
+-        // some event handler has triggered changes that
+-        // invalidate the derivatives, we need to recompute them
++        // An event handler requested a state reset, this invalidates the current derivatives.
++        // Recompute the derivative at the new step start.
+         computeDerivatives(stepStart, y, yDotK[0]);
++        // This overwrites the potentially saved FSAL value, which is correct.
+       }
+ 
+       if (! lastStep) {
+-        // in some rare cases we may get here with stepSize = 0, for example
+-        // when an event occurs at integration start, reducing the first step
+-        // to zero; we have to reset the step to some safe non zero value
++        // Prepare for the next step: step size control
++
++        // Ensure stepSize is not zero (could happen with events at step boundaries)
+         stepSize = filterStep(stepSize, forward, true);
+ 
+-        // stepsize control for next step
++        // Calculate the step size for the next attempt using the error from the accepted step
+         final double factor = Math.min(maxGrowth,
+                                        Math.max(minReduction,
+                                                 safety * Math.pow(error, exp)));
+         final double scaledH = stepSize * factor;
+         final double nextT = stepStart + scaledH;
+         final boolean nextIsLast = forward ? (nextT >= t) : (nextT <= t);
++        // hNew holds the recommended step size for the next step attempt
+         hNew = filterStep(scaledH, forward, nextIsLast);
+       }
+ 
+-    }
++    } // End of main integration loop (while !lastStep)
+ 
+     final double stopTime = stepStart;
+     resetInternalState();
+     return stopTime;
+ 
+   }
+\ No newline at end of file

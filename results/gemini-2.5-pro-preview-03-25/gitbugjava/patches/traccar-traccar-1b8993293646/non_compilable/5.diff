@@ -1,0 +1,150 @@
+diff --git a/tmp/9e09abc0-fc7b-4027-97ed-c34f6e9e2bb5_buggy.java b/tmp/604c2a81-3426-4904-9b96-61c107c3481b_fixed.java
+index 7374e5f..10a9931 100644
+--- a/tmp/9e09abc0-fc7b-4027-97ed-c34f6e9e2bb5_buggy.java
++++ b/tmp/604c2a81-3426-4904-9b96-61c107c3481b_fixed.java
+@@ -1,61 +1,127 @@
++import java.text.DateFormat;
++import java.text.SimpleDateFormat;
++import java.util.Date;
++import java.util.TimeZone;
++
++// Imports assumed based on usage:
++import io.netty.channel.Channel;
++import java.net.SocketAddress;
++import org.traccar.DeviceSession;
++import org.traccar.helper.Parser;
++import org.traccar.helper.UnitsConverter;
++import org.traccar.model.CellTower;
++import org.traccar.model.Network;
++import org.traccar.model.Position;
++import org.traccar.model.WifiAccessPoint;
++import java.util.regex.Pattern; // For PATTERN_NEW (assumed defined elsewhere)
++
++// Assumed methods like getDeviceSession, getProtocolName, sendResponse, decodeAlarm exist
++// Assumed PATTERN_NEW is defined correctly for this message type
++
+     private Object decodeLocationNew(
+             Channel channel, SocketAddress remoteAddress, String sentence) {
+ 
++        // Assuming PATTERN_NEW is defined elsewhere and matches the A03 message format
+         Parser parser = new Parser(PATTERN_NEW, sentence);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+         String imei = parser.next();
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+-        String index = parser.next();
++        String index = parser.next(); // Message index (e.g., 7F)
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
++        // Field after A03 command (potentially empty) -> Alarm Code
++        // Assuming parser.nextInt() correctly returns 0 for an empty field if pattern allows optional digits.
+         position.set(Position.KEY_ALARM, decodeAlarm(parser.nextInt()));
+ 
+-        position.setDeviceTime(parser.nextDateTime());
++        // Parse date and time
++        position.setDeviceTime(parser.nextDateTime(Parser.DateTimeFormat.YYMMDDHHMMSS));
+ 
+         Network network = new Network();
++        // Parse Cell Tower Info (MCC|MNC|LAC|CID)
++        String[] cell = parser.next().split("\\|");
++        if (cell.length == 4) {
++             try {
+                  network.addCellTower(CellTower.from(
+-                parser.nextInt(), parser.nextInt(), parser.nextHexInt(), parser.nextHexInt()));
++                     Integer.parseInt(cell[0]), Integer.parseInt(cell[1]),
++                     Integer.parseInt(cell[2], 16), Integer.parseInt(cell[3], 16)));
++             } catch (NumberFormatException e) {
++                 // Ignore cell tower if parsing fails
++             }
++        }
+ 
+-        position.set(Position.KEY_BATTERY, parser.nextDouble());
+-        position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt());
+-        position.set(Position.KEY_STATUS, parser.nextHexInt());
++        position.set(Position.KEY_BATTERY, parser.nextDouble()); // Battery voltage
++        position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt()); // Battery level (%)
++        position.set(Position.KEY_STATUS, parser.nextHexInt()); // Device status flags
+ 
++        // Consume Event Code (field after status)
++        if (parser.hasNext()) {
++            position.set(Position.KEY_EVENT, parser.nextInt());
++        } else {
++            // If no fields follow status, something is wrong with the message or pattern
++            // Log warning? For now, proceed without event/location/wifi.
++            // Send response and return position without location/wifi
++             DateFormat dateFormat = new SimpleDateFormat("yyMMddHHmmss");
++             dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
++             String response = index + ",A03," + dateFormat.format(new Date());
++             sendResponse(channel, remoteAddress, imei, response);
++             return position;
++        }
++
++        // Check if GPS data follows (validity, speed, satellites, lat, lon - 5 fields)
+         if (parser.hasNext(5)) {
+ 
+-            position.setValid(parser.next().equals("A"));
++            position.setValid(parser.next().equals("A")); // Validity ('A' or 'V')
++            // Use device time as fix time
+             position.setFixTime(position.getDeviceTime());
+-            position.set(Position.KEY_SATELLITES, parser.nextInt());
+-            position.setSpeed(UnitsConverter.knotsFromKph(parser.nextInt()));
+-            position.setLatitude(parser.nextDouble());
+-            position.setLongitude(parser.nextDouble());
+ 
+-        } else {
++            // FIX: Correct order for speed and satellites parsing
++            position.setSpeed(UnitsConverter.knotsFromKph(parser.nextInt())); // Speed (kph)
++            position.set(Position.KEY_SATELLITES, parser.nextInt()); // Satellites count
+ 
+-            String[] points = parser.next().split("\\|");
++            position.setLatitude(parser.nextDouble());  // Latitude
++            position.setLongitude(parser.nextDouble()); // Longitude
++
++        } else if (parser.hasNext()) { // Check if Wifi data follows (single field with MACs)
++
++            String wifiData = parser.next();
++            String[] points = wifiData.split("\\|");
+             for (String point : points) {
+                 String[] wifi = point.split(":");
+-                String mac = wifi[0].replaceAll("(..)", "$1:");
++                if (wifi.length >= 2) {
++                    // Reformat MAC from XXXXXXXXXXXX to XX:XX:XX:XX:XX:XX
++                    // Use a regex that inserts colons between pairs of characters
++                    String mac = wifi[0].replaceAll("(?<=\\G..)(?!$)", ":");
++                    try {
++                        // Ensure RSSI is a valid integer
+                         network.addWifiAccessPoint(WifiAccessPoint.from(
+-                        mac.substring(0, mac.length() - 1), Integer.parseInt(wifi[1])));
++                                mac, Integer.parseInt(wifi[1])));
++                    } catch (NumberFormatException e) {
++                        // Ignore malformed wifi point (invalid RSSI)
++                    } catch (IllegalArgumentException e) {
++                        // Ignore malformed MAC address (e.g., invalid characters, length)
++                    }
++                }
+             }
+-
+         }
++        // If neither full GPS nor Wifi data block follows event code, location/wifi info remains unset.
+ 
+-        position.setNetwork(network);
++        position.setNetwork(network); // Set network (contains cell info, possibly wifi)
+ 
++        // Send ACK response
+         DateFormat dateFormat = new SimpleDateFormat("yyMMddHHmmss");
+         dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
++        // Response includes original index and command A03
+         String response = index + ",A03," + dateFormat.format(new Date());
+         sendResponse(channel, remoteAddress, imei, response);
+ 
+         return position;
+     }
+\ No newline at end of file

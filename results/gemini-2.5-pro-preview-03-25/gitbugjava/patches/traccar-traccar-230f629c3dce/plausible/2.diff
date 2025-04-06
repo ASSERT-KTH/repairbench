@@ -1,0 +1,245 @@
+diff --git a/tmp/e9893fea-f545-4ab8-b5a5-aac6ab92049e_buggy.java b/tmp/d89d2a4f-6086-4deb-a72a-47d9ded29a4f_fixed.java
+index 9410efa..8036417 100644
+--- a/tmp/e9893fea-f545-4ab8-b5a5-aac6ab92049e_buggy.java
++++ b/tmp/d89d2a4f-6086-4deb-a72a-47d9ded29a4f_fixed.java
+@@ -1,196 +1,230 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+         buf.readUnsignedShort(); // data length
+ 
+         String imei = String.format("%015d", buf.readLong());
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         int type = buf.readUnsignedByte();
+ 
+         if (type == MSG_RECORDS || type == MSG_EXTENDED_RECORDS) {
+ 
+             List<Position> positions = new LinkedList<>();
+ 
+             buf.readUnsignedByte(); // records left
+             int count = buf.readUnsignedByte();
+ 
+             for (int i = 0; i < count; i++) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+ 
+                 position.setTime(new Date(buf.readUnsignedInt() * 1000));
+                 buf.readUnsignedByte(); // timestamp extension
+ 
+                 if (type == MSG_EXTENDED_RECORDS) {
+                     int recordExtension = buf.readUnsignedByte();
+                     int mergeRecordCount = BitUtil.from(recordExtension, 4);
+                     int currentRecord = BitUtil.to(recordExtension, 4);
+ 
+-                    if (currentRecord > 0 && currentRecord <= mergeRecordCount) {
++                    // If merging, reuse the last position object
++                    if (currentRecord > 0 && currentRecord <= mergeRecordCount && !positions.isEmpty()) {
+                         position = positions.remove(positions.size() - 1);
+                     }
+                 }
+ 
+                 buf.readUnsignedByte(); // priority (reserved)
+ 
++                // Read coordinates before setting validity
++                int longitudeInt = buf.readInt();
++                int latitudeInt = buf.readInt();
++
++                final int INVALID_COORD_MARKER_MAX = Integer.MAX_VALUE;
++                final int INVALID_COORD_MARKER_MIN = Integer.MIN_VALUE;
++
++                // Check if coordinates are potentially invalid markers
++                if (longitudeInt != INVALID_COORD_MARKER_MAX && longitudeInt != INVALID_COORD_MARKER_MIN &&
++                    latitudeInt != INVALID_COORD_MARKER_MAX && latitudeInt != INVALID_COORD_MARKER_MIN) {
++
+                     position.setValid(true);
+-                position.setLongitude(buf.readInt() / 10000000.0);
+-                position.setLatitude(buf.readInt() / 10000000.0);
++                    position.setLongitude(longitudeInt / 10000000.0);
++                    position.setLatitude(latitudeInt / 10000000.0);
+                     position.setAltitude(buf.readUnsignedShort() / 10.0);
+                     position.setCourse(buf.readUnsignedShort() / 100.0);
+-
+                     position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+-
+                     position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+-
+                     position.set(Position.KEY_HDOP, buf.readUnsignedByte() / 10.0);
+ 
++                } else {
++                    // Coordinates likely invalid, mark position invalid and skip related fields
++                    position.setValid(false);
++                    // Skip Altitude(2), Course(2), Satellites(1), Speed(2), HDOP(1) = 8 bytes
++                    buf.skipBytes(2 + 2 + 1 + 2 + 1);
++                }
++
++                // Event and IO data are independent of GPS validity
+                 if (type == MSG_EXTENDED_RECORDS) {
+                     position.set(Position.KEY_EVENT, buf.readUnsignedShort());
+                 } else {
+                     position.set(Position.KEY_EVENT, buf.readUnsignedByte());
+                 }
+ 
+                 // Read 1 byte data
+                 int valueCount = buf.readUnsignedByte();
+                 for (int j = 0; j < valueCount; j++) {
+                     int id = type == MSG_EXTENDED_RECORDS ? buf.readUnsignedShort() : buf.readUnsignedByte();
+                     decodeParameter(position, id, buf, 1);
+                 }
+ 
+                 // Read 2 byte data
+                 valueCount = buf.readUnsignedByte();
+                 for (int j = 0; j < valueCount; j++) {
+                     int id = type == MSG_EXTENDED_RECORDS ? buf.readUnsignedShort() : buf.readUnsignedByte();
+                     decodeParameter(position, id, buf, 2);
+                 }
+ 
+                 // Read 4 byte data
+                 valueCount = buf.readUnsignedByte();
+                 for (int j = 0; j < valueCount; j++) {
+                     int id = type == MSG_EXTENDED_RECORDS ? buf.readUnsignedShort() : buf.readUnsignedByte();
+                     decodeParameter(position, id, buf, 4);
+                 }
+ 
+                 // Read 8 byte data
+                 valueCount = buf.readUnsignedByte();
+                 for (int j = 0; j < valueCount; j++) {
+                     int id = type == MSG_EXTENDED_RECORDS ? buf.readUnsignedShort() : buf.readUnsignedByte();
+                     decodeParameter(position, id, buf, 8);
+                 }
+ 
+                 decodeDriver(position, Position.PREFIX_IO + 126, Position.PREFIX_IO + 127); // can driver
+                 decodeDriver(position, Position.PREFIX_IO + 155, Position.PREFIX_IO + 156); // tco driver
+ 
+                 Long tagIdPart1 = (Long) position.getAttributes().remove(Position.PREFIX_IO + 760);
+                 Long tagIdPart2 = (Long) position.getAttributes().remove(Position.PREFIX_IO + 761);
+                 if (tagIdPart1 != null && tagIdPart2 != null) {
+                     position.set("tagId", Long.toHexString(tagIdPart1) + Long.toHexString(tagIdPart2));
+                 }
+ 
+                 positions.add(position);
+             }
+ 
+             if (channel != null) {
+                 channel.writeAndFlush(new NetworkMessage(
+                         Unpooled.wrappedBuffer(DataConverter.parseHex("0002640113bc")), remoteAddress));
+             }
+ 
+             return positions;
+ 
+         } else if (type == MSG_DTCS) {
+ 
+             List<Position> positions = new LinkedList<>();
+ 
+             int count = buf.readUnsignedByte();
+ 
+             for (int i = 0; i < count; i++) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+ 
+                 buf.readUnsignedByte(); // reserved
+ 
+                 position.setTime(new Date(buf.readUnsignedInt() * 1000));
+ 
++                // Read coordinates before setting validity
++                int longitudeInt = buf.readInt();
++                int latitudeInt = buf.readInt();
++
++                final int INVALID_COORD_MARKER_MAX = Integer.MAX_VALUE;
++                final int INVALID_COORD_MARKER_MIN = Integer.MIN_VALUE;
++
++                // Check if coordinates are potentially invalid markers
++                if (longitudeInt != INVALID_COORD_MARKER_MAX && longitudeInt != INVALID_COORD_MARKER_MIN &&
++                    latitudeInt != INVALID_COORD_MARKER_MAX && latitudeInt != INVALID_COORD_MARKER_MIN) {
++
+                     position.setValid(true);
+-                position.setLongitude(buf.readInt() / 10000000.0);
+-                position.setLatitude(buf.readInt() / 10000000.0);
++                    position.setLongitude(longitudeInt / 10000000.0);
++                    position.setLatitude(latitudeInt / 10000000.0);
++                } else {
++                    // Coordinates likely invalid, mark position invalid
++                    position.setValid(false);
++                    // No other GPS fields to skip in this message type
++                }
++
+ 
+                 if (buf.readUnsignedByte() == 2) {
+                     position.set(Position.KEY_ARCHIVE, true);
+                 }
+ 
+                 position.set(Position.KEY_DTCS, buf.readSlice(5).toString(StandardCharsets.US_ASCII));
+ 
+                 positions.add(position);
+             }
+ 
+             if (channel != null) {
+                 channel.writeAndFlush(new NetworkMessage(
+                         Unpooled.wrappedBuffer(DataConverter.parseHex("00026d01c4a4")), remoteAddress));
+             }
+ 
+             return positions;
+ 
+         } else if (type == MSG_FILES) {
+ 
+             int subtype = buf.readUnsignedByte();
+             int source = buf.readUnsignedByte();
+ 
+             if (subtype == 2) {
+                 ByteBuf filename = buf.readSlice(8);
+                 int total = buf.readUnsignedShort();
+                 int current = buf.readUnsignedShort();
+                 if (photo == null) {
+                     photo = Unpooled.buffer();
+                 }
+                 photo.writeBytes(buf.readSlice(buf.readableBytes() - 2));
+                 if (current < total - 1) {
+                     ByteBuf content = Unpooled.buffer();
+                     content.writeByte(subtype);
+                     content.writeByte(source);
+-                    content.writeBytes(filename);
++                    content.writeBytes(filename.resetReaderIndex()); // Reset reader index before writing
+                     content.writeShort(current + 1);
+                     ByteBuf response = RuptelaProtocolEncoder.encodeContent(type, content);
+                     content.release();
+                     if (channel != null) {
+                         channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+                     }
+                 } else {
+                     Position position = new Position(getProtocolName());
+                     position.setDeviceId(deviceSession.getDeviceId());
+                     getLastLocation(position, null);
+                     position.set(Position.KEY_IMAGE, writeMediaFile(imei, photo, "jpg"));
+                     photo.release();
+                     photo = null;
+                     return position;
+                 }
+             }
+ 
+             return null;
+ 
+         } else if (type == MSG_IDENTIFICATION) {
+ 
+             ByteBuf content = Unpooled.buffer();
+             content.writeByte(1);
+             ByteBuf response = RuptelaProtocolEncoder.encodeContent(type, content);
+             content.release();
+             if (channel != null) {
+                 channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+             }
+ 
+             return null;
+ 
+         } else {
+ 
+             return decodeCommandResponse(deviceSession, type, buf);
+ 
+         }
+     }
+\ No newline at end of file

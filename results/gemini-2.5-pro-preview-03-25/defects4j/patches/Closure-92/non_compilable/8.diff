@@ -1,0 +1,158 @@
+diff --git a/tmp/660dac29-095b-4860-893f-d4d74470b95e_buggy.java b/tmp/4307e110-235e-4cb3-a9a1-1b53c0ac4eee_fixed.java
+index 851ffc2..e4c7892 100644
+--- a/tmp/660dac29-095b-4860-893f-d4d74470b95e_buggy.java
++++ b/tmp/4307e110-235e-4cb3-a9a1-1b53c0ac4eee_fixed.java
+@@ -1,70 +1,120 @@
+     /**
+      * Replace the provide statement.
+      *
+      * If we're providing a name with no definition, then create one.
+      * If we're providing a name with a duplicate definition, then make sure
+      * that definition becomes a declaration.
+      */
+     void replace() {
+       if (firstNode == null) {
+-        // Don't touch the base case ('goog').
++        // Don't touch the base case ('goog') or cases where the name is implicitly provided
++        // by a definition created before the first goog.provide.
+         replacementNode = candidateDefinition;
+         return;
+       }
+ 
+       // Handle the case where there is a duplicate definition for an explicitly
+-      // provided symbol.
++      // provided symbol. (e.g., goog.provide('a'); var a = {};)
+       if (candidateDefinition != null && explicitNode != null) {
+-        explicitNode.detachFromParent();
+-        compiler.reportCodeChange();
++        explicitNode.detachFromParent(); // Remove the goog.provide call.
+ 
+-        // Does this need a VAR keyword?
++        // Does this need a VAR keyword? Check if the definition is assign-based.
+         replacementNode = candidateDefinition;
++        // Check if the candidate is an EXPR_RESULT node (like `a = {};` or `a.b = {};`)
+         if (NodeUtil.isExpressionNode(candidateDefinition)) {
+           candidateDefinition.putBooleanProp(Node.IS_NAMESPACE, true);
+-          Node assignNode = candidateDefinition.getFirstChild();
+-          Node nameNode = assignNode.getFirstChild();
+-          if (nameNode.getType() == Token.NAME) {
+-            // Need to convert this assign to a var declaration.
+-            Node valueNode = nameNode.getNext();
++          Node assignNode = candidateDefinition.getFirstChild(); // e.g., ASSIGN
++          // Check if it's a simple assignment to a NAME, like `a = {}`
++          if (assignNode.isAssign()) {
++             Node nameNode = assignNode.getFirstChild(); // The LHS of the assign
++             if (nameNode.isName()) {
++               // Need to convert 'name = value;' (EXPR_RESULT) to 'var name = value;' (VAR)
++               Node valueNode = nameNode.getNext(); // The RHS
+                assignNode.removeChild(nameNode);
+                assignNode.removeChild(valueNode);
+-            nameNode.addChildToFront(valueNode);
+-            Node varNode = new Node(Token.VAR, nameNode);
+-            varNode.copyInformationFrom(candidateDefinition);
+-            candidateDefinition.getParent().replaceChild(
+-                candidateDefinition, varNode);
++               nameNode.addChildToFront(valueNode); // NAME node now has value as child
++               Node varNode = new Node(Token.VAR, nameNode); // Create VAR(NAME(VALUE))
++               varNode.copyInformationFrom(candidateDefinition); // Copy source pos info
++
++               // Replace the original EXPR_RESULT node with the new VAR node.
++               Node parent = candidateDefinition.getParent();
++               parent.replaceChild(candidateDefinition, varNode);
++
++               // Transfer JSDoc from the original expression statement's assign node
+                nameNode.setJSDocInfo(assignNode.getJSDocInfo());
++               replacementNode = varNode; // Update our reference
++             }
++          }
++        }
++        // We detached a node and potentially replaced another.
+         compiler.reportCodeChange();
+-            replacementNode = varNode;
+-          }
+-        }
+-      } else {
+-        // Handle the case where there's not a duplicate definition.
+-        replacementNode = createDeclarationNode();
++
++      } else { // No duplicate definition: Need to create a declaration.
++        replacementNode = createDeclarationNode(); // e.g., 'var ns = {}' or 'ns.sub = {}'
++
++        // Determine where to insert the new declaration node.
+         if (firstModule == minimumModule) {
++          // First occurrence was in the earliest module involved in the namespace path.
++          // Insert the declaration right before the first occurrence node (usually the goog.provide).
++          Preconditions.checkNotNull(firstNode, "Expected firstNode for non-implicit provide");
+           firstNode.getParent().addChildBefore(replacementNode, firstNode);
+         } else {
+-          // In this case, the name was implicitly provided by two independent
+-          // modules. We need to move this code up to a common module.
+-          int indexOfDot = namespace.indexOf('.');
++          // First occurrence was NOT in the earliest module (minimumModule).
++          if (explicitNode != null) {
++            // This name was EXPLICITLY provided in this later module (firstModule).
++            // The declaration belongs in this module (firstModule).
++            // Insert before the goog.provide statement (which is firstNode).
++            Preconditions.checkNotNull(firstNode);
++            // If explicitNode exists, it implies a goog.provide, which should be the first node.
++            Preconditions.checkState(explicitNode == firstNode,
++                "Explicit node is not the first node for namespace %s", namespace);
++            firstNode.getParent().addChildBefore(replacementNode, firstNode);
++          } else {
++            // This name was IMPLICITLY provided (needed for a child namespace like 'a' in 'a.b.c').
++            // The declaration must be hoisted to the minimumModule.
++            int indexOfDot = namespace.lastIndexOf('.'); // Get parent namespace: "a.b" for "a.b.c"
++            Node insertionScript = compiler.getNodeForCodeInsertion(minimumModule);
++
+             if (indexOfDot == -1) {
+-            // Any old place is fine.
+-            compiler.getNodeForCodeInsertion(minimumModule)
+-                .addChildToBack(replacementNode);
++              // An implicit root namespace? This is unusual if firstModule != minimumModule.
++              // It might happen if the root was implicitly created by a child in a later module.
++              // Hoist to minimum module, add to back as a fallback strategy.
++              compiler.reportWarning(
++                  ProcessClosurePrimitives.INVALID_PROVIDE_NAMESPACE, // Use a suitable warning type
++                  namespace);
++              insertionScript.addChildToBack(replacementNode);
+             } else {
+-            // Add it after the parent namespace.
++              // Implicit nested namespace. Insert into minimumModule.
++              // Try to insert AFTER the parent's node within minimumModule for correct ordering.
+               ProvidedName parentName =
+                   providedNames.get(namespace.substring(0, indexOfDot));
+-            Preconditions.checkNotNull(parentName);
+-            Preconditions.checkNotNull(parentName.replacementNode);
+-            parentName.replacementNode.getParent().addChildAfter(
+-                replacementNode, parentName.replacementNode);
++              Preconditions.checkNotNull(parentName,
++                  "Parent namespace %s should have been provided",
++                  namespace.substring(0, indexOfDot));
++
++              Node parentNode = parentName.replacementNode;
++
++              // Check if parentNode exists and is already placed in the target script.
++              if (parentNode != null && parentNode.getParent() == insertionScript) {
++                 // Insert after the parent node.
++                 insertionScript.addChildAfter(replacementNode, parentNode);
++              } else {
++                 // Parent node not found in the target script yet (either null, or not yet moved).
++                 // Add to the end of the target script. Relies on execution order or
++                 // subsequent processing to ensure parent exists before child usage.
++                 insertionScript.addChildToBack(replacementNode);
+               }
+             }
++          }
++        }
++
++        // Remove the original goog.provide() statement if this name was explicitly provided.
++        // Note: If candidateDefinition was not null, explicitNode was detached earlier.
+         if (explicitNode != null) {
+           explicitNode.detachFromParent();
+         }
++
++        // Report change as we've inserted a new node and potentially detached the explicitNode.
+         compiler.reportCodeChange();
+       }
+     }
+\ No newline at end of file

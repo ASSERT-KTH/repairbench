@@ -1,0 +1,121 @@
+diff --git a/tmp/c20f90cd-6b4b-4363-87c4-895bcfa63a01_buggy.java b/tmp/9ee50b0a-dc0c-4611-ae5b-358ab1abe0b7_fixed.java
+index 99d6a44..eda3c83 100644
+--- a/tmp/c20f90cd-6b4b-4363-87c4-895bcfa63a01_buggy.java
++++ b/tmp/9ee50b0a-dc0c-4611-ae5b-358ab1abe0b7_fixed.java
+@@ -1,58 +1,111 @@
+     /**
+      * Computes the parsed datetime by setting the saved fields.
+      * This method is idempotent, but it is not thread-safe.
+      *
+      * @param resetFields false by default, but when true, unsaved field values are cleared
+      * @param text optional text being parsed, to be included in any error message
+      * @return milliseconds since 1970-01-01T00:00:00Z
+      * @throws IllegalArgumentException if any field is out of range
+      * @since 1.3
+      */
+     public long computeMillis(boolean resetFields, String text) {
+         SavedField[] savedFields = iSavedFields;
+         int count = iSavedFieldsCount;
+         if (iSavedFieldsShared) {
+             iSavedFields = savedFields = (SavedField[])iSavedFields.clone();
+             iSavedFieldsShared = false;
+         }
+-        sort(savedFields, count);
++        sort(savedFields, count); // Sort fields according to duration and range
++
++        // Handle cases where the pattern does not include a year field implicitly
+         if (count > 0) {
+             // alter base year for parsing if first field is month or day
+             DurationField months = DurationFieldType.months().getField(iChrono);
+             DurationField days = DurationFieldType.days().getField(iChrono);
+             DurationField first = savedFields[0].iField.getDurationField();
+             if (compareReverse(first, months) >= 0 && compareReverse(first, days) <= 0) {
++                // If month or day fields are parsed before year, add default year and restart.
+                 saveField(DateTimeFieldType.year(), iDefaultYear);
++                // Recursive call might be problematic, but let's preserve original structure unless it's the root cause
+                 return computeMillis(resetFields, text);
+             }
+         }
+ 
+-        long millis = iMillis;
++        long millis = iMillis; // Start with the base instant
+         try {
++            // Sequentially apply the parsed fields
+             for (int i = 0; i < count; i++) {
+                 millis = savedFields[i].set(millis, resetFields);
+             }
+         } catch (IllegalFieldValueException e) {
++            // Handle parsing errors like out-of-range values
+             if (text != null) {
+                 e.prependMessage("Cannot parse \"" + text + '"');
+             }
+             throw e;
+         }
+         
++        // ---- Start: Added conflict resolution logic ----
++        // Check if both year/yearOfEra and weekyear fields were parsed.
++        // These fields can conflict, e.g., setting month=1, week=1 after year=2012 might shift the date to weekyear 2011.
++        int parsedYear = -1; // Sentinel for not found
++        int parsedWeekyear = -1;
++
++        for (int i = 0; i < count; i++) {
++            SavedField savedField = savedFields[i];
++            DateTimeFieldType type = savedField.iField.getType();
++            
++            // Check for various 'year' fields
++            if (type == DateTimeFieldType.year() || 
++                type == DateTimeFieldType.yearOfEra() || 
++                type == DateTimeFieldType.centuryOfEra() || 
++                type == DateTimeFieldType.yearOfCentury()) {
++                
++                // Assuming only one year-related field is parsed and saved.
++                parsedYear = savedField.iValue; 
++            }
++            
++            // Check for 'weekyear' field
++            if (type == DateTimeFieldType.weekyear()) {
++                parsedWeekyear = savedField.iValue;
++            }
++        }
++
++        // If both a standard year field and a weekyear field were specified
++        if (parsedYear != -1 && parsedWeekyear != -1) {
++            // Get the weekyear of the date computed after sequentially applying all fields
++            int computedWeekyear = iChrono.weekyear().get(millis);
++            
++            // If the computed weekyear differs from the explicitly parsed weekyear,
++            // it indicates a conflict arose (e.g., month/day setting shifted the weekyear).
++            // In this case, re-apply the parsed weekyear value to enforce it.
++            if (computedWeekyear != parsedWeekyear) {
++                millis = iChrono.weekyear().set(millis, parsedWeekyear);
++            }
++        }
++        // ---- End: Added conflict resolution logic ----
++        
++        // Adjust the computed milliseconds for the time zone
+         if (iZone == null) {
++            // Apply the fixed offset if no specific time zone is set
+             millis -= iOffset;
+         } else {
++            // Get the time zone offset for the computed local time
+             int offset = iZone.getOffsetFromLocal(millis);
+-            millis -= offset;
++            millis -= offset; // Adjust millis to UTC
++            
++            // Check for issues near time zone transitions (e.g., DST changes)
+             if (offset != iZone.getOffset(millis)) {
+                 String message =
+                     "Illegal instant due to time zone offset transition (" + iZone + ')';
+                 if (text != null) {
+                     message = "Cannot parse \"" + text + "\": " + message;
+                 }
++                // Throw exception for illegal or ambiguous instants
++                // Consider using IllegalInstantException if available/appropriate for the Joda-Time version context
+                 throw new IllegalArgumentException(message); 
+             }
+         }
+         
+-        return millis;
++        return millis; // Return the final computed milliseconds (UTC)
+     }
+\ No newline at end of file

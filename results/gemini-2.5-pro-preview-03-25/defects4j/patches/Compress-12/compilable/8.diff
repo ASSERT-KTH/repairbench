@@ -1,0 +1,154 @@
+diff --git a/tmp/ec396fc2-750c-443a-8973-1a30da6c71aa_buggy.java b/tmp/7eae3655-8c9c-46dd-abb2-2b6e5e4e801a_fixed.java
+index b5a206b..1bd46d0 100644
+--- a/tmp/ec396fc2-750c-443a-8973-1a30da6c71aa_buggy.java
++++ b/tmp/7eae3655-8c9c-46dd-abb2-2b6e5e4e801a_fixed.java
+@@ -1,80 +1,128 @@
+     /**
+      * Get the next entry in this tar archive. This will skip
+      * over any remaining data in the current entry, if there
+      * is one, and place the input stream at the header of the
+      * next entry, and read the header and instantiate a new
+      * TarEntry from the header bytes and return that entry.
+      * If there are no more entries in the archive, null will
+      * be returned to indicate that the end of the archive has
+      * been reached.
+      *
+      * @return The next TarEntry in the archive, or null.
+      * @throws IOException on error
+      */
+     public TarArchiveEntry getNextTarEntry() throws IOException {
+         if (hasHitEOF) {
+             return null;
+         }
+ 
+         if (currEntry != null) {
+             long numToSkip = entrySize - entryOffset;
+ 
++            // Skip the rest of the current entry
++            // Loop until the desired number of bytes are skipped.
+             while (numToSkip > 0) {
+-                long skipped = skip(numToSkip);
++                long skipped = skip(numToSkip); // Use the stream's skip method
+                 if (skipped <= 0) {
+-                    throw new RuntimeException("failed to skip current tar entry");
++                    // If skip returns <= 0, it may mean EOF or temporary blockage.
++                    // Tar entries should be padded, so hitting EOF while skipping usually means corruption.
++                    // Throw IOException for consistency with stream operations.
++                    throw new IOException("Possible tar file corruption: failed to skip " + numToSkip
++                                           + " bytes remaining in entry '" + currEntry.getName() + "'");
+                 }
+                 numToSkip -= skipped;
+             }
+ 
+-            readBuf = null;
++            readBuf = null; // Reset the read buffer
+         }
+ 
+-        byte[] headerBuf = getRecord();
++        byte[] headerBuf = getRecord(); // Read the 512-byte header record
+ 
++        // getRecord() returns null on EOF (physical stream end or EOF marker blocks)
++        // and sets hasHitEOF internally.
++        if (headerBuf == null) {
++            hasHitEOF = true; // Ensure hasHitEOF reflects the state from getRecord()
++        }
++
++        // Check if we have reached the end of the archive
+         if (hasHitEOF) {
+             currEntry = null;
+             return null;
+         }
+ 
++        // Attempt to parse the header record into a TarArchiveEntry object.
++        try {
+             currEntry = new TarArchiveEntry(headerBuf);
++        } catch (IllegalArgumentException e) {
++            // Catch specific exceptions thrown during header parsing (e.g., invalid octal fields)
++            // and wrap them in an IOException as per the method signature and common practice
++            // for stream corruption errors. This addresses the testCOMPRESS178 failure.
++            IOException ioe = new IOException("Failed to parse tar entry header: " + e.getMessage(), e);
++            throw ioe;
++        }
++
++        // Reset the offset and get the size for the new entry
+         entryOffset = 0;
+-        entrySize = currEntry.getSize();
++        entrySize = currEntry.getSize(); // Initial size from the header
+ 
++        // --- Handle TAR extensions ---
++        // The logic for handling extensions below uses recursive calls to getNextEntry()
++        // and might have issues (e.g., potential StackOverflowError, correctness of reading data).
++        // It is preserved here for minimal modification focused on the reported bug fix.
++
++        // Handle GNU long name entries ('L')
+         if (currEntry.isGNULongNameEntry()) {
+-            // read in the name
++            // Read the long name from the data block of this 'L' type entry.
++            // The original read loop was flawed; using a slightly improved version.
+             StringBuffer longName = new StringBuffer();
+-            byte[] buf = new byte[SMALL_BUFFER_SIZE];
++            byte[] buf = new byte[SMALL_BUFFER_SIZE]; // SMALL_BUFFER_SIZE assumed defined in the class
+             int length = 0;
+-            while ((length = read(buf)) >= 0) {
++            long bytesToRead = entrySize;
++            while (bytesToRead > 0 && (length = read(buf, 0, (int) Math.min(buf.length, bytesToRead))) != -1) {
++                 if (length > 0) {
++                    // Appends using platform default encoding, consistent with original code.
+                     longName.append(new String(buf, 0, length));
++                    bytesToRead -= length;
+                  }
+-            getNextEntry();
++            }
++             // Basic check if the expected amount was read.
++             if (bytesToRead > 0) {
++                  throw new IOException("Failed to read fully GnuTarEntry long name. Expected "
++                                        + entrySize + " bytes, but could only read " + (entrySize - bytesToRead));
++             }
++            // Now read the header of the actual entry this name belongs to.
++            getNextEntry(); // RECURSIVE CALL - potential issue
+             if (currEntry == null) {
+-                // Bugzilla: 40334
+-                // Malformed tar file - long entry name not followed by entry
++                // Bugzilla: 40334 - Malformed tar: Long name entry not followed by a regular entry.
+                 return null;
+             }
+-            // remove trailing null terminator
++            // Remove trailing null terminator as per GNU tar spec.
+             if (longName.length() > 0
+                 && longName.charAt(longName.length() - 1) == 0) {
+                 longName.deleteCharAt(longName.length() - 1);
+             }
+             currEntry.setName(longName.toString());
+         }
+ 
+-        if (currEntry.isPaxHeader()){ // Process Pax headers
+-            paxHeaders();
++        // Handle PAX headers ('x' global, 'g' entry-specific)
++        if (currEntry.isPaxHeader()) {
++            paxHeaders(); // Assumed internal method that reads PAX data and calls getNextEntry() recursively
+         }
+ 
+-        if (currEntry.isGNUSparse()){ // Process sparse files
+-            readGNUSparse();
++        // Handle GNU sparse files ('S')
++        if (currEntry.isGNUSparse()) {
++            readGNUSparse(); // Assumed internal method that reads sparse map and calls getNextEntry() recursively
+         }
+ 
+-        // If the size of the next element in the archive has changed
+-        // due to a new size being reported in the posix header
+-        // information, we update entrySize here so that it contains
+-        // the correct value.
++        // Re-fetch the size after processing extensions, as PAX headers might modify it.
++        // This relies on currEntry pointing to the correct entry after recursive calls.
++        if (currEntry != null) { // currEntry could be null if recursion hit EOF
+              entrySize = currEntry.getSize();
++        } else {
++             // If an extension handler encountered EOF, currEntry will be null.
++             return null;
++        }
++
++        // Return the processed entry
+         return currEntry;
+     }
+\ No newline at end of file

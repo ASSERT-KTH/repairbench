@@ -1,0 +1,183 @@
+diff --git a/tmp/2c99e8b4-777c-4dc6-91e1-dbd01f298ff8_buggy.java b/tmp/9ae737da-465c-4538-a798-62f68bdeb6c1_fixed.java
+index 80921f4..32b6ca1 100644
+--- a/tmp/2c99e8b4-777c-4dc6-91e1-dbd01f298ff8_buggy.java
++++ b/tmp/9ae737da-465c-4538-a798-62f68bdeb6c1_fixed.java
+@@ -1,135 +1,154 @@
+     @Override
+     public JsonToken nextToken() throws IOException
+     {
+         _binaryValue = null;
+         if (_nextToken != null) {
+             JsonToken t = _nextToken;
+             _currToken = t;
+             _nextToken = null;
+             switch (t) {
+             case START_OBJECT:
+                 _parsingContext = _parsingContext.createChildObjectContext(-1, -1);
+                 break;
+             case START_ARRAY:
+                 _parsingContext = _parsingContext.createChildArrayContext(-1, -1);
+                 break;
+             case END_OBJECT:
+             case END_ARRAY:
+                 _parsingContext = _parsingContext.getParent();
+-                _namesToWrap = _parsingContext.getNamesToWrap();
++                _namesToWrap = (_parsingContext == null) ? null : _parsingContext.getNamesToWrap();
+                 break;
+             case FIELD_NAME:
+-                _parsingContext.setCurrentName(_xmlTokens.getLocalName());
++                 // 10-Oct-2016, tatu: Since this is virtual, needs to be set explicitly
++                //   via this method, not just rely on underlying XML stream:
++                 _parsingContext.setCurrentName(_currText);
+                  break;
+             default: // VALUE_STRING, VALUE_NULL
+                 // should be fine as is?
+             }
+             return t;
+         }
+         int token = _xmlTokens.next();
+ 
+         // Need to have a loop just because we may have to eat/convert
+         // a start-element that indicates an array element.
+         while (token == XmlTokenStream.XML_START_ELEMENT) {
+             // If we thought we might get leaf, no such luck
+             if (_mayBeLeaf) {
+                 // leave _mayBeLeaf set, as we start a new context
+                 _nextToken = JsonToken.FIELD_NAME;
+                 _parsingContext = _parsingContext.createChildObjectContext(-1, -1);
++                // Ok: must reset current text, since it's not related to this element
++                _currText = _xmlTokens.getLocalName();
+                 return (_currToken = JsonToken.START_OBJECT);
+             }
+             if (_parsingContext.inArray()) {
+                 // Yup: in array, so this element could be verified; but it won't be
+                 // reported anyway, and we need to process following event.
+                 token = _xmlTokens.next();
+                 _mayBeLeaf = true;
+                 continue;
+             }
+             String name = _xmlTokens.getLocalName();
+             _parsingContext.setCurrentName(name);
++            _currText = name; // to be exposed by getCurrentName()
+ 
+             // Ok: virtual wrapping can be done by simply repeating current START_ELEMENT.
+             // Couple of ways to do it; but start by making _xmlTokens replay the thing...
+             if (_namesToWrap != null && _namesToWrap.contains(name)) {
+                 _xmlTokens.repeatStartElement();
+             }
+ 
+             _mayBeLeaf = true;
+             // Ok: in array context we need to skip reporting field names.
+             // But what's the best way to find next token?
+             return (_currToken = JsonToken.FIELD_NAME);
+         }
+ 
+         // Ok; beyond start element, what do we get?
+         switch (token) {
+         case XmlTokenStream.XML_END_ELEMENT:
+             // Simple, except that if this is a leaf, need to suppress end:
+             if (_mayBeLeaf) {
+                 _mayBeLeaf = false;
+                 // 06-Jan-2015, tatu: as per [dataformat-xml#180], need to
+-                    //    expose as empty Object, not null
+-                return (_currToken = JsonToken.VALUE_NULL);
++                //    expose as empty Object, not null. Empty String is another
++                //    possibility, but this seems saner.
++                // 28-Oct-2016, tatu: Actually, must skip the mandatory END_ELEMENT that
++                //    follows the TEXT node (whether empty or not)... although maybe that
++                //    should be handled via call to `skipEndElement()` instead. For now, fine.
++                return (_currToken = JsonToken.END_OBJECT);
+             }
+             _currToken = _parsingContext.inArray() ? JsonToken.END_ARRAY : JsonToken.END_OBJECT;
+             _parsingContext = _parsingContext.getParent();
+-            _namesToWrap = _parsingContext.getNamesToWrap();
++            _namesToWrap = (_parsingContext == null) ? null : _parsingContext.getNamesToWrap();
+             return _currToken;
+ 
+         case XmlTokenStream.XML_ATTRIBUTE_NAME:
+             // If there was a chance of leaf node, no more...
+             if (_mayBeLeaf) {
+                 _mayBeLeaf = false;
+                 _nextToken = JsonToken.FIELD_NAME;
+-                _currText = _xmlTokens.getText();
++                // We don't yet have the value; need to keep current name. Best way is to
++                // just store it for now... (note: NOT _currText, which is used for values)
++                 _staxName = _xmlTokens.getLocalName();
+                 _parsingContext = _parsingContext.createChildObjectContext(-1, -1);
+                 return (_currToken = JsonToken.START_OBJECT);
+             }
+             _parsingContext.setCurrentName(_xmlTokens.getLocalName());
++            _currText = _xmlTokens.getLocalName();
+             return (_currToken = JsonToken.FIELD_NAME);
+         case XmlTokenStream.XML_ATTRIBUTE_VALUE:
++            // note: _staxName is null if we are not converting leaf->object
++            if (_staxName != null) {
++                _parsingContext.setCurrentName(_staxName);
++                _currText = _staxName;
++                _staxName = null;
++                _nextToken = JsonToken.VALUE_STRING;
++                return (_currToken = JsonToken.FIELD_NAME);
++            }
+             _currText = _xmlTokens.getText();
+             return (_currToken = JsonToken.VALUE_STRING);
+         case XmlTokenStream.XML_TEXT:
+             _currText = _xmlTokens.getText();
+             if (_mayBeLeaf) {
+                 _mayBeLeaf = false;
+-                /* One more refinement (pronunced like "hack") is that if
+-                 * we had an empty String (or all white space), and we are
+-                 * deserializing an array, we better hide the empty text.
+-                 */
+                 // Also: must skip following END_ELEMENT
+                 _xmlTokens.skipEndElement();
++
++                // 06-Jan-2015, tatu: This is the case for <tag> </tag> which should be exposed as
++                //    String value, except if it's empty String... empty String is problematic,
++                //    needs to be considered same as <tag/>, basically.
+                 if (_parsingContext.inArray()) {
++                     // [dataformat-xml#180] Need to consider empty textual value as indication
++                     // of empty Object; not null, not just ignore. Need to see what needs
++                     // to be done but... maybe this is enough?
+                      if (_isEmpty(_currText)) {
+-                        // 06-Jan-2015, tatu: as per [dataformat-xml#180], need to
+-                        //    expose as empty Object, not null (or, worse, as used to
+-                        //    be done, by swallowing the token)
+-                        _currToken = JsonToken.END_ARRAY;
+-                        _parsingContext = _parsingContext.getParent();
+-                        _namesToWrap = _parsingContext.getNamesToWrap();
+-                        return _currToken;
++                         return (_currToken = JsonToken.END_OBJECT);
+                      }
++                } else if (_isEmpty(_currText)) {
++                    // [dataformat-xml#180], same as above, but not in array context
++                     return (_currToken = JsonToken.END_OBJECT);
+                 }
++                // And non-empty text then is just String value, whether in array or not:
+                 return (_currToken = JsonToken.VALUE_STRING);
+-            } else {
+-                // [dataformat-xml#177]: empty text may also need to be skipped
++            }
++            // [dataformat-xml#177]: Otherwise, if we are in Object, have something other
++            // than FIELD_NAME, and get empty text, need to just skip it...
+             if (_parsingContext.inObject()
+                     && (_currToken != JsonToken.FIELD_NAME) && _isEmpty(_currText)) {
+-                    _currToken = JsonToken.END_OBJECT;
+-                    _parsingContext = _parsingContext.getParent();
+-                    _namesToWrap = _parsingContext.getNamesToWrap();
+-                    return _currToken;
+-                }
++                 return nextToken();
+             }
+             // If not a leaf (or otherwise ignorable), need to transform into property...
+             _parsingContext.setCurrentName(_cfgNameForTextElement);
+             _nextToken = JsonToken.VALUE_STRING;
++            _currText = _cfgNameForTextElement;
+             return (_currToken = JsonToken.FIELD_NAME);
+         case XmlTokenStream.XML_END:
+             return (_currToken = null);
+         }
+ 
+         // should never get here
+         _throwInternal();
+         return null;
+     }

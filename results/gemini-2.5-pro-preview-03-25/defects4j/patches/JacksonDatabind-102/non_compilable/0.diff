@@ -1,0 +1,166 @@
+diff --git a/tmp/a8ad7867-f945-4d02-b752-00ee203c645d_buggy.java b/tmp/87b3e973-7933-4470-bee5-875a8de496c7_fixed.java
+index 1b07d98..9f9bc2d 100644
+--- a/tmp/a8ad7867-f945-4d02-b752-00ee203c645d_buggy.java
++++ b/tmp/87b3e973-7933-4470-bee5-875a8de496c7_fixed.java
+@@ -1,76 +1,136 @@
+     @Override
+     public JsonSerializer<?> createContextual(SerializerProvider serializers,
+             BeanProperty property) throws JsonMappingException
+     {
+-        // Note! Should not skip if `property` null since that'd skip check
+-        // for config overrides, in case of root value
+-        if (property == null) {
+-            return this;
++        // NOTE: we can NOT use method like `findFormatOverrides` or `findFormatFeature`
++        // because we need to handle both property annotations and config overrides,
++        // and combination of possible sources
++        // 29-Sep-2018, tatu: Need to use a method that is properly wired and Maestrov
++        //    knows how to use, findFormatOverrides() is not it.
++//        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
++
++        // First: check features defined via property annotations, if any
++        final AnnotationIntrospector intr = serializers.getAnnotationIntrospector();
++        final AnnotatedMember member = (property == null) ? null : property.getMember();
++        JsonFormat.Value format = null;
++
++        if (member != null) {
++            format = intr.findFormat((Annotated) member);
++        }
++
++        // Second: consider global default format for type (if any)
++        if (format == null) {
++             format = serializers.getConfig().getDefaultPropertyFormat(_handledType);
++        }
++
++        // Third: apply per-type default format settings (NOTE: necessary here?)
++        // (NOTE: could perhaps remove this part?)
++        if (format == null) {
++            // nothing from individual property, nor defaults: apply per-type settings from
++            // `ObjectMapper.configOverride(handledType)`?
++            // 29-Sep-2018, tatu: Yes, needed for [databind#2064]
++            format = serializers.getConfig().getConfigOverride(_handledType).getFormat();
+         }
+-        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
++
+         if (format == null) {
++            // No overrides, use base serializer unchanged
+             return this;
+         }
++
+         // Simple case first: serialize as numeric timestamp?
+         JsonFormat.Shape shape = format.getShape();
+         if (shape.isNumeric()) {
++            // If serializer needs to change to numeric format
+             return withFormat(Boolean.TRUE, null);
+         }
+ 
+-        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+-        // First: custom pattern will override things
++        // If pattern provided, it determines specific format:
+         if (format.hasPattern()) {
+             final Locale loc = format.hasLocale()
+                             ? format.getLocale()
+                             : serializers.getLocale();
+             SimpleDateFormat df = new SimpleDateFormat(format.getPattern(), loc);
+-            TimeZone tz = format.hasTimeZone() ? format.getTimeZone()
+-                    : serializers.getTimeZone();
++
++            TimeZone tz = format.hasTimeZone() ? format.getTimeZone() : serializers.getTimeZone();
+             df.setTimeZone(tz);
++            // Regardless of base serializer format, need to use this specific format
+             return withFormat(Boolean.FALSE, df);
+         }
+ 
+-        // Otherwise, need one of these changes:
++        // Otherwise, check for changes in Locale, TimeZone, or explicit String shape
+         final boolean hasLocale = format.hasLocale();
+         final boolean hasTZ = format.hasTimeZone();
+-        final boolean asString = (shape == JsonFormat.Shape.STRING);
++        // Note: Shape is relevant if base type's default is numeric, AND shape is STRING/SCALAR
++        final boolean asString = (shape == JsonFormat.Shape.STRING || shape == JsonFormat.Shape.SCALAR);
+ 
++        // If nothing indicates a change that requires custom format...
++        // except we must ensure format is not numeric (already checked)
+         if (!hasLocale && !hasTZ && !asString) {
+             return this;
+         }
+ 
++        // Need to apply String format with possible Locale/TimeZone customization
++
++        // Get the default DateFormat from configuration
+         DateFormat df0 = serializers.getConfig().getDateFormat();
+-        // Jackson's own `StdDateFormat` is quite easy to deal with...
++
++        // If default is Jackson's StdDateFormat, it's easy to configure
+         if (df0 instanceof StdDateFormat) {
+             StdDateFormat std = (StdDateFormat) df0;
+-            if (format.hasLocale()) {
++
++            // Determine target locale
++            if (hasLocale) {
+                 std = std.withLocale(format.getLocale());
++            } else {
++                // Otherwise ensure serializer context default used
++                std = std.withLocale(serializers.getLocale());
+             }
+-            if (format.hasTimeZone()) {
+-                std = std.withTimeZone(format.getTimeZone());
++
++            // Determine target timezone
++            TimeZone tz;
++            if (hasTZ) {
++                 tz = format.getTimeZone();
++            } else {
++                 tz = serializers.getTimeZone();
+             }
++            std = std.withTimeZone(tz);
+             return withFormat(Boolean.FALSE, std);
+         }
+ 
+-        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+-        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+-        //    So: require it be `SimpleDateFormat`; can't config other types
++        // If not StdDateFormat, require SimpleDateFormat for customization
+         if (!(df0 instanceof SimpleDateFormat)) {
++            // 28-Sep-2018, tatu: Let's verify this is close enough to fail...
++            if (df0 == null) {
++                 // Cannot apply Locale/TimeZone overrides without a base format
++                 serializers.reportBadDefinition(handledType(),
++                      "Cannot apply configuration overrides for Locale/TimeZone when no default DateFormat configured");
++            } else {
+                 serializers.reportBadDefinition(handledType(), String.format(
+                         "Configured `DateFormat` (%s) not a `SimpleDateFormat`; cannot configure `Locale` or `TimeZone`",
+                         df0.getClass().getName()));
+             }
++            // Cannot configure, return 'this' (potentially incorrect if 'this' is numeric)
++            return this;
++        }
++
++        // It's a SimpleDateFormat: clone or recreate to apply changes
+         SimpleDateFormat df = (SimpleDateFormat) df0;
+-        if (hasLocale) {
+-            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+-            df = new SimpleDateFormat(df.toPattern(), format.getLocale());
++
++        // Determine target Locale (note: seconds-from-epoch does not use Locale)
++        Locale newLocale = hasLocale ? format.getLocale() : serializers.getLocale();
++        if (!newLocale.equals(df.getLocale())) {
++            // Ugh. No way to change `Locale`, create copy; must re-create completely:
++            df = new SimpleDateFormat(df.toPattern(), newLocale);
++            // TimeZone gets reset, must re-set below:
+         } else {
++            // If locale did not change, clone to avoid modifying shared instance
+             df = (SimpleDateFormat) df.clone();
+         }
+-        TimeZone newTz = format.getTimeZone();
+-        boolean changeTZ = (newTz != null) && !newTz.equals(df.getTimeZone());
+-        if (changeTZ) {
++
++        // Determine target TimeZone
++        TimeZone newTz = hasTZ ? format.getTimeZone() : serializers.getTimeZone();
++        if (newTz != null && !newTz.equals(df.getTimeZone())) {
+             df.setTimeZone(newTz);
+         }
+         return withFormat(Boolean.FALSE, df);
+     }
+\ No newline at end of file

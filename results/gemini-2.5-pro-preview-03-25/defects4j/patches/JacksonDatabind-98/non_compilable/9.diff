@@ -1,0 +1,179 @@
+diff --git a/tmp/6607d38e-8485-4e8f-9f8c-92aa0cbd4854_buggy.java b/tmp/0e742152-4549-46f6-abd6-bee53062707d_fixed.java
+index afcc27c..7c8a1ee 100644
+--- a/tmp/6607d38e-8485-4e8f-9f8c-92aa0cbd4854_buggy.java
++++ b/tmp/0e742152-4549-46f6-abd6-bee53062707d_fixed.java
+@@ -1,61 +1,171 @@
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.core.JsonToken;
++import com.fasterxml.jackson.core.util.TokenBuffer;
++import com.fasterxml.jackson.databind.BeanProperty;
++import com.fasterxml.jackson.databind.DeserializationContext;
++import com.fasterxml.jackson.databind.DeserializationFeature;
++import com.fasterxml.jackson.databind.JavaType;
++import com.fasterxml.jackson.databind.JsonDeserializer;
++import com.fasterxml.jackson.databind.JsonMappingException;
++import com.fasterxml.jackson.databind.PropertyName;
++import com.fasterxml.jackson.databind.deser.SettableBeanProperty;
++import com.fasterxml.jackson.databind.deser.impl.PropertyBasedCreator;
++import com.fasterxml.jackson.databind.deser.impl.PropertyValueBuffer;
++import com.fasterxml.jackson.databind.jsontype.TypeDeserializer;
++import com.fasterxml.jackson.databind.jsontype.TypeIdResolver;
++import com.fasterxml.jackson.databind.util.ClassUtil;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++// This is a placeholder for the surrounding class structure.
++// Assume necessary fields like _properties, _typeIds, _tokens, _beanType
++// and methods like _deserialize are defined in the actual class.
++abstract class ExternalTypeHandler_buggy {
++    protected final JavaType _beanType = null; // Placeholder
++    protected final ExtTypedProperty[] _properties = null; // Placeholder
++    protected final Map<String, Object> _nameToPropertyIndex = null; // Placeholder
++    protected final String[] _typeIds = null; // Placeholder
++    protected final TokenBuffer[] _tokens = null; // Placeholder
++    protected abstract Object _deserialize(JsonParser p, DeserializationContext ctxt, int index, String typeId) throws IOException; // Placeholder
++
++    // The fixed method:
+     /**
+      * Variant called when creation of the POJO involves buffering of creator properties
+      * as well as property-based creator.
+      */
+     public Object complete(JsonParser p, DeserializationContext ctxt,
+             PropertyValueBuffer buffer, PropertyBasedCreator creator)
+         throws IOException
+     {
+         // first things first: deserialize all data buffered:
+         final int len = _properties.length;
+         Object[] values = new Object[len];
+         for (int i = 0; i < len; ++i) {
+             String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
+             if (typeId == null) {
+                 // let's allow missing both type and property (may already have been set, too)
+                 if (_tokens[i] == null) {
+                     continue;
+                 }
+                 // but not just one
+                 // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
+                 if (!extProp.hasDefaultType()) {
++                    // 11-Nov-2015, tatu: Should be ok to miss type id for creator property too...
++                     SettableBeanProperty prop = extProp.getProperty();
++                     // If it's creator property, maybe value is missing? Let buffer/creator fail if needed.
++                     if ((prop != null) && (prop.getCreatorIndex() >= 0)) {
++                        // 25-Mar-2019, tatu: Or possibly injectable value? For now let's assume it's ok
++                     } else {
+                         ctxt.reportInputMismatch(_beanType,
+-                            "Missing external type id property '%s'",
++                            "Missing external type id property '%s' (and no 'defaultImpl' specified)",
+                             extProp.getTypePropertyName());
++                    }
+                 } else {
+                     typeId = extProp.getDefaultTypeId();
+                 }
++                // If type is now known, make sure value is available:
++                if (typeId == null) { // should not happen... but just in case
++                     ctxt.reportInputMismatch(_beanType,
++                            "Internal error: null type id resolved for property '%s'",
++                            extProp.getProperty().getName());
++                }
++                if (_tokens[i] == null) { // but value may be missing
++                    SettableBeanProperty prop = extProp.getProperty();
++                    ctxt.reportInputMismatch(_beanType,
++                            "Missing property '%s' for external type id '%s'",
++                            prop.getName(), extProp.getTypePropertyName());
++                }
+             } else if (_tokens[i] == null) {
+                 SettableBeanProperty prop = extProp.getProperty();
++                // 13-Jan-2016, tatu: Let's allow missing properties for creator properties,
++                //    and rely on creator complaining, or buffer assigning default value.
++                if (prop.getCreatorIndex() < 0 && !prop.isRequired()) {
++                    // But if it's not required, nor creator property, just use null
++                    values[i] = null; // this is explicitly handled later for non-creator properties
++                    continue; // no need to call _deserialize
++                }
++                // Otherwise, must have the value
+                 ctxt.reportInputMismatch(_beanType,
+                         "Missing property '%s' for external type id '%s'",
+                         prop.getName(), _properties[i].getTypePropertyName());
+             }
++
++            // Note: null typeId should have been handled earlier (by error or default impl)
+             values[i] = _deserialize(p, ctxt, i, typeId);
+ 
+             final SettableBeanProperty prop = extProp.getProperty();
+             // also: if it's creator prop, fill in
+             if (prop.getCreatorIndex() >= 0) {
+                 buffer.assignParameter(prop, values[i]);
+ 
+                 // [databind#999] And maybe there's creator property for type id too?
+                 SettableBeanProperty typeProp = extProp.getTypeProperty();
+                 // for now, should only be needed for creator properties, too
+                 if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
++                    final Object typeValue;
++
+                     // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
+                     //    apply deserializer... fun fun.
+-                    buffer.assignParameter(typeProp, typeId);
++                    JavaType typePropType = typeProp.getType();
++                    // Minor optimization: If type is String, value is already good
++                    if (typePropType.hasRawClass(String.class)) {
++                        typeValue = typeId;
++                    } else {
++                        // Otherwise, need to deserialize String type Id value into actual type
++                        // Use a TokenBuffer to feed the String value to the deserializer
++                        TokenBuffer tb = ctxt.bufferForInputBuffering(p);
++                        tb.writeString(typeId);
++
++                        // important: need to make sure it's seen as VALUE_STRING Token
++                        JsonParser p2 = tb.asParserOnFirstToken();
++
++                        // Access deserializer using standard Jackson mechanisms, which encompass
++                        // potentially custom setup, key deserializers, etc.
++                        JsonDeserializer<Object> deser = typeProp.getValueDeserializer();
++                        // 16-Aug-2018, tatu: As per [databind#2126], may need to consider type overrides
++                        if (deser.getObjectIdReader() != null) {
++                             tb.close();
++                             ctxt.reportInputMismatch(typeProp,
++ "Deserializer for Creator property '%s' (%s) has `ObjectIdReader`, cannot assign it external type id property '%s'",
++                                     typeProp.getName(), typePropType, extProp.getTypePropertyName());
++                        }
++                        typeValue = deser.deserialize(p2, ctxt);
++                        tb.close(); // Release buffer resources if appropriate
++                    }
++                    buffer.assignParameter(typeProp, typeValue);
+                 }
+             }
+         }
+         Object bean = creator.build(ctxt, buffer);
+         // third: assign non-creator properties
+         for (int i = 0; i < len; ++i) {
+             SettableBeanProperty prop = _properties[i].getProperty();
+             if (prop.getCreatorIndex() < 0) {
++                // 13-Jan-2016, tatu: Skip nulls for missing properties
++                // 03-Jun-2018, tatu: Only skip if NO tokens were seen; needed for ValueInstantiators
++                //     that require non-null values for properties with default value...
++                if (values[i] == null) {
++                     if (_tokens[i] == null) {
++                         continue;
++                     }
++                }
+                 prop.set(bean, values[i]);
+             }
+         }
+         return bean;
+     }
++
++    // Placeholder for the nested class ExtTypedProperty
++    protected static final class ExtTypedProperty {
++        public SettableBeanProperty getProperty() { return null; } // Placeholder
++        public SettableBeanProperty getTypeProperty() { return null; } // Placeholder
++        public String getTypePropertyName() { return null; } // Placeholder
++        public boolean hasDefaultType() { return false; } // Placeholder
++        public String getDefaultTypeId() { return null; } // Placeholder
++    }
++}
+\ No newline at end of file

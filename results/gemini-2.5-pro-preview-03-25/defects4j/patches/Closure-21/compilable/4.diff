@@ -1,0 +1,141 @@
+diff --git a/tmp/368083e5-d076-4568-8b42-e9d7c2c65feb_buggy.java b/tmp/a4578b5f-72f1-44f9-9d2e-f8e0fae3e77c_fixed.java
+index 49a5702..a78e778 100644
+--- a/tmp/368083e5-d076-4568-8b42-e9d7c2c65feb_buggy.java
++++ b/tmp/a4578b5f-72f1-44f9-9d2e-f8e0fae3e77c_fixed.java
+@@ -1,66 +1,104 @@
+   @Override
+   public void visit(NodeTraversal t, Node n, Node parent) {
+-    // VOID nodes appear when there are extra semicolons at the BLOCK level.
+-    // I've been unable to think of any cases where this indicates a bug,
+-    // and apparently some people like keeping these semicolons around,
+-    // so we'll allow it.
+-    if (n.isEmpty() ||
+-        n.isComma()) {
++    // Ignore nodes that are definitely okay or handled elsewhere.
++    if (n.isEmpty() || n.isComma() || n.isExprResult() || parent == null) {
++      // - EMPTY nodes are usually extra semicolons (handled)
++      // - COMMA nodes are handled by visiting children
++      // - EXPR_RESULT nodes are handled by visiting the child expression
++      // - parent == null means root node
+       return;
+     }
+ 
+-    if (parent == null) {
++    // Allow qualified names with JSDoc only in stand-alone expression statements.
++    // Example: /** @type {string} */ myNs.subNs;
++    if (n.isQualifiedName() && n.getJSDocInfo() != null && parent.isExprResult()) {
+       return;
+     }
+ 
+-    // Do not try to remove a block or an expr result. We already handle
+-    // these cases when we visit the child, and the peephole passes will
+-    // fix up the tree in more clever ways when these are removed.
+-    if (n.isExprResult()) {
++    // Allow side-effect free expressions in FOR initializer and increment parts.
++    // Note: This check is necessary because NodeUtil.isExpressionResultUsed considers
++    // the init/increment value unused in the FOR structure itself.
++    if (parent.isFor()) {
++      Node init = parent.getFirstChild();
++      // Check if n is the initializer node (can be null for `for(;...;)`).
++      if (n == init) {
+           return;
+       }
+-
+-    // This no-op statement was there so that JSDoc information could
+-    // be attached to the name. This check should not complain about it.
+-    if (n.isQualifiedName() && n.getJSDocInfo() != null) {
++      // Check if n is the increment node (can be null for `for(...;;)`).
++      // The increment node is the third child. Need to check safely.
++      if (init != null) {
++          Node cond = init.getNext();
++          if (cond != null) {
++              Node incr = cond.getNext();
++              if (n == incr) {
+                   return;
+               }
++          }
++      }
++    }
+ 
++    // Check if the expression's result is used. This handles cases like
++    // the last element of a comma operator whose result is used by an
++    // assignment or return. It also handles cases where the expression is used
++    // directly, like in `if (x == y)`, `return x + y;`, `var a = b ? c : d;`.
+     boolean isResultUsed = NodeUtil.isExpressionResultUsed(n);
+-    boolean isSimpleOp = NodeUtil.isSimpleOperatorType(n.getType());
+-    if (parent.getType() == Token.COMMA) {
++
+     if (isResultUsed) {
++      // If the result is used, it's not useless code.
+       return;
+     }
+-      if (n == parent.getLastChild()) {
+-        for (Node an : parent.getAncestors()) {
+-          int ancestorType = an.getType();
+-          if (ancestorType == Token.COMMA) continue;
+-          if (ancestorType != Token.EXPR_RESULT && ancestorType != Token.BLOCK) return;
+-          else break;
+-        }
+-      }
+-    } else if (parent.getType() != Token.EXPR_RESULT && parent.getType() != Token.BLOCK) {
+-      if (! (parent.getType() == Token.FOR && parent.getChildCount() == 4 && (n == parent.getFirstChild() || n == parent.getFirstChild().getNext().getNext()))) {
++
++    // At this point, the result of 'n' is not used by its parent context.
++    // Report if 'n' is a simple operator whose result is discardable
++    // OR if 'n' has no side effects.
++
++    // Exception: `void <expr_with_no_side_effects>` is considered intentional.
++    // Example: void 0, void(0)
++    if (n.isVoid() && !NodeUtil.mayHaveSideEffects(n.getFirstChild(), t.getCompiler())) {
+       return;
+     }
+-    }
+-    if (
+-        (isSimpleOp || !NodeUtil.mayHaveSideEffects(n, t.getCompiler()))) {
++
++    boolean isSimpleOp = NodeUtil.isSimpleOperatorType(n.getType());
++    boolean hasSideEffects = NodeUtil.mayHaveSideEffects(n, t.getCompiler());
++
++    // Report if:
++    // 1. The node is a simple operator (like +, ==, !, typeof). The result of the operator
++    //    itself isn't used, which is suspicious even if operands have side-effects (e.g. `x == foo()`).
++    // 2. Or, the node is not a simple operator but has NO side effects (e.g., `"str"`, `3`, `a.b.c`).
++    if (isSimpleOp || !hasSideEffects) {
+       String msg = "This code lacks side-effects. Is there a bug?";
+       if (n.isString()) {
+         msg = "Is there a missing '+' on the previous line?";
+       } else if (isSimpleOp) {
++         // Refine message for common simple operators whose primary purpose is the result value
++         switch (n.getType()) {
++            case Token.EQ: case Token.NE: case Token.SHEQ: case Token.SHNE:
++            case Token.LT: case Token.GT: case Token.LE: case Token.GE:
++            case Token.INSTANCEOF: case Token.IN:
++            case Token.POS: case Token.NEG: // +x, -x
++            case Token.NOT: case Token.BITNOT: case Token.TYPEOF: // !, ~, typeof
++            case Token.ADD: case Token.SUB: case Token.MUL: case Token.DIV: case Token.MOD:
++            case Token.BITOR: case Token.BITXOR: case Token.BITAND:
++            case Token.LSH: case Token.RSH: case Token.URSH:
++                // Note: VOID is handled by the exception above
+                 msg = "The result of the '" + Token.name(n.getType()).toLowerCase() +
+                      "' operator is not being used.";
++                break;
++           // Default message is okay for other simple ops (if any exist)
++           // or for non-simple ops without side effects.
++         }
+       }
+ 
+       t.getCompiler().report(
+           t.makeError(n, level, USELESS_CODE_ERROR, msg));
++
++      // Track the node if it's not a statement itself, maybe for removal by a later pass.
+       // TODO(johnlenz): determine if it is necessary to
+-      // try to protect side-effect free statements as well.
++      // try to protect side-effect free statements as well. (Original comment)
+       if (!NodeUtil.isStatement(n)) {
+         problemNodes.add(n);
+       }
+     }
++    // else: Result is not used, but node is not a simple operator AND has side effects.
++    // This is okay (e.g., foo(); assignment(); ++x; delete obj.prop;)
+   }
+\ No newline at end of file

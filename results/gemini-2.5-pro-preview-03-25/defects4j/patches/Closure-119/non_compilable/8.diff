@@ -1,0 +1,185 @@
+diff --git a/tmp/d13498d4-957b-4c6e-bbe5-e778d14861c7_buggy.java b/tmp/8584bbf7-9905-4311-94d8-dec9d2ba41d5_fixed.java
+index 6dd359b..9d5c19d 100644
+--- a/tmp/d13498d4-957b-4c6e-bbe5-e778d14861c7_buggy.java
++++ b/tmp/8584bbf7-9905-4311-94d8-dec9d2ba41d5_fixed.java
+@@ -1,125 +1,175 @@
+     public void collect(JSModule module, Scope scope, Node n) {
+       Node parent = n.getParent();
+ 
+-      String name;
++      String name = null; // Initialize name to null
+       boolean isSet = false;
+       Name.Type type = Name.Type.OTHER;
+       boolean isPropAssign = false;
+ 
+       switch (n.getType()) {
+         case Token.GETTER_DEF:
+         case Token.SETTER_DEF:
+         case Token.STRING_KEY:
+           // This may be a key in an object literal declaration.
+-          name = null;
+           if (parent != null && parent.isObjectLit()) {
+             name = getNameForObjLitKey(n);
+           }
+           if (name == null) {
+             return;
+           }
+           isSet = true;
+           switch (n.getType()) {
+             case Token.STRING_KEY:
+               type = getValueType(n.getFirstChild());
+               break;
+             case Token.GETTER_DEF:
+               type = Name.Type.GET;
+               break;
+             case Token.SETTER_DEF:
+               type = Name.Type.SET;
+               break;
+             default:
+               throw new IllegalStateException("unexpected:" + n);
+           }
+           break;
+         case Token.NAME:
+           // This may be a variable get or set.
+           if (parent != null) {
+             switch (parent.getType()) {
+               case Token.VAR:
+                 isSet = true;
+                 Node rvalue = n.getFirstChild();
+                 type = rvalue == null ? Name.Type.OTHER : getValueType(rvalue);
+                 break;
+               case Token.ASSIGN:
+                 if (parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = getValueType(n.getNext());
+                 }
+                 break;
+               case Token.GETPROP:
++                // If this NAME is the obj in obj.prop, return. Handled by GETPROP case below.
+                 return;
+               case Token.FUNCTION:
+                 Node gramps = parent.getParent();
+                 if (gramps == null || NodeUtil.isFunctionExpression(parent)) {
++                   // Function expression name is local.
+                   return;
+                 }
++                // Function declaration name.
+                 isSet = true;
+                 type = Name.Type.FUNCTION;
+                 break;
+               case Token.INC:
+               case Token.DEC:
+                 isSet = true;
+                 type = Name.Type.OTHER;
+                 break;
+               default:
+                 if (NodeUtil.isAssignmentOp(parent) &&
+                     parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = Name.Type.OTHER;
+                 }
++                // Note: Parent could be CATCH here for the declaration `catch(e)`.
++                // This path doesn't set `isSet`, so it might be treated as a GET later.
++                // The fix below handles this.
+             }
+           }
+           name = n.getString();
+           break;
+         case Token.GETPROP:
+           // This may be a namespaced name get or set.
+           if (parent != null) {
+             switch (parent.getType()) {
+               case Token.ASSIGN:
+                 if (parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = getValueType(n.getNext());
+                   isPropAssign = true;
+                 }
+                 break;
+               case Token.INC:
+               case Token.DEC:
+                 isSet = true;
+                 type = Name.Type.OTHER;
+                 break;
+-              case Token.GETPROP:
+-                return;
++              // case Token.GETPROP: // Already handled by recursion?
++              //  return;
+               default:
+                 if (NodeUtil.isAssignmentOp(parent) &&
+                     parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = Name.Type.OTHER;
+                 }
+             }
+           }
+           name = n.getQualifiedName();
+           if (name == null) {
+             return;
+           }
+           break;
+         default:
+           return;
+       }
+ 
++      // If name is null at this point, we should return.
++      // This check handles cases like complex object literal keys or GETPROPs
++      // that didn't resolve to a simple qualified name.
++      if (name == null) {
++          return;
++      }
++
++      // Fix: Check if the name (or the base of a qualified name) resolves to a catch variable.
++      // This should happen BEFORE the isGlobalNameReference check.
++      String baseName = null;
++      Node nodeToCheck = n; // Start with the current node being visited
++
++      if (nodeToCheck.isName()) {
++          // If the node itself is a NAME, the base name is simply its string.
++          baseName = nodeToCheck.getString();
++      } else if (nodeToCheck.isGetProp()) {
++          // For qualified names like "a.b.c", find the ultimate base node ("a").
++          // This loop traverses down the left side of the GETPROP chain.
++          while (nodeToCheck.isGetProp()) {
++              nodeToCheck = nodeToCheck.getFirstChild();
++          }
++          // If the ultimate base is a simple name (e.g., "a"), get its name string.
++          if (nodeToCheck.isName()) {
++              baseName = nodeToCheck.getString();
++          }
++          // If the base isn't a NAME (e.g., obj[0].prop), baseName remains null.
++      }
++
++      // If we identified a simple base name (like 'e' in 'e' or 'e.name'),
++      // look up its declaration using the current scope.
++      if (baseName != null) {
++          Var v = scope.getVar(baseName);
++          // Check if the variable exists, has a declaration node, and that node's parent is a CATCH node.
++          if (v != null && v.getNameNode() != null && v.getNameNode().getParent() != null &&
++              v.getNameNode().getParent().isCatch()) {
++              // If the base name was declared in a catch block (e.g., catch(e)),
++              // then this reference (n) should be treated as local, regardless of
++              // what isGlobalNameReference might say.
++              return; // Exit collect, do not process as a potential global name.
++          }
++      }
++      // End of Fix
++
+       // We are only interested in global names.
+       if (!isGlobalNameReference(name, scope)) {
+         return;
+       }
+ 
++      // If we reach here, 'name' is considered a potential global reference.
+       if (isSet) {
+         if (isGlobalScope(scope)) {
+           handleSetFromGlobal(module, scope, n, parent, name, isPropAssign, type);
+         } else {
+           handleSetFromLocal(module, scope, n, parent, name);
+         }
+       } else {
++        // If not a set, it's a get.
+         handleGet(module, scope, n, parent, name);
+       }
+     }
+\ No newline at end of file

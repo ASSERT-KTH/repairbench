@@ -1,0 +1,154 @@
+diff --git a/tmp/7970b8ef-c40d-40f4-a6d7-ea435b52f99a_buggy.java b/tmp/0cb3421d-ad13-4b5a-975b-e80340898575_fixed.java
+index 30d7266..3e347a7 100644
+--- a/tmp/7970b8ef-c40d-40f4-a6d7-ea435b52f99a_buggy.java
++++ b/tmp/0cb3421d-ad13-4b5a-975b-e80340898575_fixed.java
+@@ -1,69 +1,109 @@
+   /**
+    * Since this pass reports errors only when a global {@code this} keyword
+    * is encountered, there is no reason to traverse non global contexts.
+    */
+   public boolean shouldTraverse(NodeTraversal t, Node n, Node parent) {
+ 
+-    if (n.getType() == Token.FUNCTION) {
+-      // Don't traverse functions that are constructors or have the @this
+-      // or @override annotation.
++    // Rule 1: Don't traverse functions with specific JSDoc annotations
++    // that imply 'this' is not global (@constructor, @interface, @this, @override).
++    if (n.isFunction()) {
++      // Use the specific helper from the original code context, assuming it gets JSDoc directly on n
+       JSDocInfo jsDoc = getFunctionJsDocInfo(n);
+       if (jsDoc != null &&
+           (jsDoc.isConstructor() ||
+            jsDoc.isInterface() ||
+            jsDoc.hasThisType() ||
+            jsDoc.isOverride())) {
+         return false;
+       }
+ 
+-      // Don't traverse functions unless they would normally
+-      // be able to have a @this annotation associated with them. e.g.,
+-      // var a = function() { }; // or
+-      // function a() {} // or
+-      // a.x = function() {}; // or
+-      // var a = {x: function() {}};
+-      int pType = parent.getType();
+-      if (!(pType == Token.BLOCK ||
+-            pType == Token.SCRIPT ||
+-            pType == Token.NAME ||
+-            pType == Token.ASSIGN ||
++      // Rule 2: Don't traverse functions inside object literals annotated with @lends.
++      // This indicates the methods should be treated as prototype methods.
++      if (parent != null) {
++        Node grandparent = parent.getParent();
++        boolean isFunctionValueInObjectLit = false;
+ 
+-            // object literal keys
+-            pType == Token.STRING ||
+-            pType == Token.NUMBER)) {
+-        return false;
++        // Check if n is the function node within an Object Literal structure
++        if (grandparent != null && grandparent.isObjectLit()) {
++           // Cases like: { method() { [n] } } or { get x() { [n] } } or { set x(v) { [n] } }
++           // Here n=FUNCTION, parent=MEMBER_FUNCTION_DEF/GETTER_DEF/SETTER_DEF, grandparent=OBJECTLIT
++           if ((parent.isMemberFunctionDef() || parent.isGetterDef() || parent.isSetterDef()) &&
++               parent.getLastChild() == n) { // Ensure n is the function body
++             isFunctionValueInObjectLit = true;
++           }
++           // Cases like: { 'key': [n] }, { 123: [n] }
++           // Here n=FUNCTION, parent=STRING_KEY/NUMBER, grandparent=OBJECTLIT
++           else if ((parent.isStringKey() || parent.isNumber()) &&
++                     parent.hasChildren() && parent.getFirstChild() == n) { // Ensure n is the value
++             isFunctionValueInObjectLit = true;
++           }
++           // Computed properties { [expr]: function() {} } could also have @lends,
++           // Parent would be COMPUTED_PROP. Add if needed.
++           // else if (parent.isComputedProp() && parent.getLastChild() == n) {
++           // isFunctionValueInObjectLit = true;
++           // }
+         }
+ 
+-      // Don't traverse functions that are getting lent to a prototype.
++        if (isFunctionValueInObjectLit) {
++            // Check the JSDoc on the OBJECTLIT node (grandparent) for @lends
++            JSDocInfo objectLitJsDoc = grandparent.getJSDocInfo();
++            if (objectLitJsDoc != null && objectLitJsDoc.getLendsName() != null) {
++               // Found @lends on the containing object literal, don't traverse function n.
++               return false;
++            }
+         }
++      }
++    } // End of n.isFunction() block for rules 1 & 2
+ 
+-    if (parent != null && parent.getType() == Token.ASSIGN) {
++    // Rule 3: Don't traverse the RHS function node if it's being assigned directly
++    // to a prototype property (e.g., Foo.prototype.bar = function() { ... }).
++    // This needs to check if 'n' itself is the function node being assigned.
++    if (parent != null && parent.isAssign() && n == parent.getLastChild() && n.isFunction()) {
++        // n is the function node on the RHS of an assignment.
+         Node lhs = parent.getFirstChild();
+-      Node rhs = lhs.getNext();
+ 
++        // Check if lhs is Foo.prototype or Foo.prototype.bar
++        if (lhs.isGetProp()) { // e.g., a.b or a.b.c
++            Node lastChild = lhs.getLastChild();
++            // Check for Foo.prototype = function() { ... };
++            if (lastChild.isString() && lastChild.getString().equals("prototype")) {
++                return false;
++            }
++
++            Node maybePrototype = lhs.getFirstChild(); // e.g., a.b from a.b.c
++            // Check for Foo.prototype.bar = function() { ... }; where maybePrototype is Foo.prototype
++            if (maybePrototype.isGetProp()) {
++                 Node prototypeChild = maybePrototype.getLastChild(); // e.g., 'prototype' from Foo.prototype
++                 if (prototypeChild.isString() && prototypeChild.getString().equals("prototype")) {
++                    return false;
++                 }
++            }
++        }
++    }
++
++    // Removed the original parent type check (BLOCK, SCRIPT, NAME, ASSIGN etc.) as it seemed unreliable
++    // and prevented correct handling of cases like @lends. The specific checks above are more targeted.
++
++    // Retain the assignLhsChild logic if it's used elsewhere in the surrounding class,
++    // but it doesn't influence the traversal decision here.
++    if (parent != null && parent.isAssign()) {
++        Node lhs = parent.getFirstChild();
+         if (n == lhs) {
+-        // Always traverse the left side of the assignment. To handle
+-        // nested assignments properly (e.g., (a = this).property = c;),
+-        // assignLhsChild should not be overridden.
+-        if (assignLhsChild == null) {
++          // We are traversing the LHS of an assignment.
++          if (assignLhsChild == null) { // Condition from original code
+             assignLhsChild = lhs;
+           }
+-      } else {
+-        // Only traverse the right side if it's not an assignment to a prototype
+-        // property or subproperty.
+-        if (NodeUtil.isGet(lhs)) {
+-          if (lhs.getType() == Token.GETPROP &&
+-              lhs.getLastChild().getString().equals("prototype")) {
+-            return false;
+-          }
+-          Node llhs = lhs.getFirstChild();
+-          if (llhs.getType() == Token.GETPROP &&
+-              llhs.getLastChild().getString().equals("prototype")) {
+-            return false;
+-          }
+-        }
+         }
+     }
+ 
++    // Default: Traverse the node. Allows the pass to find 'this' usages unless
++    // specifically excluded by the rules above (JSDoc, @lends, prototype assignment).
+     return true;
+   }
++
++  // Assume getFunctionJsDocInfo is defined in the surrounding class and correctly
++  // retrieves JSDoc information specifically associated with the function Node n.
++  abstract JSDocInfo getFunctionJsDocInfo(Node n);
++
++  // Assume assignLhsChild is a field in the surrounding class.
++  private Node assignLhsChild = null;
+\ No newline at end of file

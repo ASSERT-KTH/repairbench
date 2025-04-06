@@ -1,0 +1,211 @@
+diff --git a/tmp/e6e0bb04-33fa-4a4a-836f-384634f3a7e1_buggy.java b/tmp/c5e62ccc-e833-47fc-ab26-593182d45cd6_fixed.java
+index 851ffc2..28b0fa5 100644
+--- a/tmp/e6e0bb04-33fa-4a4a-836f-384634f3a7e1_buggy.java
++++ b/tmp/c5e62ccc-e833-47fc-ab26-593182d45cd6_fixed.java
+@@ -1,70 +1,175 @@
+     /**
+      * Replace the provide statement.
+      *
+      * If we're providing a name with no definition, then create one.
+      * If we're providing a name with a duplicate definition, then make sure
+      * that definition becomes a declaration.
+      */
+     void replace() {
+       if (firstNode == null) {
+         // Don't touch the base case ('goog').
++        // It might not have a candidate definition (if it's implicit)
++        // but we still need to assign replacementNode. Let ProcessProvides pass handle it.
+         replacementNode = candidateDefinition;
+         return;
+       }
+ 
+-      // Handle the case where there is a duplicate definition for an explicitly
+-      // provided symbol.
++      // Handle the case where there is a definition and an explicit provide.
+       if (candidateDefinition != null && explicitNode != null) {
+-        explicitNode.detachFromParent();
++        // We have both an explicit goog.provide and a definition.
++        // We prefer the definition, but we need to modify it if it's
++        // not a var declaration.
++
++        explicitNode.detachFromParent(); // Remove the goog.provide() call
+         compiler.reportCodeChange();
+ 
+-        // Does this need a VAR keyword?
+-        replacementNode = candidateDefinition;
++        replacementNode = candidateDefinition; // Use the existing definition node
++
++        // Mark the existing node as a namespace. Do this before potential VAR conversion.
++        if (NodeUtil.isExpressionNode(replacementNode)) { // ns.child = {}; (as EXPR_RESULT) or ns = {}
++            replacementNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            Node assign = replacementNode.getFirstChild();
++            if (assign != null && assign.isAssign()) {
++                Node lhs = assign.getFirstChild();
++                // Mark the root object in the namespace chain, e.g., 'a' in a.b.c = {};
++                if (lhs != null && lhs.isGetProp()) {
++                   Node root = lhs;
++                   while(root.isGetProp()) { root = root.getFirstChild(); }
++                   if (root.isName()) { root.putBooleanProp(Node.IS_NAMESPACE, true); }
++                }
++            }
++        } else if (replacementNode.isVar()) { // var ns = {};
++            replacementNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            Node nameNode = replacementNode.getFirstChild();
++            if (nameNode != null && nameNode.isName()) {
++                nameNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            }
++        }
++
++        // If the definition is an assignment like "ns = value",
++        // convert it to "var ns = value;".
+         if (NodeUtil.isExpressionNode(candidateDefinition)) {
+-          candidateDefinition.putBooleanProp(Node.IS_NAMESPACE, true);
+-          Node assignNode = candidateDefinition.getFirstChild();
+-          Node nameNode = assignNode.getFirstChild();
+-          if (nameNode.getType() == Token.NAME) {
+-            // Need to convert this assign to a var declaration.
++          Node assignNode = candidateDefinition.getFirstChild(); // Should be ASSIGN
++          Node nameNode = assignNode.getFirstChild(); // NAME or GETPROP
++          // Check if it's a simple assignment (NAME = ...)
++          if (nameNode.isName()) {
++            // Convert EXPR_RESULT(ASSIGN(NAME, VALUE)) to VAR(NAME(VALUE))
+             Node valueNode = nameNode.getNext();
+-            assignNode.removeChild(nameNode);
+-            assignNode.removeChild(valueNode);
++            // Detach NAME and VALUE from ASSIGN
++            assignNode.detachChildren();
++            // Attach VALUE to NAME
+             nameNode.addChildToFront(valueNode);
++            // Create VAR node
+             Node varNode = new Node(Token.VAR, nameNode);
++            // Copy position and JSDoc info
+             varNode.copyInformationFrom(candidateDefinition);
+-            candidateDefinition.getParent().replaceChild(
+-                candidateDefinition, varNode);
++            // Copy JSDoc from the original assign node if it had one (VAR node JSDoc is on NAME node).
+             nameNode.setJSDocInfo(assignNode.getJSDocInfo());
++            // Mark the new var node and name node as namespace
++            varNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            nameNode.putBooleanProp(Node.IS_NAMESPACE, true);
++
++            // Replace the original EXPR_RESULT node with the new VAR node
++            candidateDefinition.getParent().replaceChild(candidateDefinition, varNode);
+             compiler.reportCodeChange();
+-            replacementNode = varNode;
++            replacementNode = varNode; // Update replacement node to the new VAR
+           }
+         }
+-      } else {
+-        // Handle the case where there's not a duplicate definition.
+-        replacementNode = createDeclarationNode();
++      } else if (candidateDefinition == null) {
++        // No definition found. Create a declaration node.
++        replacementNode = createDeclarationNode(); // Assume this returns VAR or EXPR_RESULT(ASSIGN)
++
++        // Mark the newly created node as namespace
++        if (replacementNode.isVar()) {
++            replacementNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            Node nameNode = replacementNode.getFirstChild();
++            if (nameNode != null && nameNode.isName()) {
++                nameNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            }
++        } else if (NodeUtil.isExpressionNode(replacementNode)) {
++            replacementNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            Node assign = replacementNode.getFirstChild();
++             if (assign != null && assign.isAssign()) {
++                 Node lhs = assign.getFirstChild();
++                 // Mark the root object in the namespace chain, e.g., 'a' in a.b.c = {};
++                 if (lhs != null && lhs.isGetProp()) {
++                    Node root = lhs;
++                    while(root.isGetProp()) { root = root.getFirstChild(); }
++                    if (root.isName()) { root.putBooleanProp(Node.IS_NAMESPACE, true); }
++                 }
++             }
++        }
++
++        // Insert the new declaration statement.
+         if (firstModule == minimumModule) {
+-          firstNode.getParent().addChildBefore(replacementNode, firstNode);
++          // Add declaration to the first module where the name appeared.
++          // Insert before the node that triggered this name's appearance.
++          Preconditions.checkNotNull(firstNode, "firstNode cannot be null for %s", namespace);
++          Node parent = firstNode.getParent();
++          Preconditions.checkNotNull(parent, "parent cannot be null for %s", firstNode);
++          // Insert before the statement containing firstNode.
++          parent.addChildBefore(replacementNode, firstNode);
+         } else {
+-          // In this case, the name was implicitly provided by two independent
+-          // modules. We need to move this code up to a common module.
++          // Implicitly provided in multiple modules or first module is not
++          // the common ancestor. Add declaration to the common ancestor module.
+           int indexOfDot = namespace.indexOf('.');
+           if (indexOfDot == -1) {
+-            // Any old place is fine.
+-            compiler.getNodeForCodeInsertion(minimumModule)
+-                .addChildToBack(replacementNode);
++            // Add `var ns = {};` to the end of the script in the minimum module.
++            compiler.getNodeForCodeInsertion(minimumModule).addChildToBack(replacementNode);
+           } else {
+-            // Add it after the parent namespace.
++            // Add `ns.child = {};` after the parent's declaration `var ns = {};`
++            // or `ns.parent = {};`.
+             ProvidedName parentName =
+                 providedNames.get(namespace.substring(0, indexOfDot));
+-            Preconditions.checkNotNull(parentName);
+-            Preconditions.checkNotNull(parentName.replacementNode);
+-            parentName.replacementNode.getParent().addChildAfter(
+-                replacementNode, parentName.replacementNode);
++            Preconditions.checkNotNull(parentName, "Parent namespace %s does not exist", namespace.substring(0, indexOfDot));
++            // The parent should have already been processed due to TreeMap iteration order
++            Preconditions.checkNotNull(parentName.replacementNode, "Parent namespace %s has not been processed yet", parentName.namespace);
++
++            Node parentStatementNode = parentName.replacementNode; // This is the VAR or EXPR_RESULT node for the parent.
++            // Ensure parentStatementNode is indeed a statement node.
++            Preconditions.checkState(NodeUtil.isStatement(parentStatementNode),
++                "Parent replacement node is not a statement: %s", parentStatementNode);
++            Preconditions.checkNotNull(parentStatementNode.getParent(),
++                "Parent statement node %s has no parent", parentStatementNode);
++
++            parentStatementNode.getParent().addChildAfter(replacementNode, parentStatementNode);
+           }
+         }
++
++        // Detach the explicit provide statement if it existed (and wasn't detached above).
++        // This happens if candidateDefinition was null but explicitNode was not.
+         if (explicitNode != null) {
+           explicitNode.detachFromParent();
+         }
+-        compiler.reportCodeChange();
++        compiler.reportCodeChange(); // Report the insertion/detach
++
++      } else {
++        // Case: candidateDefinition != null && explicitNode == null
++        // A definition exists, but it wasn't explicitly provided.
++        // Use the existing definition. No code modifications or insertions needed.
++        replacementNode = candidateDefinition;
++         // Ensure the existing definition is marked as a namespace
++        if (NodeUtil.isExpressionNode(replacementNode)) { // ns.child = {}; (as EXPR_RESULT) or ns = {}
++            replacementNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            Node assign = replacementNode.getFirstChild();
++             if (assign != null && assign.isAssign()) {
++                 Node lhs = assign.getFirstChild();
++                 // Mark the root object in the namespace chain, e.g., 'a' in a.b.c = {};
++                 if (lhs != null && lhs.isGetProp()) {
++                    Node root = lhs;
++                    while(root.isGetProp()) { root = root.getFirstChild(); }
++                    if (root.isName()) { root.putBooleanProp(Node.IS_NAMESPACE, true); }
++                 } else if (lhs != null && lhs.isName()) {
++                     // Also mark the NAME node itself if it's a simple ns = {} case.
++                     lhs.putBooleanProp(Node.IS_NAMESPACE, true);
++                 }
++             }
++        } else if (replacementNode.isVar()) { // var ns = {};
++            replacementNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            Node nameNode = replacementNode.getFirstChild();
++            if (nameNode != null && nameNode.isName()) {
++                nameNode.putBooleanProp(Node.IS_NAMESPACE, true);
++            }
++        }
+       }
+     }
+\ No newline at end of file

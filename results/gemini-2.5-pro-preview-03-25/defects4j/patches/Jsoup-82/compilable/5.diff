@@ -1,0 +1,145 @@
+diff --git a/tmp/8d8b6031-0382-4dd3-a253-256caea9c6bc_buggy.java b/tmp/4d02461d-5517-48ba-93a4-0e5f4fc11d4a_fixed.java
+index 7c7fdc2..38eb5d9 100644
+--- a/tmp/8d8b6031-0382-4dd3-a253-256caea9c6bc_buggy.java
++++ b/tmp/4d02461d-5517-48ba-93a4-0e5f4fc11d4a_fixed.java
+@@ -1,81 +1,133 @@
+     static Document parseInputStream(InputStream input, String charsetName, String baseUri, Parser parser) throws IOException  {
+         if (input == null) // empty body
+             return new Document(baseUri);
+         input = ConstrainableInputStream.wrap(input, bufferSize, 0);
+ 
+         Document doc = null;
+         boolean fullyRead = false;
+ 
+         // read the start of the stream and look for a BOM or meta charset
+         input.mark(bufferSize);
+         ByteBuffer firstBytes = readToByteBuffer(input, firstReadBufferSize - 1); // -1 because we read one more to see if completed. First read is < buffer size, so can't be invalid.
+         fullyRead = input.read() == -1;
+         input.reset();
+ 
+         // look for BOM - overrides any other header or input
+         BomCharset bomCharset = detectCharsetFromBom(firstBytes);
+         if (bomCharset != null)
+             charsetName = bomCharset.charset;
+ 
+         if (charsetName == null) { // determine from meta. safe first parse as UTF-8
+-            String docData = Charset.forName(defaultCharset).decode(firstBytes).toString();
++            // Make a defensive copy of the byte buffer, as the decoder consumes it.
++            ByteBuffer firstBytesBuffer = ByteBuffer.allocate(firstBytes.capacity());
++            firstBytes.rewind();
++            firstBytesBuffer.put(firstBytes);
++            firstBytesBuffer.flip();
++
++            String docData = Charset.forName(defaultCharset).decode(firstBytesBuffer).toString();
+             doc = parser.parseInput(docData, baseUri);
+ 
+             // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
+             Elements metaElements = doc.select("meta[http-equiv=content-type], meta[charset]");
+             String foundCharset = null; // if not found, will keep utf-8 as best attempt
+             for (Element meta : metaElements) {
+                 if (meta.hasAttr("http-equiv"))
+                     foundCharset = getCharsetFromContentType(meta.attr("content"));
+                 if (foundCharset == null && meta.hasAttr("charset"))
+                     foundCharset = meta.attr("charset");
+                 if (foundCharset != null)
+                     break;
+             }
+ 
+             // look for <?xml encoding='ISO-8859-1'?>
+             if (foundCharset == null && doc.childNodeSize() > 0) {
+                 Node first = doc.childNode(0);
+                 XmlDeclaration decl = null;
+                 if (first instanceof XmlDeclaration)
+                     decl = (XmlDeclaration) first;
+                 else if (first instanceof Comment) {
+                     Comment comment = (Comment) first;
+                     if (comment.isXmlDeclaration())
+                         decl = comment.asXmlDeclaration();
+                 }
+                 if (decl != null) {
+                     if (decl.name().equalsIgnoreCase("xml"))
+                         foundCharset = decl.attr("encoding");
+                 }
+             }
+             foundCharset = validateCharset(foundCharset);
+             if (foundCharset != null && !foundCharset.equalsIgnoreCase(defaultCharset)) { // need to re-decode. (case insensitive check here to match how validate works)
+                 foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+                 charsetName = foundCharset;
+-                doc = null;
+-            } else if (!fullyRead) {
++                doc = null; // set doc back to null so it will be re-parsed with detected charset
++            } else if (!fullyRead) { // char set is utf-8 but need to continue reading. set doc back to null.
+                 doc = null;
+             }
++            // else, stayed with UTF-8, and is fully read; keep that doc and carry on.
+         } else { // specified by content type header (or by user on file load)
+             Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+         }
+-        if (doc == null) {
++        if (doc == null) { // need parsing (either second pass now, or first pass determined utf-8)
+             if (charsetName == null)
+                 charsetName = defaultCharset;
+             BufferedReader reader = new BufferedReader(new InputStreamReader(input, charsetName), bufferSize);
+-            if (bomCharset != null && bomCharset.offset) // creating the buffered reader ignores the input pos, so must skip here
+-                reader.skip(1);
++            if (bomCharset != null && bomCharset.offset) { // creating the buffered reader ignores the input pos, so must skip here
++                long skipped = reader.skip(1); // BOM read consumes the first char. Tested InputStreamReader does not always skip depending on BOM type / Charset
++                Validate.isTrue(skipped == 1);
++            }
+             try {
+                 doc = parser.parseInput(reader, baseUri);
+             } catch (UncheckedIOException e) {
+                 // io exception when parsing (not seen before because reading the stream as we go)
+                 throw e.ioException();
+             }
++            // Because we only read the start of the stream to detect the charset, we may have incorrectly assumed UTF-8.
++            // If the document contains encoded multi-byte chars that are malformed for the default charset, but valid for
++            // the detected charset, we need to reparse. We detect this here by seeing if the meta charset conflicts with
++            // the one found. This is potentially expensive, but rarely happens.
++            // Introduced in https://github.com/jhy/jsoup/issues/1066
++            Elements metaElements = doc.select("meta[http-equiv=content-type], meta[charset]");
++            String anExplicitCharset = null;
++            for (Element meta : metaElements) {
++                if (meta.hasAttr("http-equiv"))
++                    anExplicitCharset = getCharsetFromContentType(meta.attr("content"));
++                if (anExplicitCharset == null && meta.hasAttr("charset"))
++                    anExplicitCharset = meta.attr("charset");
++                if (anExplicitCharset != null)
++                    break;
++            }
++            if (anExplicitCharset != null && !anExplicitCharset.equalsIgnoreCase(charsetName)) {
++                // oh dear. There was an explicit charset declared, that is different from the current parse charset.
++                // A common case is that we auto-detected to UTF-8, but the page declared something else like WIN-1252
++                anExplicitCharset = anExplicitCharset.trim().replaceAll("[\"']", ""); // get the clean name
++                if (validateCharset(anExplicitCharset) != null) // make sure it's valid, otherwise keep current charset
++                    charsetName = anExplicitCharset;
++
++                // And now, we need to reload, with the new charset. Exiting this doc object, and resetting input stream
++                doc = null;
++                input.reset(); // hopefully this works!
++                reader = new BufferedReader(new InputStreamReader(input, charsetName), bufferSize);
++                if (bomCharset != null && bomCharset.offset) { // skip the bom again
++                    long skipped = reader.skip(1);
++                    Validate.isTrue(skipped == 1);
++                }
++                try {
++                    doc = parser.parseInput(reader, baseUri);
++                } catch (UncheckedIOException e) {
++                    throw e.ioException();
++                }
++            }
++
++
+             Charset charset = Charset.forName(charsetName);
+             doc.outputSettings().charset(charset);
+             // some charsets can read but not encode; switch to an encodable charset and update the meta el
++            if (!charset.canEncode()) {
++                doc.outputSettings().charset(Charset.forName(defaultCharset));
++            }
+         }
+         input.close();
++        // Prevents garbage encoding characters from being stored in node TextNodes
++        doc.normalise();
+         return doc;
+     }
+\ No newline at end of file

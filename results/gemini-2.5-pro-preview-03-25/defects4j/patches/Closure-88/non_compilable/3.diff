@@ -1,0 +1,98 @@
+diff --git a/tmp/7ebe7a26-8664-4751-b3de-406b891d1c4b_buggy.java b/tmp/5ea677df-b4de-4b69-81da-cbc098e3959d_fixed.java
+index 9353941..7b56976 100644
+--- a/tmp/7ebe7a26-8664-4751-b3de-406b891d1c4b_buggy.java
++++ b/tmp/5ea677df-b4de-4b69-81da-cbc098e3959d_fixed.java
+@@ -1,30 +1,83 @@
+   /**
+    * Give an expression and a variable. It returns READ, if the first
+-   * reference of that variable is a read. It returns KILL, if the first
+-   * reference of that variable is an assignment. It returns MAY_LIVE otherwise.
++   * reference of that variable is a read based on evaluation order.
++   * It returns KILL, if the first reference of that variable is an assignment to that
++   * variable name. It returns MAYBE_LIVE otherwise (variable not found, or
++   * complex case like function call).
+    */
+   private VariableLiveness isVariableReadBeforeKill(
+       Node n, String variable) {
++
++    // Handle NAME node base case: encounter of the variable name.
+     if (NodeUtil.isName(n) && variable.equals(n.getString())) {
+-      if (NodeUtil.isLhs(n, n.getParent())) {
+-        // The expression to which the assignment is made is evaluated before
+-        // the RHS is evaluated (normal left to right evaluation) but the KILL
+-        // occurs after the RHS is evaluated.
+-        return VariableLiveness.KILL;
++        // If a NAME node is the direct LHS of an assignment, its KILL effect
++        // happens *after* the RHS is evaluated. So, encountering the NAME
++        // node itself during traversal doesn't represent the KILL time.
++        // We return MAYBE_LIVE and let the ASSIGN node handler determine the order.
++        // Any other occurrence of the NAME is a READ.
++        // Note: NodeUtil.isLhs checks if the parent is ASSIGN, INC, DEC, or
++        // FOR_IN/FOR_OF loop variable. Only ASSIGN matters for the kill-after-rhs logic.
++        // Other LHS cases (like x++ or for(x in ...)) are typically reads or read/writes
++        // where the timing isn't the same as simple assignment.
++        // We refine the check to specifically look for ASSIGN parent.
++        if (n.getParent() != null && n.getParent().isAssign() && n.getParent().getFirstChild() == n) {
++             // This is the NAME on the LHS of an ASSIGN. Defer to ASSIGN handler.
++             return VariableLiveness.MAYBE_LIVE;
+         } else {
++            // Any other reference (RHS, condition, non-assign LHS like x++) is a READ first.
+             return VariableLiveness.READ;
+         }
+     }
+ 
+-    // Expressions are evaluated left-right, depth first.
++    // Special handling for ASSIGN to implement evaluation order:
++    // 1. Evaluate LHS expression (for reads/kills inside it, e.g., array index)
++    // 2. Evaluate RHS expression
++    // 3. Perform assignment (KILL effect)
++    if (n.isAssign()) {
++        Node lhs = n.getFirstChild();
++        Node rhs = n.getLastChild();
++
++        // Check LHS expression first (for reads/kills that happen during its evaluation)
++        // Example: a[x++] = y; -- the read/write of x happens before RHS eval.
++        VariableLiveness lhsState = isVariableReadBeforeKill(lhs, variable);
++        if (lhsState != VariableLiveness.MAYBE_LIVE) {
++             return lhsState; // Found READ/KILL within LHS evaluation.
++        }
++
++        // Check RHS expression next.
++        // Example: x = f(x); -- the read of x in f(x) happens before the KILL.
++        VariableLiveness rhsState = isVariableReadBeforeKill(rhs, variable);
++        if (rhsState != VariableLiveness.MAYBE_LIVE) {
++            return rhsState; // Found READ/KILL within RHS evaluation.
++        }
++
++        // If no READ/KILL found so far, check if the assignment target IS the variable.
++        // This represents the KILL effect, happening after LHS/RHS evaluation.
++        if (NodeUtil.isName(lhs) && variable.equals(lhs.getString())) {
++            return VariableLiveness.KILL;
++        }
++
++        // Otherwise, variable not involved or LHS is complex (e.g., obj.prop).
++        // The recursive call on LHS already checked for reads/kills within its structure.
++        return VariableLiveness.MAYBE_LIVE;
++    }
++
++    // Standard recursive traversal for other node types.
++    // Assumes left-to-right, depth-first evaluation for children, which is
++    // an approximation (doesn't handle short-circuiting, etc.).
+     for (Node child = n.getFirstChild();
+         child != null; child = child.getNext()) {
+-      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // Not a FUNCTION
++      // Skip nodes that represent new scopes or control flow graphs if necessary.
++      // The original code had this check, retaining it. It skips FUNCTION nodes.
++      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) {
+         VariableLiveness state = isVariableReadBeforeKill(child, variable);
+         if (state != VariableLiveness.MAYBE_LIVE) {
++          // Return the first definitive state found during traversal.
+           return state;
+         }
+       }
+     }
++
++    // No read or kill of the variable found within this subtree.
+     return VariableLiveness.MAYBE_LIVE;
+   }
+\ No newline at end of file

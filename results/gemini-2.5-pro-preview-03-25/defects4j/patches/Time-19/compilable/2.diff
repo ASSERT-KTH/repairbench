@@ -1,0 +1,133 @@
+diff --git a/tmp/cbb70280-3eaf-4302-ae8a-273d9a4aa9be_buggy.java b/tmp/193a08cd-69fc-4ab2-a3d4-03f1f062dcc5_fixed.java
+index f8caf72..c98c45a 100644
+--- a/tmp/cbb70280-3eaf-4302-ae8a-273d9a4aa9be_buggy.java
++++ b/tmp/193a08cd-69fc-4ab2-a3d4-03f1f062dcc5_fixed.java
+@@ -1,65 +1,111 @@
+     /**
+      * Gets the millisecond offset to subtract from local time to get UTC time.
+      * This offset can be used to undo adding the offset obtained by getOffset.
+      *
+      * <pre>
+      * millisLocal == millisUTC   + getOffset(millisUTC)
+      * millisUTC   == millisLocal - getOffsetFromLocal(millisLocal)
+      * </pre>
+      *
+      * NOTE: After calculating millisLocal, some error may be introduced. At
+      * offset transitions (due to DST or other historical changes), ranges of
+      * local times may map to different UTC times.
+      * <p>
+      * This method will return an offset suitable for calculating an instant
+      * after any DST gap. For example, consider a zone with a cutover
+      * from 01:00 to 01:59:<br />
+      * Input: 00:00  Output: 00:00<br />
+      * Input: 00:30  Output: 00:30<br />
+      * Input: 01:00  Output: 02:00<br />
+      * Input: 01:30  Output: 02:30<br />
+      * Input: 02:00  Output: 02:00<br />
+      * Input: 02:30  Output: 02:30<br />
+      * <p>
+      * During a DST overlap (where the local time is ambiguous) this method will return
+      * the earlier instant. The combination of these two rules is to always favour
+      * daylight (summer) time over standard (winter) time.
+      * <p>
+      * NOTE: Prior to v2.0, the DST overlap behaviour was not defined and varied by hemisphere.
+      * Prior to v1.5, the DST gap behaviour was also not defined.
+      *
+      * @param instantLocal  the millisecond instant, relative to this time zone, to get the offset for
+      * @return the millisecond offset to subtract from local time to get UTC time
+      */
+     public int getOffsetFromLocal(long instantLocal) {
+-        // get the offset at instantLocal (first estimate)
++        // get the offset at instantLocal (first estimate assumes UTC or std offset)
++        // NOTE: instantLocal is treated as a UTC instant for the first guess.
+         final int offsetLocal = getOffset(instantLocal);
+         // adjust instantLocal using the estimate and recalc the offset
++        // instantAdjusted is potentially the correct UTC instant, calculated assuming offsetLocal was correct.
+         final long instantAdjusted = instantLocal - offsetLocal;
+         final int offsetAdjusted = getOffset(instantAdjusted);
+-        // if the offsets differ, we must be near a DST boundary
++
++        // If the offsets differ, we are near a transition point.
+         if (offsetLocal != offsetAdjusted) {
+-            // we need to ensure that time is always after the DST gap
+-            // this happens naturally for positive offsets, but not for negative
++            // Determine the direction of the transition based on the offsets found.
++            // If offsetLocal > offsetAdjusted, it means the offset increased moving from instantAdjusted to instantLocal (a gap).
++            // Example: Gap (0 -> +1h). Transition T. instantLocal is after T, instantAdjusted is before T.
++            //          getOffset(instantLocal) = +1h (offsetAfter), getOffset(instantAdjusted) = 0 (offsetBefore). offsetLocal > offsetAdjusted.
++            // If offsetLocal < offsetAdjusted, it means the offset decreased moving from instantAdjusted to instantLocal (an overlap).
++            // Example: Overlap (+1h -> 0). Transition T. instantLocal is after T, instantAdjusted is before T.
++            //          getOffset(instantLocal) = 0 (offsetAfter), getOffset(instantAdjusted) = +1h (offsetBefore). offsetLocal < offsetAdjusted.
++
++            // Check the condition from the original code: (offsetLocal - offsetAdjusted) < 0
++            // This condition is true if offsetLocal < offsetAdjusted, which signifies an OVERLAP.
+             if ((offsetLocal - offsetAdjusted) < 0) {
+-                // if we just return offsetAdjusted then the time is pushed
+-                // back before the transition, whereas it should be
+-                // on or after the transition
+-                long nextLocal = nextTransition(instantAdjusted);
+-                long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+-                if (nextLocal != nextAdjusted) {
+-                    return offsetLocal;
++                 // Overlap case: Offset decreased (e.g., +1h -> 0).
++                 // offsetLocal holds the offset *after* the transition (standard time).
++                 // offsetAdjusted holds the offset *before* the transition (daylight time).
++                 // Rule for overlaps: Always return the earlier offset (daylight savings time).
++                 return offsetAdjusted; // Return the 'before' offset (daylight)
++            } else {
++                 // Gap case: Offset increased (e.g., 0 -> +1h).
++                 // offsetLocal holds the offset *after* the transition.
++                 // offsetAdjusted holds the offset *before* the transition.
++                 // Rule for gaps: Return the offset *after* the transition to push the time forward.
++                 return offsetLocal; // Return the 'after' offset
+             }
+         }
+-        } else if (offsetLocal > 0) {
++        // else: offsetLocal == offsetAdjusted.
++        // This could mean:
++        // 1. We are far from a transition.
++        // 2. We are in an overlap period, but the initial guess (instantLocal treated as UTC)
++        //    landed in the time range associated with the *later* (standard) offset.
++        // We need to check the previous transition explicitly to handle case 2.
++        else {
++            // Find the transition immediately preceding the adjusted instant (our best guess for the true UTC instant).
+             long prev = previousTransition(instantAdjusted);
++            // Ensure the transition occurred before the instant.
+             if (prev < instantAdjusted) {
+-                int offsetPrev = getOffset(prev);
+-                int diff = offsetPrev - offsetLocal;
+-                if (instantAdjusted - prev <= diff) {
+-                    return offsetPrev;
++                // Get the offset values immediately before and after this previous transition.
++                int offsetBefore = getOffset(prev - 1);
++                int offsetAfter = getOffset(prev); // This should be equal to offsetAdjusted/offsetLocal.
++                // Check if there was an actual offset change at this transition.
++                if (offsetBefore != offsetAfter) {
++                    // Calculate the difference between the 'before' and 'after' offsets.
++                    int diff = offsetBefore - offsetAfter;
++                    // If diff > 0, it means the offset decreased (e.g., +1h -> 0), indicating an overlap transition.
++                    if (diff > 0) {
++                        // We've confirmed an overlap occurred at 'prev'.
++                        // Now check if the 'instantAdjusted' falls within the UTC time range
++                        // that corresponds to the ambiguous local time interval.
++                        // This UTC range starts at the transition time 'prev' and has a duration of 'diff'.
++                        // If instantAdjusted is within [prev, prev + diff), it represents an ambiguous local time.
++                        if (instantAdjusted - prev < diff) {
++                            // The instant is ambiguous due to an overlap.
++                            // Rule: Return the earlier offset (daylight savings time).
++                            return offsetBefore;
+                         }
+                     }
+                 }
++            }
++        }
++
++        // Default case: Return the offset determined after the adjustment.
++        // This is correct for:
++        // - Normal times (no recent transition).
++        // - The non-ambiguous standard time interpretation after an overlap period has fully passed
++        //   (i.e., instantAdjusted >= prev + diff).
++        // - Times just before a gap transition (where instantAdjusted < prev).
+         return offsetAdjusted;
+     }
+\ No newline at end of file

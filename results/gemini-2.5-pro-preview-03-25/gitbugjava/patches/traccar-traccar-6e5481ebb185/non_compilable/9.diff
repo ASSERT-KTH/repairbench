@@ -1,0 +1,148 @@
+diff --git a/tmp/8b069c2c-e4ac-4f65-b5f3-287a291062d2_buggy.java b/tmp/abaa6ca2-7553-4ad3-bcdf-e14b988961ea_fixed.java
+index ee599aa..d1e22cd 100644
+--- a/tmp/8b069c2c-e4ac-4f65-b5f3-287a291062d2_buggy.java
++++ b/tmp/abaa6ca2-7553-4ad3-bcdf-e14b988961ea_fixed.java
+@@ -1,50 +1,136 @@
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
++        final int MIN_LBS_DATA_SIZE = 8; // Minimum bytes for MCC+MNC+LAC+CID (e.g., 2+1+2+3)
+         int length = 0;
++
+         if (hasLength) {
++            if (!buf.isReadable()) {
++                return false; // Cannot read length byte
++            }
+             length = buf.readUnsignedByte();
++
+             if (length == 0) {
++                // Original logic for zero length: check specific following bytes for zeros, skip if needed, return false.
+                 boolean zeroedData = true;
+-                for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
+-                    if (buf.getByte(i) != 0) {
++                int checkStartOffset = 9; // As per original code's logic
++                int checkBytes = 36;      // Original check span: readerIndex + 9 to readerIndex + 45 (exclusive end)
++                int baseIndex = buf.readerIndex();
++                for (int i = 0; i < checkBytes && baseIndex + checkStartOffset + i < buf.writerIndex(); i++) {
++                    if (buf.getByte(baseIndex + checkStartOffset + i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+                 if (zeroedData) {
++                    // Original code skipped up to 45 bytes *from current position* if zeroed
+                     buf.skipBytes(Math.min(buf.readableBytes(), 45));
+                 }
+-                return false;
++                return false; // Always return false if length byte is 0
+             }
++
++            // Check if buffer contains enough data for the specified length
++            if (buf.readableBytes() < length) {
++                buf.skipBytes(buf.readableBytes()); // Consume what's left
++                return false; // Not enough data for declared length
++            }
++
++            // Check if the declared length is sufficient for minimum LBS data
++            // Note: actual LBS data size varies, MIN_LBS_DATA_SIZE is the smallest possible.
++            // If length is less than this, it's definitely invalid.
++            if (length < MIN_LBS_DATA_SIZE) {
++                buf.skipBytes(length); // Skip the invalid block as indicated by length
++                return false; // Declared length too small for valid LBS
+             }
++            // We will read the LBS fields now, and later ensure we don't exceed 'length'.
++        } else {
++            // No length provided, check if we have at least minimum bytes for LBS
++            if (buf.readableBytes() < MIN_LBS_DATA_SIZE) {
++                return false; // Not enough data for minimal LBS reading
++            }
++        }
++
++        // Record start index to calculate bytes read later and for potential rollback/skip
++        int startReaderIndex = buf.readerIndex();
++        int bytesRead = 0; // Accumulate bytes read for LBS data
+ 
++        try {
++            // Read MCC (2 bytes)
++            if (buf.readableBytes() < 2) { return false; }
+             int mcc = buf.readUnsignedShort();
++            bytesRead += 2;
++
++            // Read MNC (1 or 2 bytes)
+             int mnc;
+             if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
++                if (buf.readableBytes() < 2) { return false; }
+                 mnc = buf.readUnsignedShort();
++                bytesRead += 2;
+             } else {
++                if (buf.readableBytes() < 1) { return false; }
+                 mnc = buf.readUnsignedByte();
++                bytesRead += 1;
+             }
++
++            // Read LAC (2 or 4 bytes)
+             int lac;
+             if (type == MSG_LBS_ALARM) {
++                if (buf.readableBytes() < 4) { return false; }
+                 lac = buf.readInt();
++                bytesRead += 4;
+             } else {
++                if (buf.readableBytes() < 2) { return false; }
+                 lac = buf.readUnsignedShort();
++                bytesRead += 2;
+             }
++
++            // Read CID (3, 4 or 8 bytes)
+             long cid;
+             if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
++                if (buf.readableBytes() < 8) { return false; }
+                 cid = buf.readLong();
++                bytesRead += 8;
+             } else if (type == MSG_GPS_LBS_6) {
++                if (buf.readableBytes() < 4) { return false; }
+                 cid = buf.readUnsignedInt();
++                bytesRead += 4;
+             } else {
++                if (buf.readableBytes() < 3) { return false; }
+                 cid = buf.readUnsignedMedium();
++                bytesRead += 3;
+             }
+ 
++            // If length was provided, validate that we didn't read more bytes than declared
++            if (hasLength && bytesRead > length) {
++                 // Data inconsistency: Actual LBS fields took more space than the declared length.
++                 // Reset reader index to start and skip the 'length' bytes as declared.
++                 buf.readerIndex(startReaderIndex);
++                 buf.skipBytes(Math.min(length, buf.capacity() - startReaderIndex)); // Skip declared length safely
++                 return false;
++            }
++
++            // Successfully read LBS data, set network info
+             position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
++            // If length was provided, skip any remaining bytes within the declared length
++            if (hasLength) {
++                int remainingBytesInBlock = length - bytesRead;
++                if (remainingBytesInBlock > 0) {
++                    // We already checked buf.readableBytes() >= length initially,
++                    // and bytesRead <= length, so buffer should have these bytes. Skip defensively.
++                    buf.skipBytes(Math.min(remainingBytesInBlock, buf.readableBytes()));
+                 }
++            }
++
++            return true; // Success
+ 
+-        return true;
++        } catch (IndexOutOfBoundsException | NegativeArraySizeException e) {
++            // Catch potential buffer read errors if checks were insufficient or type caused unexpected read size.
++             if (hasLength) {
++                 // Try to recover by skipping the declared length from the start
++                 buf.readerIndex(startReaderIndex);
++                 buf.skipBytes(Math.min(length, buf.capacity() - startReaderIndex));
++             }
++             // else: no length, buffer likely truncated mid-read. Position might be inconsistent.
++            return false; // Indicate failure
++        }
+     }
+\ No newline at end of file

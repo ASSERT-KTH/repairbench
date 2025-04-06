@@ -1,0 +1,144 @@
+diff --git a/tmp/eaa91dc0-2fc3-4bc1-b47d-392713aed453_buggy.java b/tmp/1ffc44e2-fea8-4b38-8513-94adab89a813_fixed.java
+index 3effef5..5d867f2 100644
+--- a/tmp/eaa91dc0-2fc3-4bc1-b47d-392713aed453_buggy.java
++++ b/tmp/1ffc44e2-fea8-4b38-8513-94adab89a813_fixed.java
+@@ -1,73 +1,106 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithUnwrapped(JsonParser p,
+     		DeserializationContext ctxt)
+-        throws IOException, JsonProcessingException
++        throws IOException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
++        // Use TokenBuffer to store ALL non-creator properties encountered
+         TokenBuffer tokens = new TokenBuffer(p, ctxt);
+         tokens.writeStartObject();
+ 
++        Object bean = null; // To store bean instance once created
++
+         JsonToken t = p.getCurrentToken();
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
++            // Skip field name:
+             p.nextToken(); // to point to value
+-            // creator property?
++
++            // Is it a creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
+-                if (buffer.assignParameter(creatorProp, creatorProp.deserialize(p, ctxt))) {
+-                    t = p.nextToken();
+-                    Object bean;
++                // Found creator property, value still needed
++                Object value = creatorProp.deserialize(p, ctxt);
++                // Assign value and check if we are done with creator properties
++                if (buffer.assignParameter(creatorProp, value)) {
++                    // Got all creator params, try to build the bean
++                    // Need to advance token stream past value for the PROPERTY that triggered build
++                    t = p.nextToken(); // IMPORTANT: move past the value of this creator prop
++
+                     try {
+                         bean = creator.build(ctxt, buffer);
+                     } catch (Exception e) {
+-                        wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+-                        continue;
++                         // Bean construction failed, report & return
++                        return wrapInstantiationProblem(e, ctxt);
+                     }
+-                    while (t == JsonToken.FIELD_NAME) {
+-                        p.nextToken();
+-                        tokens.copyCurrentStructure(p);
+-                        t = p.nextToken();
+-                    }
+-                    tokens.writeEndObject();
++                    // Catch possible polymorph type problem (check Builder pattern behavior?)
++                    // 25-Nov-2015, tatu: Actually, with builders, this is completely normal,
++                    //    so cannot verify type this way. And can't ensure format either.
++                    //    But leaving the check in place for now
+                     if (bean.getClass() != _beanType.getRawClass()) {
+-                        ctxt.reportMappingException("Can not create polymorphic instances with unwrapped values");
+-                        return null;
++                         // 28-Oct-2023, tatu: Use the more specific helper method
++                         return ctxt.reportBadDefinition(_beanType, String.format(
++                                "Cannot create polymorphic instances with unwrapped values (got instance of %s, expected %s)",
++                                bean.getClass().getName(), _beanType.getRawClass().getName()));
+                     }
+-                    return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
++
++                    // Bean built successfully. Check if we are now done with the input object
++                    if (t == JsonToken.END_OBJECT) {
++                        break; // Exit loop: bean is built, tokens contain pre-build props.
+                     }
++                    // Otherwise loop continues, and remaining props will be added to `tokens` below
++                    // Fall through to continue loop
++                }
++                // Handled creator property (either assigned parameter or built bean),
++                // continue to next property. Loop condition `t == JsonToken.FIELD_NAME`
++                // is checked based on `t` which was updated above if bean was built.
++                continue;
++            }
++
++            // Not a creator property...
++
++            // If bean is already built, it must be handled via TokenBuffer.
++            if (bean != null) {
++                tokens.writeFieldName(propName);
++                tokens.copyCurrentStructure(p);
+                 continue;
+             }
++
++            // Bean not yet built. Check for ObjectId, Ignorable, or buffer into TokenBuffer.
++
+             // Object Id property?
+             if (buffer.readIdProperty(propName)) {
+-                continue;
+-            }
+-            // regular property? needs buffering
+-            SettableBeanProperty prop = _beanProperties.find(propName);
+-            if (prop != null) {
+-                buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+-                continue;
++                continue; // Handled by buffer
+             }
++            // Ignorable properties?
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+-                handleIgnoredProperty(p, ctxt, handledType(), propName);
+-                continue;
++                handleIgnoredProperty(p, ctxt, handledType(), propName); // Skips the value
++                continue; // Skip buffering
+             }
++
++            // Otherwise, it's a property to be buffered for unwrapping/setting later
++            // (Could be a regular property (_beanProperties), part of unwrapped object, or 'any' property (_anySetter))
++            // All these need to be buffered and processed by UnwrappedPropertyHandler
+             tokens.writeFieldName(propName);
+             tokens.copyCurrentStructure(p);
+-            // "any property"?
+-            if (_anySetter != null) {
+-                buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
+-            }
+         }
+ 
+-        // We hit END_OBJECT, so:
+-        Object bean;
+-        // !!! 15-Feb-2012, tatu: Need to modify creator to use Builder!
++        // Loop ended (either naturally at END_OBJECT or via break after mid-stream build)
++
++        // If bean was not built mid-stream, build it now.
++        if (bean == null) {
+             try {
+                 bean = creator.build(ctxt, buffer);
+             } catch (Exception e) {
++                // Probably mapping exception?
+                 return wrapInstantiationProblem(e, ctxt);
+             }
++        }
++
++        // We have the bean instance and the TokenBuffer containing all non-creator properties.
++        // Finalize the token stream and process it using the unwrapped handler.
++        tokens.writeEndObject();
+         return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+     }
+\ No newline at end of file

@@ -1,0 +1,145 @@
+diff --git a/tmp/390046a6-d18f-455c-9ba7-5237657b513a_buggy.java b/tmp/e836ba87-38f6-4c30-ba28-ec6db2437b45_fixed.java
+index 9353941..aca6a36 100644
+--- a/tmp/390046a6-d18f-455c-9ba7-5237657b513a_buggy.java
++++ b/tmp/e836ba87-38f6-4c30-ba28-ec6db2437b45_fixed.java
+@@ -1,30 +1,131 @@
+   /**
+    * Give an expression and a variable. It returns READ, if the first
+    * reference of that variable is a read. It returns KILL, if the first
+-   * reference of that variable is an assignment. It returns MAY_LIVE otherwise.
++   * reference of that variable is an assignment or kill. It returns
++   * MAY_LIVE otherwise. This follows JavaScript evaluation order.
+    */
+   private VariableLiveness isVariableReadBeforeKill(
+       Node n, String variable) {
++    // Base case: NAME node
+     if (NodeUtil.isName(n) && variable.equals(n.getString())) {
+-      if (NodeUtil.isLhs(n, n.getParent())) {
+-        // The expression to which the assignment is made is evaluated before
+-        // the RHS is evaluated (normal left to right evaluation) but the KILL
+-        // occurs after the RHS is evaluated.
++      Node parent = n.getParent();
++      // NodeUtil.isLhs determines if the name node is an L-value.
++      boolean isLhs = NodeUtil.isLhs(n, parent);
++
++      if (isLhs) {
++          // Distinguish specific LHS types for accurate first action (READ or KILL)
++          // based on JavaScript evaluation order.
++          if (parent.isAssign()) {
++              // Simple assign (x = ...), kill is deferred after RHS.
++              // The read/kill analysis happens within the ASSIGN handler below.
++              // Return MAYBE_LIVE to signal that the ASSIGN handler needs to check RHS.
++              return VariableLiveness.MAYBE_LIVE;
++          } else if (NodeUtil.isAssignmentOp(parent)) {
++              // Compound assign (x += ...), it's a READ first.
++              return VariableLiveness.READ;
++          } else if (parent.isInc() || parent.isDec()) {
++              // INC/DEC: Postfix (x++) is READ first, Prefix (++x) is KILL first.
++              // Node.INCRDECR_PROP indicates prefix according to Rhino Node documentation.
++              boolean isPrefix = parent.getBooleanProp(Node.INCRDECR_PROP);
++              return isPrefix ? VariableLiveness.KILL : VariableLiveness.READ;
++          } else if (parent.isVar() || parent.isForIn() || parent.isCatch()) {
++             // VAR declaration, FOR-IN iteration var, CATCH var are KILLs.
+              return VariableLiveness.KILL;
++          } else if (parent.isParamList()) {
++             // Function parameters are KILLs conceptually at function start,
++             // but if referenced within an expression tree being analyzed,
++             // it implies a read unless it's somehow LHS again. Safe default READ.
++             return VariableLiveness.READ;
+           } else {
++             // Other LHS cases (e.g., destructuring?).
++             // Defaulting to KILL might be appropriate for assignment contexts.
++             // TODO(user): handle destructuring correctly.
++             // For now, assume KILL for unknown LHS.
++             return VariableLiveness.KILL;
++          }
++      } else {
++          // Not LHS, must be a read.
+           return VariableLiveness.READ;
+       }
+     }
+ 
+-    // Expressions are evaluated left-right, depth first.
++    // Handle specific node types to override standard traversal order if needed
++
++    // Simple Assignment: Evaluate LHS (reads/kills within), Evaluate RHS, KILL LHS var.
++    if (n.isAssign()) {
++        Node lhs = n.getFirstChild();
++        Node rhs = n.getLastChild();
++
++        // 1. Check LHS expression (for reads/kills happening during LHS evaluation)
++        //    Skip if LHS is just the variable name itself (handled by base case + step 3).
++        if (!(NodeUtil.isName(lhs) && variable.equals(lhs.getString()))) {
++             VariableLiveness lhsExprState = isVariableReadBeforeKill(lhs, variable);
++             if (lhsExprState != VariableLiveness.MAYBE_LIVE) {
++                 // Found a read/kill within the LHS expression itself (e.g., array index)
++                 return lhsExprState;
++             }
++        }
++
++        // 2. Check RHS expression (evaluated after LHS ref evaluation, before assignment)
++        VariableLiveness rhsExprState = isVariableReadBeforeKill(rhs, variable);
++        if (rhsExprState != VariableLiveness.MAYBE_LIVE) {
++            return rhsExprState;
++        }
++
++        // 3. Check for the KILL from the assignment itself (if LHS is the variable)
++        //    This happens *after* RHS evaluation.
++        if (NodeUtil.isName(lhs) && variable.equals(lhs.getString())) {
++            // The base case returned MAYBE_LIVE for this, now confirm the KILL.
++            return VariableLiveness.KILL;
++        }
++
++        // If none of the above found the var, it's not read/killed in this assign expr.
++        return VariableLiveness.MAYBE_LIVE;
++    }
++
++    // Handle compound assignments (LHS read/eval -> RHS eval -> KILL LHS var)
++    if (NodeUtil.isAssignmentOp(n)) { // e.g., +=, -=, must be compound
++        Node lhs = n.getFirstChild();
++        Node rhs = n.getLastChild();
++
++        // 1. Check LHS expression (contains the initial READ or other events)
++        VariableLiveness lhsExprState = isVariableReadBeforeKill(lhs, variable);
++         // The base case correctly returns READ for simple name LHS of compound assign.
++         // It also handles INC/DEC within complex LHS correctly (returning READ/KILL).
++        if (lhsExprState != VariableLiveness.MAYBE_LIVE) {
++             // Return the first event found during LHS eval (READ or KILL).
++             return lhsExprState;
++        }
++
++        // 2. Check RHS expression (evaluated after LHS read/eval)
++        VariableLiveness rhsExprState = isVariableReadBeforeKill(rhs, variable);
++        if (rhsExprState != VariableLiveness.MAYBE_LIVE) {
++            return rhsExprState;
++        }
++
++        // 3. KILL event happens after READ/LHS-eval and RHS-eval.
++        // Since we only care about the *first* event, we don't need to explicitly
++        // return KILL here for the compound assignment itself. The initial READ
++        // (or kill from prefix inc/dec) in the LHS evaluation (Step 1) is the first event.
++
++        // If neither LHS nor RHS had the var definitively first.
++        return VariableLiveness.MAYBE_LIVE;
++    }
++
++    // Default traversal: Left-to-right, depth-first.
++    // This handles nodes like AND, OR, CALL, GETPROP etc. correctly by default,
++    // respecting standard evaluation order for operands.
+     for (Node child = n.getFirstChild();
+         child != null; child = child.getNext()) {
+-      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // Not a FUNCTION
++      // Skip FUNCTION nodes, as they define a new scope and CFG.
++      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) {
+         VariableLiveness state = isVariableReadBeforeKill(child, variable);
+         if (state != VariableLiveness.MAYBE_LIVE) {
+-          return state;
++          return state; // Return the first READ/KILL found.
+         }
+       }
+     }
++
++    // If no read/kill found in the subtree.
+     return VariableLiveness.MAYBE_LIVE;
+   }
+\ No newline at end of file

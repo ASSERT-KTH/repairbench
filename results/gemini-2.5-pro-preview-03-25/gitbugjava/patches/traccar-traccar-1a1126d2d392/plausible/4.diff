@@ -1,0 +1,153 @@
+diff --git a/tmp/a1f287c8-6bdc-4ebf-b01e-b711b62fa18d_buggy.java b/tmp/86274f04-6a5c-4a57-8662-50d656594dd5_fixed.java
+index 2a0dceb..542fb4f 100644
+--- a/tmp/a1f287c8-6bdc-4ebf-b01e-b711b62fa18d_buggy.java
++++ b/tmp/86274f04-6a5c-4a57-8662-50d656594dd5_fixed.java
+@@ -1,68 +1,141 @@
+     private Position decode4(
+             Channel channel, SocketAddress remoteAddress, String[] values) throws ParseException {
+         int index = 0;
+ 
+-        String type = values[index++].substring(5);
++        String type = values[index++].substring(5); // e.g., "STT" or "ALT" from "ST410STT"
+ 
+         if (!type.equals("STT") && !type.equals("ALT")) {
+             return null;
+         }
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, values[index++]);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+         position.set(Position.KEY_TYPE, type);
+ 
++        // Check bounds before accessing array elements
++        if (index < values.length) {
+             position.set(Position.KEY_VERSION_FW, values[index++]);
++        }
++        if (index < values.length) {
+             index += 1; // model
++        }
+ 
+         Network network = new Network();
+ 
++        // Network Info - Loop expects 7 cells, each with 6 fields = 42 fields total
+         for (int i = 0; i < 7; i++) {
++            // Check if enough fields remain for a cell block
++            if (index + 5 >= values.length) {
++                // Not enough fields left for this cell tower block, break the loop
++                break;
++            }
++            try {
+                 int cid = Integer.parseInt(values[index++]);
+                 int mcc = Integer.parseInt(values[index++]);
+                 int mnc = Integer.parseInt(values[index++]);
+                 int lac, rssi;
+                 if (i == 0) {
+                     rssi = Integer.parseInt(values[index++]);
+                     lac = Integer.parseInt(values[index++]);
+                 } else {
+                     lac = Integer.parseInt(values[index++]);
+                     rssi = Integer.parseInt(values[index++]);
+                 }
+                 index += 1; // timing advance
+                 if (cid > 0) {
+                     network.addCellTower(CellTower.from(mcc, mnc, lac, cid, rssi));
+                 }
++            } catch (NumberFormatException e) {
++                // Error parsing cell data, stop processing network info for this message
++                // Log.warning("Failed to parse cell tower data for ST4 type", e);
++                break; // Exit the loop if data is malformed
+             }
+-
++        }
++        if (!network.getCellTowers().isEmpty() || !network.getWifiAccessPoints().isEmpty()) {
+             position.setNetwork(network);
++        }
+ 
++        // Battery, Archive, Index, Status - with bounds checks
++        try {
++            if (index < values.length) {
+                 position.set(Position.KEY_BATTERY, Double.parseDouble(values[index++]));
++            }
++            if (index < values.length) {
+                 position.set(Position.KEY_ARCHIVE, values[index++].equals("0") ? true : null);
++            }
++            if (index < values.length) {
+                 position.set(Position.KEY_INDEX, Integer.parseInt(values[index++]));
++            }
++            if (index < values.length) {
+                 position.set(Position.KEY_STATUS, Integer.parseInt(values[index++]));
++            }
++        } catch (NumberFormatException e) {
++            // Log.warning("Failed to parse status fields for ST4 type", e);
++        }
+ 
+-        if (values[index].length() == 3) {
++        // Collaborative Network - with bounds check
++        if (index < values.length && values[index].length() == 3) {
+             index += 1; // collaborative network
+         }
+ 
++        // Check if date/time and subsequent GPS fields exist and parse them
++        // Need at least 2 fields for date/time, plus 6 for GPS = 8 fields potentially
++        if (index + 1 < values.length && !values[index].isEmpty() && !values[index + 1].isEmpty()) {
++            // Date and Time seem present
+             DateFormat dateFormat = new SimpleDateFormat("yyyyMMddHH:mm:ss");
+             dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+-        position.setTime(dateFormat.parse(values[index++] + values[index++]));
++            try {
++                // Combine date and time parts for parsing
++                position.setTime(dateFormat.parse(values[index] + values[index + 1]));
++            } catch (ParseException e) {
++                // Log error if parsing fails despite non-empty strings
++                // Log.warning("Failed to parse date/time: " + values[index] + " " + values[index + 1], e);
++                position.setValid(false); // Mark invalid if date parse fails
++            }
++            index += 2; // Consume date and time fields
+ 
++            // Check if remaining GPS fields exist (lat, lon, speed, course, sats, valid) = 6 fields
++            if (index + 5 < values.length) {
++                 try {
+                      position.setLatitude(Double.parseDouble(values[index++]));
+                      position.setLongitude(Double.parseDouble(values[index++]));
+                      position.setSpeed(UnitsConverter.knotsFromKph(Double.parseDouble(values[index++])));
+                      position.setCourse(Double.parseDouble(values[index++]));
+-
+                      position.set(Position.KEY_SATELLITES, Integer.parseInt(values[index++]));
+-
++                     // Set validity based on the protocol's validity field ONLY if time was parsed correctly
++                     if (position.getFixTime() != null) {
+                          position.setValid(values[index++].equals("1"));
++                     } else {
++                         position.setValid(false);
++                         index++; // Consume validity field anyway
++                     }
++                 } catch (NumberFormatException | ArrayIndexOutOfBoundsException | NullPointerException e) {
++                     // Handle error parsing GPS fields (e.g., if they are empty strings or non-numeric)
++                     // Log.warning("Failed to parse GPS data for ST4 type", e);
++                     position.setValid(false); // Mark invalid if GPS parse fails
++                     // Attempt to advance index past potentially problematic fields if possible
++                     index = Math.min(index + 6, values.length); // Advance past expected GPS fields
++                 }
++            } else {
++                 // Not enough fields for GPS data after date/time
++                 position.setValid(false);
++            }
++        } else {
++            // Date or Time field is missing or empty
++            position.setValid(false);
++            // Do not attempt to parse date/time or GPS fields.
++            // Advance index past the expected empty slots for date/time if they exist
++            if (index + 1 < values.length) {
++                index += 2;
++            } else if (index < values.length) {
++                index += 1;
++            }
++        }
+ 
+         return position;
+     }
+\ No newline at end of file

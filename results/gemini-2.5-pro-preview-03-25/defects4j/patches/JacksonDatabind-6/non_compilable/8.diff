@@ -1,0 +1,283 @@
+diff --git a/tmp/466fc660-8817-4fff-9b29-b39201bfb446_buggy.java b/tmp/70e39460-9091-4d5e-85c1-2808e5ca2690_fixed.java
+index cd412d2..c6aa3ab 100644
+--- a/tmp/466fc660-8817-4fff-9b29-b39201bfb446_buggy.java
++++ b/tmp/70e39460-9091-4d5e-85c1-2808e5ca2690_fixed.java
+@@ -1,76 +1,223 @@
+     protected Date parseAsISO8601(String dateStr, ParsePosition pos)
+     {
+         /* 21-May-2009, tatu: DateFormat has very strict handling of
+          * timezone modifiers for ISO-8601. So we need to do some scrubbing.
+-         */
+-
+-        /* First: do we have "zulu" format ('Z' == "GMT")? If yes, that's
+-         * quite simple because we already set date format timezone to be
+-         * GMT, and hence can just strip out 'Z' altogether
++         * Applied fix from [databind#117], allowing for dates without
++         * time and plain dates too.
++         * And [databind#570] fix for partial milliseconds.
++         * And [databind#178] fix for missing seconds.
+          */
+         int len = dateStr.length();
++        // All ISO8601 variants need minimal length "yyyy-MM-dd" which is 10
++        // Let SimpleDateFormat fail on too short strings later.
++
+         char c = dateStr.charAt(len-1);
+         DateFormat df;
++        final String formatStr;
+ 
+-        // [JACKSON-200]: need to support "plain" date...
+-        if (len <= 10 && Character.isDigit(c)) {
++        // 1. Handle plain date "yyyy-MM-dd"
++        // This is not exactly ISO-8601 format but is often used
++        if (len == 10 && Character.isDigit(c)) {
++             boolean isPlain = true;
++             for (int i = 0; i < len; ++i) {
++                 char ch = dateStr.charAt(i);
++                 if (i == 4 || i == 7) {
++                     if (ch != '-') { isPlain = false; break; }
++                 } else {
++                     if (!Character.isDigit(ch)) { isPlain = false; break; }
++                 }
++             }
++             if (isPlain) {
+                 df = _formatPlain;
++                formatStr = DATE_FORMAT_STR_PLAIN; // yyyy-MM-dd
+                 if (df == null) {
+-                df = _formatPlain = _cloneFormat(DATE_FORMAT_PLAIN, DATE_FORMAT_STR_PLAIN, _timezone, _locale);
++                    df = _formatPlain = _cloneFormat(DATE_FORMAT_PLAIN, formatStr, _timezone, _locale);
+                 }
+-        } else if (c == 'Z') {
++                return df.parse(dateStr, pos);
++             }
++             // If not plain format, fall through to ISO handling
++        }
++
++        // ISO-8601 variants: 'Z' or +/-nn:nn or +/-nnnn
++        // These formats require seconds and 3-digit milliseconds for our standard formatters.
++        // We need to normalize the input string if they are missing or partial.
++        String normDateStr = dateStr; // Start with original, modify if needed
++
++        // 2. Handle 'Z' variant (UTC)
++        if (c == 'Z') {
+             df = _formatISO8601_z;
++            formatStr = DATE_FORMAT_STR_ISO8601_Z; // yyyy-MM-dd'T'HH:mm:ss.SSS'Z'
+             if (df == null) {
+-                df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, DATE_FORMAT_STR_ISO8601_Z, _timezone, _locale);
+-            }
+-            // [JACKSON-334]: may be missing milliseconds... if so, add
+-            if (dateStr.charAt(len-4) == ':') {
+-                StringBuilder sb = new StringBuilder(dateStr);
+-                sb.insert(len-1, ".000");
+-                dateStr = sb.toString();
+-            }
+-        } else {
+-            // Let's see if we have timezone indicator or not...
+-            if (hasTimeZone(dateStr)) {
+-                c = dateStr.charAt(len-3);
+-                if (c == ':') { // remove optional colon
+-                    // remove colon
+-                    StringBuilder sb = new StringBuilder(dateStr);
+-                    sb.delete(len-3, len-2);
+-                    dateStr = sb.toString();
+-                } else if (c == '+' || c == '-') { // missing minutes
+-                    // let's just append '00'
+-                    dateStr += "00";
+-                }
+-                // Milliseconds partial or missing; and even seconds are optional
+-                len = dateStr.length();
+-                // remove 'T', '+'/'-' and 4-digit timezone-offset
+-                c = dateStr.charAt(len-9);
+-                if (Character.isDigit(c)) {
+-                    StringBuilder sb = new StringBuilder(dateStr);
+-                    sb.insert(len-5, ".000");
+-                    dateStr = sb.toString();
++                df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, formatStr, GMT, _locale);
+             }
++            // Ensure GMT is used because DateFormats are stateful and not thread-safe
++            if (!GMT.equals(df.getTimeZone())) {
++                 // Must create a new instance because DateFormat instances are not thread-safe
++                 df = _cloneFormat(DATE_FORMAT_ISO8601_Z, formatStr, GMT, _locale);
++            }
++
++            // Normalize for seconds and milliseconds if necessary
++            int zIndex = len - 1;
++            int timeSepIndex = normDateStr.indexOf('T');
++
++            // Must have 'T' and time part for Z variant usually
++            if (timeSepIndex > 0) {
++                int dotIndex = normDateStr.lastIndexOf('.', zIndex - 1);
++                int secondColonIndex = -1;
++                int firstColonIndex = normDateStr.indexOf(':', timeSepIndex + 1);
++
++                 if (firstColonIndex > 0) {
++                      secondColonIndex = normDateStr.indexOf(':', firstColonIndex + 1);
++                      // Check if colon is part of time, not something weird before Z
++                      if (secondColonIndex > 0 && ( (dotIndex > 0 && secondColonIndex > dotIndex) || secondColonIndex > zIndex ) ) {
++                          secondColonIndex = -1; // Invalid colon position
++                      }
++                 }
++
++                 // Check if we have at least HH:mm
++                 if (firstColonIndex > 0) {
++                     StringBuilder sb = null; // Create lazily if needed
++                     int V = (dotIndex > 0) ? (zIndex - (dotIndex + 1)) : 0; // Millisecond digits count
++
++                     if (dotIndex < 0 && secondColonIndex < 0) { // Format like HH:mmZ
++                         sb = new StringBuilder(normDateStr);
++                         sb.insert(zIndex, ":00.000");
++                     } else if (dotIndex < 0) { // Format like HH:mm:ssZ
++                         sb = new StringBuilder(normDateStr);
++                         sb.insert(zIndex, ".000");
++                     } else if (V < 3) { // Format like HH:mm:ss.SZ or HH:mm:ss.SSZ
++                         sb = new StringBuilder(normDateStr);
++                         for (; V < 3; ++V) {
++                             // Insert '0' *before* 'Z'
++                             sb.insert(zIndex, '0');
++                         }
++                     }
++                     // else: Format HH:mm:ss.SSSZ - no change needed
++
++                     if (sb != null) {
++                         normDateStr = sb.toString();
++                     }
++                 }
++                 // else: 'T' without HH:mm? Let SDF parse fail on original string.
++            }
++            // else: No 'T'? Let SDF parse fail on original string.
++
++        }
++        // 3. Handle offset variant (+/-HH:mm, +/-HHmm, +/-HH)
++        else if (hasTimeZone(normDateStr)) {
+             df = _formatISO8601;
+-                if (_formatISO8601 == null) {
+-                    df = _formatISO8601 = _cloneFormat(DATE_FORMAT_ISO8601, DATE_FORMAT_STR_ISO8601, _timezone, _locale);
+-                }
+-            } else {
+-                // If not, plain date. Easiest to just patch 'Z' in the end?
+-                StringBuilder sb = new StringBuilder(dateStr);
+-                // And possible also millisecond part if missing
+-                int timeLen = len - dateStr.lastIndexOf('T') - 1;
+-                if (timeLen <= 8) {
++            formatStr = DATE_FORMAT_STR_ISO8601; // yyyy-MM-dd'T'HH:mm:ss.SSSZ
++            if (df == null) {
++                // TZ here is default, SDF will override based on parsed offset using 'Z' pattern char
++                df = _formatISO8601 = _cloneFormat(DATE_FORMAT_ISO8601, formatStr, _timezone, _locale);
++            }
++
++            // Normalize timezone first to +/-HHmm required by 'Z' pattern char
++            int signPos = Math.max(normDateStr.lastIndexOf('+'), normDateStr.lastIndexOf('-'));
++            // Heuristic check: timezone sign should appear after 'T' and some time digits
++            int timeSepIndex = normDateStr.indexOf('T');
++            if (signPos > 0 && timeSepIndex > 0 && signPos > timeSepIndex + 4) { // Check sign is after T HH:m
++                String P1 = normDateStr.substring(0, signPos); // Date/time part
++                String P2 = normDateStr.substring(signPos); // Timezone part (+/-...)
++
++                int tzLen = P2.length();
++                boolean tzNormalized = false;
++                if (tzLen == 6 && P2.charAt(3) == ':') { // Format +/-HH:mm -> +/-HHmm
++                     P2 = P2.substring(0, 3) + P2.substring(4);
++                     tzNormalized = true;
++                } else if (tzLen == 3) { // Format +/-HH -> +/-HH00
++                     P2 = P2 + "00";
++                     tzNormalized = true;
++                } else if (tzLen == 5) { // Format +/-HHmm - already ok
++                     tzNormalized = true;
++                }
++
++                if (tzNormalized) { // Only proceed if timezone looks valid and normalized
++                    // Now normalize seconds/milliseconds in P1
++                    int timePartEndIndex = P1.length();
++                    int dotIndex = P1.lastIndexOf('.');
++                    int secondColonIndex = -1;
++                    int firstColonIndex = P1.indexOf(':', timeSepIndex + 1);
++
++                    if (firstColonIndex > 0) { // Must have at least T HH:mm
++                         secondColonIndex = P1.indexOf(':', firstColonIndex + 1);
++                         if (secondColonIndex > 0 && dotIndex > 0 && secondColonIndex > dotIndex) {
++                            secondColonIndex = -1; // Invalid colon position
++                         }
++
++                         StringBuilder sb = null; // Create lazily
++                         int V = (dotIndex > 0) ? (timePartEndIndex - (dotIndex + 1)) : 0;
++
++                         if (dotIndex < 0 && secondColonIndex < 0) { // HH:mm -> HH:mm:00.000
++                             P1 = P1 + ":00.000";
++                         } else if (dotIndex < 0) { // HH:mm:ss -> HH:mm:ss.000
++                             P1 = P1 + ".000";
++                         } else if (V < 3) { // HH:mm:ss.S or HH:mm:ss.SS -> pad to SSS
++                             sb = new StringBuilder(P1);
++                             for (; V < 3; ++V) {
++                                 sb.append('0'); // Append to end of P1
++                             }
++                             P1 = sb.toString();
++                         }
++                         // else: HH:mm:ss.SSS - no change needed
++
++                         normDateStr = P1 + P2; // Reassemble final string
++                    }
++                    // else: T without HH:mm? Let SDF parse fail on original string.
++                }
++                // else: Timezone didn't look like standard offset format. Pass original string.
++            }
++            // else: Sign not found or in unexpected place. Pass original string.
++        }
++        // 4. No timezone ('Z' or offset): Treat as local time? UTC?
++        // Jackson's default is typically UTC for dates without offset. Let's append 'Z'.
++        else {
++            df = _formatISO8601_z;
++            formatStr = DATE_FORMAT_STR_ISO8601_Z; // yyyy-MM-dd'T'HH:mm:ss.SSS'Z'
++            if (df == null) {
++                df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, formatStr, GMT, _locale);
++            }
++            // Ensure GMT is used
++            if (!GMT.equals(df.getTimeZone())) {
++                  // Must create a new instance because DateFormat instances are not thread-safe
++                  df = _cloneFormat(DATE_FORMAT_ISO8601_Z, formatStr, GMT, _locale);
++            }
++
++            // Normalize seconds/milliseconds and append 'Z'
++            int timeSepIndex = normDateStr.indexOf('T');
++            if (timeSepIndex > 0) { // Must have 'T'
++                int dotIndex = normDateStr.lastIndexOf('.');
++                int secondColonIndex = -1;
++                int firstColonIndex = normDateStr.indexOf(':', timeSepIndex + 1);
++
++                if (firstColonIndex > 0) { // Must have T HH:mm
++                     secondColonIndex = normDateStr.indexOf(':', firstColonIndex + 1);
++                     if (secondColonIndex > 0 && dotIndex > 0 && secondColonIndex > dotIndex) {
++                         secondColonIndex = -1; // Invalid colon position
++                     }
++
++                     StringBuilder sb = new StringBuilder(normDateStr);
++                     int V = (dotIndex > 0) ? (len - (dotIndex + 1)) : 0; // Millisecond digits count from original len
++
++                     if (dotIndex < 0 && secondColonIndex < 0) { // HH:mm -> HH:mm:00.000
++                         sb.append(":00.000");
++                     } else if (dotIndex < 0) { // HH:mm:ss -> HH:mm:ss.000
+                          sb.append(".000");
++                     } else if (V < 3) { // HH:mm:ss.S or HH:mm:ss.SS -> pad to SSS
++                         for (; V < 3; ++V) {
++                             sb.append('0');
+                          }
+-                sb.append('Z');
+-                dateStr = sb.toString();
+-                df = _formatISO8601_z;
+-                if (df == null) {
+-                    df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, DATE_FORMAT_STR_ISO8601_Z,
+-                            _timezone, _locale);
+                      }
++                     // else: HH:mm:ss.SSS - no change needed
++
++                     sb.append('Z'); // Append 'Z'
++                     normDateStr = sb.toString();
+                  }
++                 // else: T without HH:mm? Let SDF parse fail on original string.
+              }
+-        return df.parse(dateStr, pos);
++             // else: No 'T'? Let SDF parse fail on original string.
++        }
++
++        // Use the selected formatter on the (potentially normalized) string
++        return df.parse(normDateStr, pos);
+     }
+\ No newline at end of file

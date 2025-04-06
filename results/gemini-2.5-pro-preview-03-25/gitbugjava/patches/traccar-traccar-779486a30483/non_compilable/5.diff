@@ -1,0 +1,119 @@
+diff --git a/tmp/7a331bbb-142f-4aec-b1aa-afcfdc07f932_buggy.java b/tmp/869c5ebe-3845-4d50-87e1-e2088d95a1c3_fixed.java
+index f591bc6..ef8e2e8 100644
+--- a/tmp/7a331bbb-142f-4aec-b1aa-afcfdc07f932_buggy.java
++++ b/tmp/869c5ebe-3845-4d50-87e1-e2088d95a1c3_fixed.java
+@@ -1,74 +1,87 @@
+     protected Object decodeAvrmc(
+             String sentence, Channel channel, SocketAddress remoteAddress) {
+ 
++        // PATTERN_AVRMC likely expects ADC1 and ADC2, and optionally MCC, MNC before checksum
++        // Example with MCC/MNC: ... <ADC1>,<ADC2>,<LAC>,<CID>,<MCC>,<MNC>*<Checksum>
++        // Example without:      ... <ADC1>,<ADC2>,<LAC>,<CID>*<Checksum>
++
+         Parser parser = new Parser(PATTERN_AVRMC, sentence);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+         DeviceSession deviceSession =
+-            getDeviceSession(channel, remoteAddress, parser.next());
++            getDeviceSession(channel, remoteAddress, parser.next()); // Field 1: ID
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         String deviceModel = null;
+         Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
+         if (device != null) {
+             deviceModel = device.getModel();
+         }
+ 
+         Position position = new Position(getProtocolName());
+-
+         position.setDeviceId(deviceSession.getDeviceId());
++
+         DateBuilder dateBuilder = new DateBuilder()
+-                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0)); // Field 2: Time
+ 
+-        String status = parser.next();
++        String status = parser.next(); // Field 3: Status
+         String upperCaseStatus = status.toUpperCase();
+         position.setValid(upperCaseStatus.equals("A") || upperCaseStatus.equals("R") || upperCaseStatus.equals("P"));
+         position.set(Position.KEY_STATUS, status);
+ 
+-        position.setLatitude(parser.nextCoordinate());
+-        position.setLongitude(parser.nextCoordinate());
+-        position.setSpeed(parser.nextDouble(0));
+-        position.setCourse(parser.nextDouble(0));
++        position.setLatitude(parser.nextCoordinate());  // Fields 4, 5: Latitude, N/S
++        position.setLongitude(parser.nextCoordinate()); // Fields 6, 7: Longitude, E/W
++        position.setSpeed(parser.nextDouble(0));      // Field 8: Speed
++        position.setCourse(parser.nextDouble(0));     // Field 9: Course
+ 
+-        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0)); // Field 10: Date
+         position.setTime(dateBuilder.getDate());
+ 
+-        String event = parser.next();
++        String event = parser.next(); // Field 11: Event
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
++        // Pass deviceModel if decodeEvent needs it
+         position.set(Position.KEY_EVENT, decodeEvent(event, position, deviceModel));
+-        position.set(Position.KEY_BATTERY, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001);
+-        position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000);
+-        position.set(Position.KEY_GPS, parser.nextInt());
+-        position.set(Position.PREFIX_ADC + 1, parser.nextDouble() * 0.001);
++        position.set(Position.KEY_BATTERY, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001); // Field 12: Battery
++        position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000); // Field 13: Odometer
++        position.set(Position.KEY_GPS, parser.nextInt()); // Field 14: GPS Status
++        position.set(Position.PREFIX_ADC + 1, parser.nextDouble() * 0.001); // Field 15: ADC1
+ 
+-        if ("AVL110".equals(deviceModel) || "AVL120".equals(deviceModel)) {
+-            position.set(Position.PREFIX_ADC + 2, parser.nextDouble() * 0.001);
+-        }
++        // FIX 1: Always parse ADC2. The original conditional parse based on deviceModel
++        // caused index misalignment if the field was present but the model didn't match.
++        // Examples suggest ADC2 is consistently present.
++        position.set(Position.PREFIX_ADC + 2, parser.nextDouble() * 0.001); // Field 16: ADC2
+ 
+-        Integer lac = parser.nextHexInt();
+-        Integer cid = parser.nextHexInt();
+-        Integer mcc = parser.nextInt();
+-        Integer mnc = parser.nextInt();
+-        if (lac != null && cid != null && mcc != null && mnc != null) {
++        // Parse network info
++        Integer lac = parser.nextHexInt(); // Field 17: LAC
++        Integer cid = parser.nextHexInt(); // Field 18: CID
++        Integer mcc = parser.nextInt();     // Field 19: MCC (optional, parser returns null if missing/not int)
++        Integer mnc = parser.nextInt();     // Field 20: MNC (optional, parser returns null if missing/not int)
++
++        // Set network info if valid data is available
++        if (mcc != null && mnc != null && mcc != 0 && mnc != 0 && lac != null && cid != null) {
++            // Case 1: Full network info (MCC, MNC, LAC, CID) is present and valid (non-zero MCC/MNC)
+             position.setNetwork(new Network(CellTower.from(mcc, mnc, lac, cid)));
++        } else if (lac != null && cid != null && lac != 0 && cid != 0) {
++            // Case 2: Only LAC/CID are available and valid (non-zero)
++             position.setNetwork(new Network(CellTower.fromLacCid(lac, cid)));
+         }
+ 
+-        parser.next(); // unused
+-
+-        String checksum = parser.next();
++        // FIX 2: Remove the incorrect parser.next() call that consumed the checksum.
++        // The checksum is the field immediately after MNC (if present) or CID (if MNC/MCC absent).
++        String checksum = parser.next(); // Field 21 or 19: Checksum
+ 
+         if (channel != null) {
+-
++            // Pass the correctly parsed checksum value
+             sendAcknowledge(status, event, checksum, channel, remoteAddress);
+ 
+             String devicePassword = AttributeUtil.getDevicePassword(
+                     getCacheManager(), deviceSession.getDeviceId(), getProtocolName(), DEFAULT_DEVICE_PASSWORD);
+             sendEventResponse(event, devicePassword, channel, remoteAddress);
+         }
+ 
+         return position;
+     }
+\ No newline at end of file

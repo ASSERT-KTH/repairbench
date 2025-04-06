@@ -1,0 +1,150 @@
+diff --git a/tmp/bd62ee1d-b914-4780-aa40-173b43393b9d_buggy.java b/tmp/05ef3dd1-8ddc-4192-964d-dacc2ccb2309_fixed.java
+index ee599aa..05de236 100644
+--- a/tmp/bd62ee1d-b914-4780-aa40-173b43393b9d_buggy.java
++++ b/tmp/05ef3dd1-8ddc-4192-964d-dacc2ccb2309_fixed.java
+@@ -1,50 +1,134 @@
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+-        int length = 0;
+         if (hasLength) {
+-            length = buf.readUnsignedByte();
++            // Check if there's at least 1 byte for the length
++            if (!buf.isReadable()) {
++                return false;
++            }
++            int length = buf.readUnsignedByte(); // Read declared length of LBS data block
++
++            // Handle the zero-length case with potentially zeroed data (device-specific quirk)
+             if (length == 0) {
+                 boolean zeroedData = true;
+-                for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
++                int checkLimit = Math.min(buf.writerIndex(), buf.readerIndex() + 45); // Check up to next 45 bytes
++                for (int i = buf.readerIndex(); i < checkLimit; i++) { // Check from current index
+                     if (buf.getByte(i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+-                if (zeroedData) {
+-                    buf.skipBytes(Math.min(buf.readableBytes(), 45));
++                if (zeroedData && buf.readerIndex() < checkLimit) {
++                    // Calculate how many bytes were actually checked and zero
++                    int bytesToSkip = checkLimit - buf.readerIndex();
++                    buf.skipBytes(bytesToSkip); // Skip the zeroed block
+                 }
++                // Always return false if length is 0, as no LBS data was decoded
+                 return false;
+             }
++
++            // Validate if the buffer actually contains 'length' bytes after the length byte.
++            if (buf.readableBytes() < length) {
++                // Declared length exceeds available data in the buffer. Invalid packet structure.
++                // Skip remaining readable bytes to avoid partial reads by subsequent decoders.
++                buf.skipBytes(buf.readableBytes());
++                return false;
++            }
++
++            // Create a slice of the buffer containing exactly 'length' bytes for LBS data
++            ByteBuf lbsBlock = buf.readSlice(length);
++
++            // Now decode MCC, MNC, LAC, CID from the lbsBlock slice
++            try {
++                // Check if slice has enough data for minimum LBS fields (e.g., MCC+MNC+LAC+CID ~ 8 bytes)
++                // Exact minimum depends on type flags, but check before reading.
++                // Smallest combination: mcc(2) + mnc(1) + lac(2) + cid(3) = 8 bytes
++                if (lbsBlock.readableBytes() < 8
++                        && !(type == MSG_LBS_ALARM && lbsBlock.readableBytes() >= 2 + 1 + 4 + 8) // Check specific types if needed
++                        && !(type == MSG_GPS_LBS_7 && lbsBlock.readableBytes() >= 2 + 1 + 2 + 8)) {
++                     // Not enough data in the slice for a valid LBS record based on declared length
++                     return false;
++                }
++
++
++                int mcc = lbsBlock.readUnsignedShort();
++                int mnc;
++                // Size check before reading conditional fields
++                if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
++                     if (lbsBlock.readableBytes() < 2) { return false; } // Need 2 bytes for short MNC
++                     mnc = lbsBlock.readUnsignedShort();
++                 } else {
++                     if (lbsBlock.readableBytes() < 1) { return false; } // Need 1 byte for byte MNC
++                     mnc = lbsBlock.readUnsignedByte();
++                 }
++
++                int lac;
++                if (type == MSG_LBS_ALARM) {
++                    if (lbsBlock.readableBytes() < 4) { return false; } // Need 4 bytes for int LAC
++                    lac = lbsBlock.readInt();
++                } else {
++                    if (lbsBlock.readableBytes() < 2) { return false; } // Need 2 bytes for short LAC
++                    lac = lbsBlock.readUnsignedShort();
++                }
++
++                long cid;
++                if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
++                    if (lbsBlock.readableBytes() < 8) { return false; } // Need 8 bytes for long CID
++                    cid = lbsBlock.readLong();
++                } else if (type == MSG_GPS_LBS_6) {
++                    if (lbsBlock.readableBytes() < 4) { return false; } // Need 4 bytes for int CID
++                    cid = lbsBlock.readUnsignedInt();
++                } else {
++                    if (lbsBlock.readableBytes() < 3) { return false; } // Need 3 bytes for medium CID
++                    cid = lbsBlock.readUnsignedMedium();
++                }
++
++                position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
++
++                // Remaining bytes in lbsBlock (if any, e.g., RSSI, Wifi data) are implicitly skipped
++                // as we only operated on the slice which was advanced in the main buffer.
++                return true;
++
++            } catch (IndexOutOfBoundsException e) {
++                // This might happen if 'length' was non-zero but too small for the required fields read above.
++                // Although checks were added, catch as a final safety net.
++                return false; // Decoding failed
+             }
+ 
++        } else {
++            // Case where LBS data exists but without a preceding length byte (e.g., type 0x16, 0x26)
++            // Original logic seems okay, assuming the caller ensures sufficient bytes are available.
++            // Add safety checks for readable bytes before reading.
++            if (buf.readableBytes() < 2) { return false; } // MCC
+             int mcc = buf.readUnsignedShort();
+             int mnc;
+             if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
++                if (buf.readableBytes() < 2) { return false; } // MNC short
+                 mnc = buf.readUnsignedShort();
+             } else {
++                if (buf.readableBytes() < 1) { return false; } // MNC byte
+                 mnc = buf.readUnsignedByte();
+             }
+             int lac;
+             if (type == MSG_LBS_ALARM) {
++                if (buf.readableBytes() < 4) { return false; } // LAC int
+                 lac = buf.readInt();
+             } else {
++                if (buf.readableBytes() < 2) { return false; } // LAC short
+                 lac = buf.readUnsignedShort();
+             }
+             long cid;
+             if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
++                if (buf.readableBytes() < 8) { return false; } // CID long
+                 cid = buf.readLong();
+             } else if (type == MSG_GPS_LBS_6) {
++                if (buf.readableBytes() < 4) { return false; } // CID int
+                 cid = buf.readUnsignedInt();
+             } else {
++                if (buf.readableBytes() < 3) { return false; } // CID medium
+                 cid = buf.readUnsignedMedium();
+             }
+ 
+             position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+-
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
+-        }
+-
+             return true;
+         }
++    }
+\ No newline at end of file

@@ -1,0 +1,197 @@
+diff --git a/tmp/f958f461-75f5-483f-8f60-3c8b1719a7c1_buggy.java b/tmp/347f36b8-b3c3-4fc2-9402-d20ee4236c53_fixed.java
+index 9240541..c31e3d1 100644
+--- a/tmp/f958f461-75f5-483f-8f60-3c8b1719a7c1_buggy.java
++++ b/tmp/347f36b8-b3c3-4fc2-9402-d20ee4236c53_fixed.java
+@@ -1,121 +1,172 @@
+     private Position decodePosition(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         int status = buf.readUnsignedShort();
+ 
+         position.setValid(BitUtil.check(status, 15));
+ 
+         position.set(Position.KEY_STATUS, status);
+         position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+         int event = buf.readUnsignedShort();
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, event);
+ 
+         String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
+         DateBuilder dateBuilder = new DateBuilder()
+                 .setYear(Integer.parseInt(time.substring(0, 2)))
+                 .setMonth(Integer.parseInt(time.substring(2, 4)))
+                 .setDay(Integer.parseInt(time.substring(4, 6)))
+                 .setHour(Integer.parseInt(time.substring(6, 8)))
+                 .setMinute(Integer.parseInt(time.substring(8, 10)))
+                 .setSecond(Integer.parseInt(time.substring(10, 12)));
+         position.setTime(dateBuilder.getDate());
+ 
+         position.setLongitude(buf.readInt() * 0.00001);
+         position.setLatitude(buf.readInt() * 0.00001);
+ 
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+         position.setCourse(buf.readUnsignedShort());
+         position.setAltitude(buf.readUnsignedShort());
+ 
+-        position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
++        // Read initial odometer value (might be overwritten by subtype 0x0010 if present)
++        position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000L);
+ 
+         Network network = new Network();
+ 
+-        while (buf.readableBytes() > 4) {
++        while (buf.readableBytes() > 4) { // Need at least 4 bytes for subtype and length
+             int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
+-            int endIndex = buf.readerIndex() + length;
++            int blockLength = buf.readUnsignedShort(); // Total length of subtype block (including type and length fields)
++            int dataLength = blockLength - 4; // Length of the actual data
++            int endIndex = buf.readerIndex() + dataLength;
++
++            // Ensure dataLength is not negative and doesn't exceed buffer bounds
++            if (dataLength < 0 || dataLength > buf.readableBytes()) {
++                 // Invalid length, break loop or log error, advance reader to where it should be if length was correct
++                 // For now, just break to avoid potential errors. The readerIndex will not be advanced further.
++                 // Consider logging this situation.
++                 break;
++            }
++
+             switch (subtype) {
+                 case 0x0001:
++                    if (dataLength >= 19) { // Minimum expected length for base fields
+                         int coolantTemperature = buf.readUnsignedByte() - 40;
+                         if (coolantTemperature <= 215) {
+                             position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                         }
+                         int rpm = buf.readUnsignedShort();
+                         if (rpm <= 65535) {
+                             position.set(Position.KEY_RPM, rpm);
+                         }
+                         position.set("averageSpeed", buf.readUnsignedByte());
+                         buf.readUnsignedShort(); // interval fuel consumption
+                         position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+-                    position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
++                        position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort() * 1000L); // Assuming km -> m
+                         position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                         position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+                         buf.readUnsignedInt(); // trip id
+-                    if (buf.readerIndex() < endIndex) {
++                        if (buf.readerIndex() < endIndex) { // Check if AdBlue level is present
+                             position.set("adBlueLevel", buf.readUnsignedByte() * 0.4);
+                         }
++                    }
+                     break;
+                 case 0x0005:
++                     if (dataLength >= 6) { // Check required length
+                          position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+-                    position.set(Position.KEY_HDOP, buf.readUnsignedByte());
++                         position.set(Position.KEY_HDOP, buf.readUnsignedByte() * 0.1); // Assuming scale 0.1
+                          buf.readUnsignedInt(); // run time
++                     }
+                     break;
+                 case 0x0009:
+                     position.set(
+-                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
++                            Position.KEY_VIN, buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString());
++                    break;
++                case 0x0010: // Total odometer
++                     if (dataLength > 0) {
++                         String odometerKmStr = buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
++                         try {
++                             // Value is in kilometers, convert to meters for KEY_ODOMETER
++                             position.set(Position.KEY_ODOMETER, Double.parseDouble(odometerKmStr) * 1000.0);
++                         } catch (NumberFormatException e) {
++                             // Ignore invalid format
++                         }
++                     }
+                      break;
+                 case 0x0011:
++                    if (dataLength >= 4) {
+                         position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
++                    }
+                     break;
+                 case 0x0014:
+-                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
+-                    position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+-                    position.set("airTemp", buf.readUnsignedByte() - 40);
+-                    position.set("airFlow", buf.readUnsignedShort() * 0.01);
+-                    position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
++                    if (dataLength >= 7) { // Check required length
++                        position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 2.55); // % = value / 2.55
++                        position.set("timingAdvance", buf.readUnsignedByte() * 0.5 - 64); // degrees = value * 0.5 - 64
++                        position.set("airTemp", buf.readUnsignedByte() - 40); // Celsius = value - 40
++                        position.set("airFlow", buf.readUnsignedShort() * 0.01); // g/s = value * 0.01
++                        position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 2.55); // % = value / 2.55
++                    }
+                     break;
+                 case 0x0020:
+-                    String[] cells = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                    String cellsText = buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
++                    if (!cellsText.isEmpty()) {
++                        String[] cells = cellsText.split("\\+");
+                         for (String cell : cells) {
+                             String[] values = cell.split("@");
++                            try {
++                                if (values.length >= 4) {
+                                     network.addCellTower(CellTower.from(
+                                             Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                             Integer.parseInt(values[2], 16), Long.parseLong(values[3], 16)));
+                                 }
++                            } catch (NumberFormatException e) {
++                                // Ignore invalid cell data
++                            }
++                        }
++                    }
+                     break;
+                 case 0x0021:
+-                    String[] points = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                    String pointsText = buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
++                     if (!pointsText.isEmpty()) {
++                         String[] points = pointsText.split("\\+");
+                          for (String point : points) {
+                              String[] values = point.split("@");
+-                        network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
++                             try {
++                                 if (values.length >= 2) {
++                                     network.addWifiAccessPoint(WifiAccessPoint.from(
++                                             values[0].replace('-', ':'), // Correct MAC format
++                                             Integer.parseInt(values[1])));
++                                 }
++                             } catch (NumberFormatException e) {
++                                // Ignore invalid wifi data
++                             }
++                         }
+                      }
+                     break;
+                 default:
+-                    buf.skipBytes(length);
++                    // Skip unknown subtypes
++                    buf.skipBytes(dataLength);
+                     break;
+             }
++            // Ensure reader index is set to the end of the current subtype block,
++            // even if parsing failed or dataLength was smaller than expected.
+             buf.readerIndex(endIndex);
+         }
+ 
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+         sendResponse(channel, MSG_POSITION_RSP, index, null);
+ 
+         return position;
+     }
+\ No newline at end of file

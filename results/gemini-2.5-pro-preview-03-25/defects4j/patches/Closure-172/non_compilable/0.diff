@@ -1,0 +1,167 @@
+diff --git a/tmp/5b1450e0-358e-47a4-8356-43821122d011_buggy.java b/tmp/7c5d8133-3ced-46e7-8187-9de33294321b_fixed.java
+index 7b89a27..1a9f642 100644
+--- a/tmp/5b1450e0-358e-47a4-8356-43821122d011_buggy.java
++++ b/tmp/7c5d8133-3ced-46e7-8187-9de33294321b_fixed.java
+@@ -1,76 +1,152 @@
++import com.google.javascript.jscomp.AnalyzePrototypeProperties.AstFunctionContents;
++import com.google.javascript.jscomp.FunctionTypeBuilder;
++import com.google.javascript.jscomp.NodeUtil;
++import com.google.javascript.rhino.JSDocInfo;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.jstype.FunctionType;
++import com.google.javascript.rhino.jstype.JSType;
++
++// NOTE: This code snippet assumes it's part of a class that provides
++// context like 'scope', 'getJSType(Node)', 'isConstantSymbol(JSDocInfo, Node)',
++// and 'getFunctionAnalysisResults(Node)', similar to TypeCheck.java.
++
++
+     /**
+      * Determines whether a qualified name is inferred.
+      * NOTE(nicksantos): Determining whether a property is declared or not
+      * is really really obnoxious.
+      *
+      * The problem is that there are two (equally valid) coding styles:
+      *
+      * (function() {
+      *   /* The authoritative definition of goog.bar. /
+      *   goog.bar = function() {};
+      * })();
+      *
+      * function f() {
+      *   goog.bar();
+      *   /* Reset goog.bar to a no-op. /
+      *   goog.bar = function() {};
+      * }
+      *
+      * In a dynamic language with first-class functions, it's very difficult
+      * to know which one the user intended without looking at lots of
+      * contextual information (the second example demonstrates a small case
+      * of this, but there are some really pathological cases as well).
+      *
+      * The current algorithm checks if either the declaration has
+      * JsDoc type information, or @const with a known type,
+      * or a function literal with a name we haven't seen before.
+      */
+     private boolean isQualifiedNameInferred(
+         String qName, Node n, JSDocInfo info,
+         Node rhsValue, JSType valueType) {
+       if (valueType == null) {
+         return true;
+       }
+ 
+       // Prototypes of constructors and interfaces are always declared.
++      // Check if this is an assignment to a prototype property.
+       if (qName != null && qName.endsWith(".prototype")) {
++          Node baseObjectNode = null;
++          // This logic primarily handles assignment `a.prototype = ...` where 'n' is ASSIGN.
++          if (n.isAssign() && n.getFirstChild().isGetProp()) {
++              Node getPropNode = n.getFirstChild();
++              // We already checked qName ends with ".prototype", but double-check the node property name.
++              if (".prototype".equals(getPropNode.getString())) {
++                  baseObjectNode = getPropNode.getFirstChild();
++              }
++          }
++          // TODO(b/196436498): Handle other declaration forms like VAR `var ns.C.prototype = {}`
++          // if necessary. This might require more context or changes to qName resolution.
++
++          if (baseObjectNode != null) {
++              // Use getJSType from TypeCheck context to find the type of the base object.
++              JSType baseType = getJSType(baseObjectNode);
++              // Check if the type is known and is a function type.
++              // Unknown types or non-function types shouldn't trigger the declaration rule.
++              if (baseType != null && !baseType.isUnknownType() && baseType.isFunctionType()) {
++                   FunctionType fnType = baseType.toMaybeFunctionType();
++                   // If the base object is a constructor or interface, then assigning
++                   // to its prototype is a declaration.
++                   if (fnType != null && (fnType.isConstructor() || fnType.isInterface())) {
++                       // Mark as declared
+                        return false;
+                    }
++              }
++              // If baseType is not a known constructor/interface (e.g., it's Object,
++              // unknown, null, or not a function type), then don't treat this
++              // .prototype assignment as a special declaration. Fall through to the
++              // general inference rules below.
++          } else {
++              // If we couldn't identify the base object node reliably (e.g., complex qName
++              // in VAR decl, or 'n' is not ASSIGN), fall through to the general logic.
++              // This prevents incorrectly marking assignments like `obj.prototype = ...`
++              // (where obj is not a constructor) as declared based only on the suffix.
++          }
++      }
+ 
++      // General inference rules based on JSDoc, value type, scope, etc.
+       boolean inferred = true;
+       if (info != null) {
+-        inferred = !(info.hasType()
+-            || info.hasEnumParameterType()
++        // This assignment has JSDoc info. Check if it declares a type.
++        inferred = !(info.hasType() // @type
++            || info.hasEnumParameterType() // @enum
++            // @const with a known type (excluding unknown)
+             || (isConstantSymbol(info, n) && valueType != null
+                 && !valueType.isUnknownType())
++            // @interface or @constructor (handled by FunctionTypeBuilder)
+             || FunctionTypeBuilder.isFunctionTypeDeclaration(info));
+       }
+ 
++      // Additional checks, especially for function assignments without JSDoc
+       if (inferred && rhsValue != null && rhsValue.isFunction()) {
+         if (info != null) {
++          // Original code had this: if JSDoc is present but didn't meet the
++          // criteria above (e.g., just @param), assigning a function is still
++          // considered a declaration. Keep this behavior for now.
+           return false;
+-        } else if (!scope.isDeclared(qName, false) &&
+-            n.isUnscopedQualifiedName()) {
++        } else {
++          // Function assignment without JSDoc. Check scope and usage.
++          // Need the L-value node (the thing being assigned to), e.g., NAME or GETPROP.
++          Node lValueNode = n.isAssign() ? n.getFirstChild() :
++                           (NodeUtil.isNameDeclaration(n) ? n : null); // Handle VAR/LET/CONST NAME etc.
++
++          // Check if the name was already declared in the current scope.
++          // If it was already declared, this assignment is likely not the declaration itself.
++          // NOTE: The second arg to isDeclared means "search up the scope chain".
++          if (!scope.isDeclared(qName, false)) {
++            // Check if the L-value is a qualified name (potentially global or namespace member)
++            // and is defined in a place that looks like a declaration (not inside loops/ifs).
++            if (lValueNode != null && NodeUtil.isQualifiedName(lValueNode) &&
++                lValueNode.isUnscopedQualifiedName()) {
+ 
+               // Check if this is in a conditional block.
+               // Functions assigned in conditional blocks are inferred.
+               for (Node current = n.getParent();
+-               !(current.isScript() || current.isFunction());
++                   current != null && !(current.isScript() || current.isFunction());
+                    current = current.getParent()) {
+                 if (NodeUtil.isControlStructure(current)) {
++                  // Assignment is inside if/loop/etc., treat as inferred.
+                   return true;
+                 }
+               }
+ 
+-          // Check if this is assigned in an inner scope.
+-          // Functions assigned in inner scopes are inferred.
++              // Check if this is assigned in an inner scope using escape analysis.
++              // Functions assigned in inner scopes that don't escape might be declarations for that scope.
+               AstFunctionContents contents =
+                   getFunctionAnalysisResults(scope.getRootNode());
+-          if (contents == null ||
+-              !contents.getEscapedQualifiedNames().contains(qName)) {
++              // If escape analysis results are available AND the qualified name does NOT escape...
++              if (contents != null && !contents.getEscapedQualifiedNames().contains(qName)) {
++                 // Function doesn't escape, isn't in control structure, has no JSDoc,
++                 // isn't already declared -> treat as a declaration.
+                 return false;
+               }
++              // If it escapes, or analysis unavailable, assume inferred (fall through).
+             }
+           }
++        }
++      }
++      // If none of the conditions for declaration were met, it's inferred.
+       return inferred;
+     }
+\ No newline at end of file

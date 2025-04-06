@@ -1,0 +1,172 @@
+diff --git a/tmp/ffeeaeb2-ddaa-4045-8b14-5bd9a17bf722_buggy.java b/tmp/74940669-1bef-4820-be23-96ad9388d25f_fixed.java
+index 25ca093..5beb90e 100644
+--- a/tmp/ffeeaeb2-ddaa-4045-8b14-5bd9a17bf722_buggy.java
++++ b/tmp/74940669-1bef-4820-be23-96ad9388d25f_fixed.java
+@@ -1,52 +1,129 @@
+-    // todo - this is getting gnarly. needs a rewrite.
+-    static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
++    // The contents of this method were rewritten as there were many competing objectives, including
++    // - read BOM
++    // - charset detection from meta tags
++    // - support for parsing from InputStream, potentially with wrong charset specified in header
++    // - etc.
++    // The previous implementation resulted in multiple passes and complex logic. My objective is to simplify.
++    // Simplification:
++    // 1. Always read buffer fully into memory. This allows fallback on charset detection failure.
++    // 2. Read BOM. If found, use that charset; String = decode(buffer, bomCharset). goto Done.
++    // 3. If known charset provided, and no BOM, use it; String = decode(buffer, charset). goto Done.
++    // 4. If no BOM, no known charset, try defaultCharSet; String = decode(buffer, default). goto CheckMeta.
++    // CheckMeta:
++    // 5. Look for <meta charset/http-equiv>. If found, String = decode(buffer, metaCharset). goto Done.
++    // 6. If not found, use the default decode attempt. goto Done.
++    // Done:
++    // 7. Parse string. Set Document.outputsettings.
++
++
++    /**
++     * Parse the input ByteBuffer into a Document.
++     * @param byteData data to parse
++     * @param charsetName character set of input; null if not known. Passable charsets are determined by {@link Charset#forName(String)}
++     * @param baseUri base URI of document, to resolve relative links against
++     * @param parser alternate {@link Parser#xmlParser() parser} to use.
++     * @return Document doc. {@link Document#outputSettings()} will have the character set of the parsed document.
++     */
++    static Document parseByteData(ByteBuffer byteData, @Nullable String charsetName, String baseUri, Parser parser) {
+         String docData;
+         Document doc = null;
+-
+-        // look for BOM - overrides any other header or input
+-
+-        if (charsetName == null) { // determine from meta. safe parse as UTF-8
+-            // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
+-            docData = Charset.forName(defaultCharset).decode(byteData).toString();
+-            doc = parser.parseInput(docData, baseUri);
+-            Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+-            if (meta != null) { // if not found, will keep utf-8 as best attempt
+         String foundCharset = null;
+-                if (meta.hasAttr("http-equiv")) {
+-                    foundCharset = getCharsetFromContentType(meta.attr("content"));
+-                }
+-                if (foundCharset == null && meta.hasAttr("charset")) {
+-                    try {
+-                        if (Charset.isSupported(meta.attr("charset"))) {
+-                            foundCharset = meta.attr("charset");
++        // Use the default charset from StringUtil if available, otherwise fallback to UTF-8
++        final String defaultCharset = DataUtil.defaultCharsetName(); // Use default from DataUtil or UTF-8
++
++        byteData.mark(); // Mark the start position
++
++        // *** 1. Check for BOM ***
++        // Reference: https://en.wikipedia.org/wiki/Byte_order_mark#Byte_order_marks_by_encoding
++        byte[] bom = new byte[4];
++        int read = Math.min(byteData.remaining(), 4);
++        if (read > 0) byteData.get(bom, 0, read);
++        byteData.reset(); // Reset position to start
++
++        // Order matters: check for longer BOMs first
++        if (read >= 4 && bom[0] == (byte)0x00 && bom[1] == (byte)0x00 && bom[2] == (byte)0xFE && bom[3] == (byte)0xFF) { // UTF-32BE
++            foundCharset = StandardCharsets.UTF_32BE.name(); byteData.position(byteData.position() + 4);
++        } else if (read >= 4 && bom[0] == (byte)0xFF && bom[1] == (byte)0xFE && bom[2] == (byte)0x00 && bom[3] == (byte)0x00) { // UTF-32LE
++            foundCharset = StandardCharsets.UTF_32LE.name(); byteData.position(byteData.position() + 4);
++        } else if (read >= 2 && bom[0] == (byte)0xFE && bom[1] == (byte)0xFF) { // UTF-16BE
++            foundCharset = StandardCharsets.UTF_16BE.name(); byteData.position(byteData.position() + 2);
++        } else if (read >= 2 && bom[0] == (byte)0xFF && bom[1] == (byte)0xFE) { // UTF-16LE
++            foundCharset = StandardCharsets.UTF_16LE.name(); byteData.position(byteData.position() + 2);
++        } else if (read >= 3 && bom[0] == (byte)0xEF && bom[1] == (byte)0xBB && bom[2] == (byte)0xBF) { // UTF-8
++            foundCharset = StandardCharsets.UTF_8.name(); byteData.position(byteData.position() + 3);
+         }
+-                    } catch (IllegalCharsetNameException e) {
+-                        foundCharset = null;
++        // If BOM found, byteData position is advanced, and foundCharset is set.
++        // If not found, byteData position is still at the start, and foundCharset is null.
++
++        String finalCharset;
++
++        if (foundCharset != null) { // ** Case 1: BOM found
++            finalCharset = foundCharset;
++        } else if (charsetName != null) { // ** Case 2: User provided charset, no BOM
++             // Validate the user provided charset name
++            finalCharset = validateCharset(charsetName);
++            if (finalCharset == null) { // Provided charset invalid/unsupported
++                // Keep finalCharset null, fallback to detection / default
++                 Validate.fail("Provided charset '" + charsetName + "' is not supported or invalid."); // Or maybe fallback? Current code errors. Let's stick to erroring for invalid input charset.
+             }
++        } else { // ** Case 3: No BOM, no user charset -> detect from meta or use default
++            finalCharset = null; // Will be determined below
++            byteData.mark(); // Mark position after BOM (or start) for potential reset
++            try {
++                // Decode using default charset for tentative parse
++                Charset defaultCs = Charset.forName(defaultCharset);
++                docData = defaultCs.decode(byteData).toString(); // Consumes buffer from marked position
++                doc = parser.parseInput(docData, baseUri); // Tentative parse
++                Element meta = doc.selectFirst("meta[http-equiv=content-type], meta[charset]");
++                String metaCharset = null;
++                if (meta != null) {
++                    if (meta.hasAttr("http-equiv")) metaCharset = getCharsetFromContentType(meta.attr("content"));
++                    if (metaCharset == null && meta.hasAttr("charset")) metaCharset = meta.attr("charset");
+                 }
+ 
+-                if (foundCharset != null && foundCharset.length() != 0 && !foundCharset.equals(defaultCharset)) { // need to re-decode
+-                    foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+-                    charsetName = foundCharset;
+-                    byteData.rewind();
+-                    docData = Charset.forName(foundCharset).decode(byteData).toString();
+-                    doc = null;
++                if (metaCharset != null) { // Check if found meta charset is valid and supported
++                     String validatedMetaCharset = validateCharset(metaCharset);
++                     if (validatedMetaCharset != null && !validatedMetaCharset.equalsIgnoreCase(defaultCharset)) {
++                        // Meta charset is valid, supported, and different from default
++                        finalCharset = validatedMetaCharset; // Use validated meta charset
++                        doc = null; // Discard the tentatively parsed doc
++                     }
+                 }
++            } catch (Exception e) {
++                 // Includes UnsupportedCharsetException, CharacterCodingException, parser exceptions...
++                 // If tentative parse fails, we can't check meta. Fallback below.
++                 doc = null; // Ensure doc is null if tentative parse failed
++            } finally {
++                // Reset buffer position to after BOM / start for final decode, regardless of meta outcome
++                byteData.reset();
+             }
+-        } else { // specified by content type header (or by user on file load)
+-            Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+-            docData = Charset.forName(charsetName).decode(byteData).toString();
++
++            // If meta detection didn't yield a supported charset different from default, use default
++            if (finalCharset == null) {
++                finalCharset = defaultCharset;
++                // If doc was successfully parsed with default and no overriding meta found, keep it.
+             }
+-        if (docData.length() > 0 && docData.charAt(0) == UNICODE_BOM) {
+-            byteData.rewind();
+-            docData = Charset.forName(defaultCharset).decode(byteData).toString();
+-            docData = docData.substring(1);
+-            charsetName = defaultCharset;
+-            doc = null;
+         }
+-        if (doc == null) {
++
++        // *** Final Decode and Parse ***
++        if (doc == null) { // If tentative parse wasn't done, wasn't successful, or needs to be redone with different charset
++             Validate.notEmpty(finalCharset, "Charset not determined? Please report bug."); // Should always have a charset here
++             try {
++                 Charset cs = Charset.forName(finalCharset);
++                 docData = cs.decode(byteData).toString(); // Decode from current buffer position (after BOM or start)
+                  doc = parser.parseInput(docData, baseUri);
+-            doc.outputSettings().charset(charsetName);
++             } catch (UnsupportedCharsetException | IllegalCharsetNameException e) {
++                 // If the determined charset (from BOM, user, or meta) is unsupported, there's not much we can do.
++                 // The Charset.forName should handle validation, but decode might fail.
++                 // If it came from user input, Validate.fail above handled it.
++                 // If it came from BOM/Meta/Default, this indicates a deeper issue.
++                 // Throwing an informative exception seems appropriate.
++                 throw new UncheckedIOException("Unsupported charset specified: " + finalCharset, e);
+              }
++        }
++
++        // Set the determined charset on the document
++        // Use the charset that was actually used for the final parse
++        doc.outputSettings().charset(finalCharset);
+         return doc;
+     }
+\ No newline at end of file

@@ -1,0 +1,123 @@
+diff --git a/tmp/46bee1e6-3271-4940-9cb0-fa4be230fe2d_buggy.java b/tmp/5c1e2e1f-8fa8-48f5-a2a1-1687ffd69b56_fixed.java
+index 800e6e1..1374943 100644
+--- a/tmp/46bee1e6-3271-4940-9cb0-fa4be230fe2d_buggy.java
++++ b/tmp/5c1e2e1f-8fa8-48f5-a2a1-1687ffd69b56_fixed.java
+@@ -1,32 +1,117 @@
++import com.google.javascript.rhino.JSDocInfo;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.Token;
++import com.google.javascript.rhino.jstype.FunctionType;
++import com.google.javascript.rhino.jstype.JSType;
++import com.google.javascript.rhino.jstype.JSTypeExpression;
++import com.google.javascript.rhino.jstype.JSTypeRegistry;
++import com.google.javascript.rhino.jstype.ObjectType;
++
++// Assume other necessary imports exist from the original class
++
+     /**
+      * Visit a node in a local scope, and add any local variables or catch
+      * parameters into the local symbol table.
+      *
+      * @param t The node traversal.
+      * @param n The node being visited.
+      * @param parent The parent of n
+      */
+     @Override public void visit(NodeTraversal t, Node n, Node parent) {
+       if (n == scope.getRootNode()) return;
+ 
+       if (n.getType() == Token.LP && parent == scope.getRootNode()) {
+         handleFunctionInputs(parent);
+         return;
+       }
+ 
++      // Handle JSDoc annotated expression statements like:
++      // /** @type {number} */ ns.prop;
++      // /** @param {string} s */ ns.method;
++      // /** @return {number} */ this.method;
++      // This ensures that the type system knows about these declarations,
++      // especially for local scopes where they might not be picked up otherwise.
++      // Ref: https://github.com/google/closure-compiler/issues/134
++      if (n.getType() == Token.EXPR_RESULT) {
++        Node expr = n.getFirstChild();
++        JSDocInfo jsdoc = n.getJSDocInfo();
++        // Check for qualified names (NAME, GETPROP) or THIS properties (GETPROP)
++        // used as stubs with JSDoc.
++        if (jsdoc != null && expr.isQualifiedName()) {
++          // Check if JSDoc defines a type via @type or implies a function signature
++          // through other tags like @param, @return, @constructor, @interface, etc.
++          // We rely on the JSTypeRegistry to synthesize the function type if needed.
++          // Note: jsdoc.containsFunctionDeclaration() is not a real method in JSDocInfo,
++          // we use a combination of checks for tags that imply a function.
++          boolean definesFunction = jsdoc.hasReturnType()
++                || jsdoc.hasParameters() || jsdoc.hasThisType()
++                || jsdoc.isConstructor() || jsdoc.isInterface()
++                || !jsdoc.getTemplateTypeNames().isEmpty();
++
++
++          if (jsdoc.hasType() || definesFunction) {
++            JSType typeToDeclare = null;
++            JSTypeRegistry typeRegistry = t.getCompiler().getTypeRegistry();
++
++            if (jsdoc.hasType()) {
++              JSTypeExpression typeExpr = jsdoc.getType();
++              // Evaluate the type expression from @type
++              // Use the current scope for resolving type names.
++              typeToDeclare = typeExpr.evaluate(scope, typeRegistry);
++            } else { // definesFunction must be true
++              // Synthesize function type from JSDoc details.
++              // This relies on the registry having the capability.
++              // Pass 'expr' as the node associated with the declaration, which might be
++              // needed by the registry method for context (e.g., 'this' resolution).
++              FunctionType functionType = typeRegistry.createFunctionTypeFromJsDoc(jsdoc, expr, scope);
++              if (functionType != null) {
++                 typeToDeclare = functionType;
++                 // Ensure constructors/interfaces implicitly return their instance type
++                 // if no @return is specified.
++                 if ((jsdoc.isConstructor() || jsdoc.isInterface()) && !jsdoc.hasReturnType()) {
++                     ObjectType instanceType = functionType.getInstanceType();
++                     // Check instanceType is not null and is not explicitly the unknown type,
++                     // which might happen if the definition is recursive or erroneous.
++                     if (instanceType != null && !instanceType.isUnknownType()) {
++                         // Use withReturnType to avoid modifying the original type potentially cached.
++                         typeToDeclare = functionType.withReturnType(instanceType);
++                     }
++                 }
++              }
++            }
++
++            if (typeToDeclare != null) {
++              // Declare the variable/property using the existing declareVar helper.
++              // It handles qualified names and defining properties on object types.
++              // Pass 'expr' (the GETPROP/NAME node) as the declaration node.
++              // Pass 'n' (the EXPR_RESULT node) as the parent context node.
++              // The type comes from JSDoc, so it's not inferred.
++              declareVar(expr, n, typeToDeclare, jsdoc, /* inferred= */ false);
++
++              // Handled this node as a JSDoc declaration stub. Skip further processing.
++              return;
++            }
++          }
++        }
++      }
++
++
+       attachLiteralTypes(n);
+       switch (n.getType()) {
+         case Token.FUNCTION:
++          // Avoid defining variables for named function expressions, as they are
++          // handled by VAR declarations or assignments capturing them.
++          // This prevents double declarations for patterns like var x = function funcName() {};
+           if (parent.getType() == Token.NAME) {
+             return;
+           }
+           defineDeclaredFunction(n, parent);
+           break;
+         case Token.CATCH:
+           defineCatch(n, parent);
+           break;
+         case Token.VAR:
+           defineVar(n, parent);
+           break;
+       }
+     }
+\ No newline at end of file

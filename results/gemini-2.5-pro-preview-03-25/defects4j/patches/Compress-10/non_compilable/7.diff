@@ -1,0 +1,155 @@
+diff --git a/tmp/760a4ee5-bc51-4a36-a669-518540869adf_buggy.java b/tmp/fe1bf467-2df5-4fd6-a944-84e389b92840_fixed.java
+index 85e6a42..9d73953 100644
+--- a/tmp/760a4ee5-bc51-4a36-a669-518540869adf_buggy.java
++++ b/tmp/fe1bf467-2df5-4fd6-a944-84e389b92840_fixed.java
+@@ -1,50 +1,128 @@
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
++import org.apache.commons.compress.archivers.zip.ZipShort;
++import org.apache.commons.compress.archivers.zip.ZipUtil;
++
++// Stub classes and constants needed for compilation
++class ZipFile {
++    // Assuming these constants exist and have appropriate values
++    static final int SHORT = 2;
++    static final int LFH_OFFSET_FOR_FILENAME_LENGTH = 26;
++
++    // Assuming these fields exist
++    Map<ZipArchiveEntry, OffsetEntry> entries;
++    Map<String, ZipArchiveEntry> nameMap;
++    java.io.RandomAccessFile archive;
++
++    // Placeholder for OffsetEntry internal class or structure
++    static class OffsetEntry {
++        long headerOffset;
++        long dataOffset;
++    }
++
++    // Placeholder for NameAndComment internal class or structure
++    static class NameAndComment {
++        byte[] name;
++        byte[] comment;
++    }
++
+     /**
+      * Walks through all recorded entries and adds the data available
+      * from the local file header.
+      *
+      * <p>Also records the offsets for the data to read from the
+      * entries.</p>
+      */
+     private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                             entriesWithoutUTF8Flag)
+         throws IOException {
+-        // changing the name of a ZipArchiveEntry is going to change
+-        // the hashcode - see COMPRESS-164
+-        // Map needs to be reconstructed in order to keep central
+-        // directory order
+-        for (ZipArchiveEntry ze : entries.keySet()) {
+-            OffsetEntry offsetEntry = entries.get(ze);
++        // Map needs to be reconstructed because changing the name of a ZipArchiveEntry
++        // changes its hashCode, potentially breaking the map (COMPRESS-164).
++        // Use a LinkedHashMap to preserve the central directory order.
++        Map<ZipArchiveEntry, OffsetEntry> newEntries =
++            new LinkedHashMap<>(entries.size()); // Initialize with expected size
++
++        // Iterate over a copy of the keySet to ensure we iterate
++        // using the original keys before any potential hashcode changes.
++        for (ZipArchiveEntry ze : new ArrayList<>(entries.keySet())) { // Use copy of keys
++            OffsetEntry offsetEntry = entries.get(ze); // Get OffsetEntry using original key
++            // If ze is not found in entries, something is very wrong.
++            if (offsetEntry == null) {
++                 // This indicates an internal inconsistency. Throw an exception.
++                 throw new IOException("Internal error: Entry '" + ze.getName()
++                                      + "' not found in offset map during LFH processing.");
++            }
++
+             long offset = offsetEntry.headerOffset;
++            // Seek to the LFH section containing filename length and extra field length.
+             archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+-            byte[] b = new byte[SHORT];
+-            archive.readFully(b);
+-            int fileNameLen = ZipShort.getValue(b);
+-            archive.readFully(b);
+-            int extraFieldLen = ZipShort.getValue(b);
++            byte[] shortBuf = new byte[SHORT]; // Reuse buffer
++            archive.readFully(shortBuf);
++            int fileNameLen = ZipShort.getValue(shortBuf);
++            archive.readFully(shortBuf);
++            int extraFieldLen = ZipShort.getValue(shortBuf);
++
++            // Skip the filename in the LFH.
+             int lenToSkip = fileNameLen;
+             while (lenToSkip > 0) {
+                 int skipped = archive.skipBytes(lenToSkip);
+                 if (skipped <= 0) {
+-                    throw new RuntimeException("failed to skip file name in"
+-                                               + " local file header");
++                    // Added entry name to error message for better diagnostics
++                    throw new IOException("Failed to skip file name in local file header for entry '"
++                                               + ze.getName() + "'");
+                 }
+                 lenToSkip -= skipped;
+             }
++
++            // Read the local extra field data.
+             byte[] localExtraData = new byte[extraFieldLen];
+             archive.readFully(localExtraData);
++            // Set the local extra data. Note: This does NOT change the hash code yet.
++            // The ZipArchiveEntry internally stores both local and central extra data.
++            // Parsing logic later (e.g., in getExtraFields(true)) handles merging.
+             ze.setExtra(localExtraData);
+-            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+-                + SHORT + SHORT + fileNameLen + extraFieldLen;
+ 
++            // Calculate the data offset (start of compressed data).
++            // Offset = start of LFH + LFH static size + filename length + extra field length
++            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH // Offset to lengths
++                + SHORT // filename length field size
++                + SHORT // extra field length field size
++                + fileNameLen // actual filename length
++                + extraFieldLen; // actual extra field length
++
++            // If the entry might not have the UTF-8 flag set but needs UTF-8 decoding
++            // (based on central directory info), attempt to find name/comment in extra fields.
++            // We look up using 'ze' which still has its original hashcode at this point.
+             if (entriesWithoutUTF8Flag.containsKey(ze)) {
+-                String orig = ze.getName();
+-                NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+-                ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+-                                                         nc.comment);
+-                if (!orig.equals(ze.getName())) {
+-                    nameMap.remove(orig);
++                String origName = ze.getName(); // Store original name
++                NameAndComment nc = entriesWithoutUTF8Flag.get(ze); // Get data prepared earlier
++                // This method might change ze.getName() by parsing extra fields,
++                // which in turn changes its hash code.
++                ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name, nc.comment);
++
++                // If the name was changed by the above call, update the nameMap accordingly.
++                if (!origName.equals(ze.getName())) {
++                    nameMap.remove(origName);
+                     nameMap.put(ze.getName(), ze);
+                 }
+             }
++
++            // Add the entry (potentially with a new hash code) and its offset data
++            // to the new map.
++            newEntries.put(ze, offsetEntry);
++        }
++
++        // Replace the old map with the newly constructed map.
++        // This ensures lookups using the potentially updated entry objects (with new hashcodes)
++        // will work correctly later, e.g. in getInputStream().
++        if (entries.size() != newEntries.size()) {
++             // Sanity check - should not happen if loop logic is correct
++             throw new IOException("Internal error: Entry map size changed unexpectedly during LFH processing.");
++        }
++        entries.clear();
++        entries.putAll(newEntries);
+     }
+ }
+\ No newline at end of file

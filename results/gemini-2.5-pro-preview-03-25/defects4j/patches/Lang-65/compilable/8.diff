@@ -1,0 +1,233 @@
+diff --git a/tmp/0f4639dd-924b-4728-a414-cf18f12ffc93_buggy.java b/tmp/d4fc5b69-bb27-4078-9700-c3a2de274772_fixed.java
+index cae0024..a7cdc23 100644
+--- a/tmp/0f4639dd-924b-4728-a414-cf18f12ffc93_buggy.java
++++ b/tmp/d4fc5b69-bb27-4078-9700-c3a2de274772_fixed.java
+@@ -1,103 +1,185 @@
+     /**
+      * <p>Internal calculation method.</p>
+      *
+      * @param val  the calendar
+      * @param field  the field constant
+      * @param round  true to round, false to truncate
+      * @throws ArithmeticException if the year is over 280 million
+      */
+     private static void modify(Calendar val, int field, boolean round) {
++        // Check if year is too large for accurate calculations
+         if (val.get(Calendar.YEAR) > 280000000) {
+             throw new ArithmeticException("Calendar value too large for accurate calculations");
+         }
+ 
+-
+         // ----------------- Fix for LANG-59 ---------------------- START ---------------
+         // see http://issues.apache.org/jira/browse/LANG-59
+         //
+-        // Manually truncate milliseconds, seconds and minutes, rather than using
+-        // Calendar methods.
++        // Manually truncate milliseconds, seconds, minutes, and hours using
++        // setTimeInMillis() arithmetic to avoid Calendar.set() quirks, especially near DST transitions.
++        // This is only done if the target field is coarser than the field being truncated.
+ 
++        long timeInMillis = val.getTimeInMillis();
++        long originalTimeInMillis = timeInMillis; // Store original time for rounding check later
+ 
+-        // truncate milliseconds
++        // Truncate milliseconds if requested field is coarser
++        if (field != Calendar.MILLISECOND) {
++            timeInMillis = timeInMillis - (timeInMillis % 1000L);
++        }
+ 
+-        // truncate seconds
++        // Truncate seconds if requested field is coarser
++        if (field != Calendar.MILLISECOND && field != Calendar.SECOND) {
++            timeInMillis = timeInMillis - (timeInMillis % (60L * 1000L));
++        }
+ 
+-        // truncate minutes
++        // Truncate minutes if requested field is coarser
++        if (field != Calendar.MILLISECOND && field != Calendar.SECOND && field != Calendar.MINUTE) {
++            timeInMillis = timeInMillis - (timeInMillis % (60L * 60L * 1000L));
++        }
+ 
+-        // reset time
++        // Truncate hours if requested field is coarser
++        if (field != Calendar.MILLISECOND && field != Calendar.SECOND && field != Calendar.MINUTE &&
++            field != Calendar.HOUR && field != Calendar.HOUR_OF_DAY && field != Calendar.AM_PM) {
++            // Truncate to start of day using timezone offset
++            long tzOffset = val.get(Calendar.ZONE_OFFSET) + val.get(Calendar.DST_OFFSET);
++            long timeOfDayMillis = (timeInMillis - tzOffset) % (24L * 60L * 60L * 1000L);
++            if (timeOfDayMillis < 0) { // Handle time before epoch in UTC
++                timeOfDayMillis += (24L * 60L * 60L * 1000L);
++            }
++            timeInMillis = timeInMillis - timeOfDayMillis; // Truncate to start of day in the timezone
++        }
++
++        // Set time back only if it was modified by manual truncation
++        if (timeInMillis != originalTimeInMillis) {
++            val.setTimeInMillis(timeInMillis);
++        }
+         // ----------------- Fix for LANG-59 ----------------------- END ----------------
+ 
+         boolean roundUp = false;
+-        for (int i = 0; i < fields.length; i++) {
++        for (int i = 0; i < fields.length; i++) { // Iterate through field precision levels (e.g., ms, s, m, h, date...)
++            int currentFieldGroup = fields[i][0]; // The main field of this level
++
++            // Check if any field in this level matches the target field
++            boolean fieldFoundInThisLevel = false;
+             for (int j = 0; j < fields[i].length; j++) {
+                 if (fields[i][j] == field) {
+-                    //This is our field... we stop looping
++                    fieldFoundInThisLevel = true;
++                    break;
++                }
++            }
++
++            // Determine if this field group was manually truncated above
++            // This helps avoid redundant/problematic set() calls later
++            boolean wasManuallyTruncated = false;
++            // Check if MILLISECOND was manually truncated
++            if (currentFieldGroup == Calendar.MILLISECOND && field != Calendar.MILLISECOND) {
++                wasManuallyTruncated = true; // It was truncated if field != MILLISECOND
++            }
++            // Check if SECOND was manually truncated
++            else if (currentFieldGroup == Calendar.SECOND && !(field == Calendar.MILLISECOND || field == Calendar.SECOND)) {
++                wasManuallyTruncated = true;
++            }
++            // Check if MINUTE was manually truncated
++            else if (currentFieldGroup == Calendar.MINUTE && !(field == Calendar.MILLISECOND || field == Calendar.SECOND || field == Calendar.MINUTE)) {
++                wasManuallyTruncated = true;
++            }
++            // Check if HOUR was manually truncated
++            else if ((currentFieldGroup == Calendar.HOUR || currentFieldGroup == Calendar.HOUR_OF_DAY) &&
++                     !(field == Calendar.MILLISECOND || field == Calendar.SECOND || field == Calendar.MINUTE ||
++                       field == Calendar.HOUR || field == Calendar.HOUR_OF_DAY || field == Calendar.AM_PM)) {
++                wasManuallyTruncated = true;
++            }
++
++
++            if (fieldFoundInThisLevel) {
++                // Target field found. Apply rounding if needed and return.
++                // Rounding depends on `roundUp` calculated from the *previous* (finer) field iteration.
+                 if (round && roundUp) {
+                     if (field == DateUtils.SEMI_MONTH) {
+-                            //This is a special case that's hard to generalize
+-                            //If the date is 1, we round up to 16, otherwise
+-                            //  we subtract 15 days and add 1 month
+-                            if (val.get(Calendar.DATE) == 1) {
++                        // Special case SEMI_MONTH rounding
++                        // Get the DATE value *before* potential modification
++                        int date = val.get(Calendar.DATE);
++                        if (date == 1) {
+                             val.add(Calendar.DATE, 15);
+                         } else {
+                             val.add(Calendar.DATE, -15);
+                             val.add(Calendar.MONTH, 1);
+                         }
++                    } else if (field == Calendar.AM_PM) {
++                        // Special case AM_PM rounding
++                        val.add(Calendar.HOUR_OF_DAY, 12);
+                     } else {
+-                            //We need at add one to this field since the
+-                            //  last number causes us to round up
++                        // General rounding: add 1 to the primary field of this level
+                         val.add(fields[i][0], 1);
+                     }
+                 }
++                // We've processed up to the target field. Stop.
+                 return;
+             }
+-            }
+-            //We have various fields that are not easy roundings
++
++            // Field not found in this level: currentFieldGroup is smaller than the target field.
++            // We need to:
++            // 1. Calculate `roundUp` based on this field's original value (before any truncation).
++            // 2. Truncate this field `currentFieldGroup` *if* it wasn't manually truncated.
++
++            // --- Calculate roundUp based on the original value ---
++            // Use a temporary calendar based on original time to get original field values for rounding calc.
++            Calendar originalCal = Calendar.getInstance(val.getTimeZone());
++            originalCal.setTimeInMillis(originalTimeInMillis); // Use original time before manual truncation
++
+             int offset = 0;
+-            boolean offsetSet = false;
+-            //These are special types of fields that require different rounding rules
+-            switch (field) {
++            boolean offsetSet = false; // Flag for special rounding cases
++
++            // Special calculation of offset/roundUp for SEMI_MONTH and AM_PM targets
++            switch (field) { // Check the TARGET field
+                 case DateUtils.SEMI_MONTH:
+-                    if (fields[i][0] == Calendar.DATE) {
+-                        //If we're going to drop the DATE field's value,
+-                        //  we want to do this our own way.
+-                        //We need to subtrace 1 since the date has a minimum of 1
+-                        offset = val.get(Calendar.DATE) - 1;
+-                        //If we're above 15 days adjustment, that means we're in the
+-                        //  bottom half of the month and should stay accordingly.
++                    if (currentFieldGroup == Calendar.DATE) { // If current level is DATE
++                        offset = originalCal.get(Calendar.DATE) - 1; // Use original value
+                         if (offset >= 15) {
+                             offset -= 15;
+                         }
+-                        //Record whether we're in the top or bottom half of that range
+                         roundUp = offset > 7;
+                         offsetSet = true;
+                     }
+                     break;
+                 case Calendar.AM_PM:
+-                    if (fields[i][0] == Calendar.HOUR_OF_DAY) {
+-                        //If we're going to drop the HOUR field's value,
+-                        //  we want to do this our own way.
+-                        offset = val.get(Calendar.HOUR_OF_DAY);
++                     if (currentFieldGroup == Calendar.HOUR_OF_DAY) { // If current level is HOUR_OF_DAY
++                        offset = originalCal.get(Calendar.HOUR_OF_DAY); // Use original value
+                         if (offset >= 12) {
+                             offset -= 12;
+                         }
+-                        roundUp = offset > 6;
++                        roundUp = offset >= 6;
+                         offsetSet = true;
+                     }
+                     break;
+             }
++
++            // Default calculation of offset/roundUp for other fields
+             if (!offsetSet) {
+-                int min = val.getActualMinimum(fields[i][0]);
+-                int max = val.getActualMaximum(fields[i][0]);
+-                //Calculate the offset from the minimum allowed value
+-                offset = val.get(fields[i][0]) - min;
+-                //Set roundUp if this is more than half way between the minimum and maximum
+-                roundUp = offset > ((max - min) / 2);
++                // Use originalCal to get min/max/value to ensure rounding is based on pre-truncation state
++                int min = originalCal.getActualMinimum(currentFieldGroup);
++                int max = originalCal.getActualMaximum(currentFieldGroup);
++                offset = originalCal.get(currentFieldGroup) - min; // Use original value
++                // Determine roundUp: true if value > midpoint
++                roundUp = (offset * 2) > (max - min);
+             }
+-            //We need to remove this field
+-                val.set(fields[i][0], val.get(fields[i][0]) - offset);
++
++            // --- Truncate the current field `currentFieldGroup` ---
++            // Only apply truncation using set() if the field wasn't manually truncated above.
++            if (!wasManuallyTruncated) {
++                 // Get the current value and minimum for the actual 'val' Calendar.
++                 int currentValField = val.get(currentFieldGroup);
++                 int minValField = val.getActualMinimum(currentFieldGroup);
++                 // Use set() only if the value is not already the minimum.
++                 // This avoids potential issues with set() if the field is already 0.
++                 if (currentValField != minValField) {
++                    val.set(currentFieldGroup, minValField);
+                  }
++            }
++            // else: Field was already truncated manually using setTimeInMillis. No action needed here.
++
++        } // End of loop through field precision levels
++
++        // This should not be reached if 'field' is valid and present in 'fields' array
+         throw new IllegalArgumentException("The field " + field + " is not supported");
+-
+     }
+\ No newline at end of file

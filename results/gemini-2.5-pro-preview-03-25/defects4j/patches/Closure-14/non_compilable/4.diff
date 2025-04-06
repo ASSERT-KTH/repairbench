@@ -1,0 +1,225 @@
+diff --git a/tmp/546798dd-2904-42a1-86a2-edaab6b6eb5a_buggy.java b/tmp/fb640bd2-fc81-4c61-b020-17b6c9998f5d_fixed.java
+index bf9bb88..efa8bcb 100644
+--- a/tmp/546798dd-2904-42a1-86a2-edaab6b6eb5a_buggy.java
++++ b/tmp/fb640bd2-fc81-4c61-b020-17b6c9998f5d_fixed.java
+@@ -1,108 +1,184 @@
+   /**
+    * Computes the follow() node of a given node and its parent. There is a side
+    * effect when calling this function. If this function computed an edge that
+-   * exists a FINALLY, it'll attempt to connect the fromNode to the outer
++   * exits a FINALLY, it'll attempt to connect the fromNode to the outer
+    * FINALLY according to the finallyMap.
+    *
+    * @param fromNode The original source node since {@code node} is changed
+    *        during recursion.
+    * @param node The node that follow() should compute.
+    */
+   private static Node computeFollowNode(
+       Node fromNode, Node node, ControlFlowAnalysis cfa) {
+     /*
+      * This is the case where:
+      *
+      * 1. Parent is null implies that we are transferring control to the end of
+      * the script.
+      *
+      * 2. Parent is a function implies that we are transferring control back to
+      * the caller of the function.
+      *
+      * 3. If the node is a return statement, we should also transfer control
+-     * back to the caller of the function.
++     * back to the caller of the function. (Handled by CFG builder separately)
+      *
+      * 4. If the node is root then we have reached the end of what we have been
+      * asked to traverse.
+      *
+      * In all cases we should transfer control to a "symbolic return" node.
+      * This will make life easier for DFAs.
+      */
+     Node parent = node.getParent();
+     if (parent == null || parent.isFunction() ||
+         (cfa != null && node == cfa.root)) {
+       return null;
+     }
+ 
+-    // If we are just before a IF/WHILE/DO/FOR:
++    // If parent is a governing control structure, we special case.
+     switch (parent.getType()) {
+-      // The follow() of any of the path from IF would be what follows IF.
++      // The follow() of any path from IF would be what follows IF.
+       case Token.IF:
++        // From the THEN or ELSE block, the follow is the node after the IF.
+         return computeFollowNode(fromNode, parent, cfa);
++
+       case Token.CASE:
+       case Token.DEFAULT_CASE:
+-        // After the body of a CASE, the control goes to the body of the next
+-        // case, without having to go to the case condition.
+-        if (parent.getNext() != null) {
+-          if (parent.getNext().isCase()) {
+-            return parent.getNext().getFirstChild().getNext();
+-          } else if (parent.getNext().isDefaultCase()) {
+-            return parent.getNext().getFirstChild();
+-          } else {
+-            Preconditions.checkState(false, "Not reachable");
++        // After the body of a CASE/DEFAULT, control goes to the body of the
++        // next case/default, or out of the switch.
++        Node nextCase = parent.getNext();
++        // Find the next CASE or DEFAULT, skipping other nodes (e.g. LABELs).
++        while (nextCase != null && !nextCase.isCase() && !nextCase.isDefaultCase()) {
++          nextCase = nextCase.getNext();
++        }
++
++        if (nextCase != null) {
++          // Go to the body of the next case/default.
++          if (nextCase.isCase()) {
++            // Next case body is the second child (first child is the case value).
++            return computeFallThrough(nextCase.getLastChild());
++          } else { // Default case
++            // Default case body is the first child.
++            return computeFallThrough(nextCase.getFirstChild());
+           }
+         } else {
+-          return computeFollowNode(fromNode, parent, cfa);
++          // Done with CASES, flow should continue after the SWITCH.
++          return computeFollowNode(fromNode, parent.getParent(), cfa);
+         }
+-        break;
++
+       case Token.FOR:
+         if (NodeUtil.isForIn(parent)) {
++          // For-in loops are essentially while loops. Fall through leads back to the loop.
+           return parent;
+         } else {
+-          return parent.getFirstChild().getNext().getNext();
++          // Standard FOR loop: determines the next node based on the current position.
++          Node init = NodeUtil.getForInit(parent);
++          Node condition = NodeUtil.getForCond(parent);
++          Node increment = NodeUtil.getForIncr(parent);
++          Node body = NodeUtil.getForBody(parent);
++
++          if (node == init || node == increment) {
++             // After init or increment, go to condition (at FOR node).
++             return parent;
++          } else if (node == condition) {
++            // After condition (if true), go to body.
++            // This is handled by the edge creation for the condition, not fall-through.
++            // computeFollowNode computes fall-through assuming condition is false.
++            return computeFollowNode(fromNode, parent, cfa); // After the loop
++          } else if (node == body) {
++             // After body, go to increment. If increment is empty, go back to condition (at FOR node).
++            return increment.isEmpty() ? parent : computeFallThrough(increment);
+           }
++        }
++        break; // Added break for FOR loop logic clarity
++
+       case Token.WHILE:
++        // Follow of the body is the WHILE node (re-test condition).
++        // Follow of the condition (false) is after the WHILE loop.
++        if (node == parent.getFirstChild()) { // Node is Condition
++           return computeFollowNode(fromNode, parent, cfa);
++        } else { // Node is Body
++           return parent;
++        }
++
+       case Token.DO:
++        // Follow of the body is the DO node (re-test condition).
++        // Follow of the condition (false) is after the DO loop.
++        if (node == parent.getLastChild()) { // Node is Condition
++            return computeFollowNode(fromNode, parent, cfa);
++        } else { // Node is Body
+             return parent;
++        }
++
+       case Token.TRY:
+-        // If we are coming out of the TRY block...
++        Node finallyBlock = NodeUtil.getFinallyBlock(parent);
++        Node catchNode = NodeUtil.getCatchNode(parent); // The CATCH node itself.
++
++        // If we are coming out of the TRY block body...
+         if (parent.getFirstChild() == node) {
+-          if (NodeUtil.hasFinally(parent)) { // and have FINALLY block.
+-            return computeFallThrough(parent.getLastChild());
+-          } else { // and have no FINALLY.
+-            return computeFollowNode(fromNode, parent, cfa);
++          // Control flows to CATCH block body (if present), else FINALLY (if present), else after TRY.
++          if (catchNode != null) {
++            return computeFallThrough(catchNode.getFirstChild()); // Catch block body
++          } else if (finallyBlock != null) {
++            return computeFallThrough(finallyBlock);
++          } else {
++            return computeFollowNode(fromNode, parent, cfa); // After TRY
+           }
+-        // CATCH block.
+-        } else if (NodeUtil.getCatchBlock(parent) == node){
+-          if (NodeUtil.hasFinally(parent)) { // and have FINALLY block.
+-            return computeFallThrough(node.getNext());
++        // If we are coming out of the CATCH block body...
++        } else if (catchNode != null && catchNode.getFirstChild() == node) {
++           // Control flows to FINALLY (if present), else after TRY.
++           if (finallyBlock != null) {
++             return computeFallThrough(finallyBlock);
+            } else {
+-            return computeFollowNode(fromNode, parent, cfa);
++             return computeFollowNode(fromNode, parent, cfa); // After TRY
+            }
+         // If we are coming out of the FINALLY block...
+-        } else if (parent.getLastChild() == node){
+-          if (cfa != null) {
+-            for (Node finallyNode : cfa.finallyMap.get(parent)) {
+-              cfa.createEdge(fromNode, Branch.UNCOND, finallyNode);
+-            }
++        } else if (finallyBlock != null && finallyBlock == node) {
++           // Check if any jumps (return, break, continue, throw) targeted this finally.
++           // A finallyMap entry exists if a jump occurred in the corresponding try/catch.
++           boolean jumpTargetedThisFinally = cfa != null && cfa.finallyMap.containsKey(parent);
++           Node outerFinally = (cfa == null) ? null : cfa.getFinallyBlock(parent.getParent());
++
++           if (outerFinally != null) {
++             // If there is an outer finally, control always transfers there next,
++             // regardless of whether we got here normally or via jump.
++             return computeFallThrough(outerFinally);
++           } else {
++             // No outer finally block.
++             if (jumpTargetedThisFinally) {
++               // This finally was entered due to a jump. Resume the jump.
++               // Create edges from the exit of this finally ('node') to the jump target(s).
++               // This is necessary because handleFinally may not correctly create these edges
++               // from the *exit* of the finally block.
++               for (Node finallyTarget : cfa.finallyMap.get(parent)) {
++                   cfa.createEdge(node, Branch.UNCOND, finallyTarget);
+                }
++               // Return null: flow determined by jump edges, not normal fall-through.
++               return null;
++             } else {
++               // Normal fall-through from finally. Continue after the TRY statement.
+                return computeFollowNode(fromNode, parent, cfa);
+              }
+            }
++        }
++        // If control reaches here, 'node' is likely the TRY node itself, or CATCH node.
++        // Fall through to sibling logic.
++        break; // End of TRY case
++    } // End switch
+ 
+-    // Now that we are done with the special cases follow should be its
+-    // immediate sibling, unless its sibling is a function
++    // If not handled by special parent processing, follow should be the next sibling.
+     Node nextSibling = node.getNext();
+ 
+-    // Skip function declarations because control doesn't get pass into it.
++    // Skip function declarations.
+     while (nextSibling != null && nextSibling.isFunction()) {
+       nextSibling = nextSibling.getNext();
+     }
+ 
+     if (nextSibling != null) {
++      // Fall through to the next statement in the block.
+       return computeFallThrough(nextSibling);
+     } else {
+-      // If there are no more siblings, control is transferred up the AST.
++      // No more siblings. Transfer control up the AST.
++      // Let the parent's computeFollowNode decide.
+       return computeFollowNode(fromNode, parent, cfa);
+     }
+   }
+\ No newline at end of file

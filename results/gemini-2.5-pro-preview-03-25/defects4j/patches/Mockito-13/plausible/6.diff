@@ -1,0 +1,92 @@
+diff --git a/tmp/5057df24-267a-423e-95e3-fec43cfdcbdd_buggy.java b/tmp/a70c302f-4cf5-4067-95b1-e449731cbf9d_fixed.java
+index 5481b94..f796ec3 100644
+--- a/tmp/5057df24-267a-423e-95e3-fec43cfdcbdd_buggy.java
++++ b/tmp/a70c302f-4cf5-4067-95b1-e449731cbf9d_fixed.java
+@@ -1,49 +1,67 @@
+     public Object handle(Invocation invocation) throws Throwable {
++        // 1. Handle stubbing voids (`Mockito.stubVoid()`, `doAnswer()`, etc.)
+         if (invocationContainerImpl.hasAnswersForStubbing()) {
+-            // stubbing voids with stubVoid() or doAnswer() style
+-            InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress
+-                            .getArgumentMatcherStorage(), invocation);
++            // Ongoing stubbing using doReturn() style.
++            InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(), invocation);
+             invocationContainerImpl.setMethodForStubbing(invocationMatcher);
+             return null;
+         }
++
++        // 2. Pull verification mode, if any.
+         VerificationMode verificationMode = mockingProgress.pullVerificationMode();
+-
+         InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(),
+                         invocation);
+ 
+-        mockingProgress.validateState();
+-
+-        //if verificationMode is not null then someone is doing verify()        
++        // 3. Is verify() happening?
+         if (verificationMode != null) {
+-            //We need to check if verification was started on the correct mock 
+-            // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            if (verificationMode instanceof MockAwareVerificationMode && ((MockAwareVerificationMode) verificationMode).getMock() == invocation.getMock()) {
++            // Is the verification targeted at the *current* invocation's mock?
++            boolean isMockAware = verificationMode instanceof MockAwareVerificationMode;
++            boolean isCorrectMockForVerification = isMockAware
++                    && ((MockAwareVerificationMode) verificationMode).getMock() == invocation.getMock();
++
++            if (isCorrectMockForVerification) {
++                // Yes, this is the invocation we want to verify.
+                 VerificationDataImpl data = new VerificationDataImpl(invocationContainerImpl, invocationMatcher);
+                 verificationMode.verify(data);
+-                return null;
+-                // this means there is an invocation on a different mock. Re-adding verification mode 
+-                // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            }
++                return null; // Verification finished for this invocation.
++            } else {
++                // No, this is an invocation on a different mock during verification
++                // (e.g. the mock.otherMethod() call inside verify(mockTwo).simpleMethod(mock.otherMethod())).
++                // Put the verification mode back so it's available for the correct invocation.
++                mockingProgress.verificationStarted(verificationMode);
++                // Proceed to handle this invocation normally (e.g., find stub, return value) below.
++                // *** We must NOT validate state or report ongoing stubbing for this intermediate invocation. ***
+             }
++        } else {
++            // 4. If not verifying, validate state *before* handling invocation/stubbing
++            // Catches unfinished stubbing/verification, misplaced matchers etc.
++             mockingProgress.validateState();
+ 
++            // Prepare for potential stubbing (e.g., `when(mock.foo())`)
+             invocationContainerImpl.setInvocationForPotentialStubbing(invocationMatcher);
+             OngoingStubbingImpl<T> ongoingStubbing = new OngoingStubbingImpl<T>(invocationContainerImpl);
+             mockingProgress.reportOngoingStubbing(ongoingStubbing);
++            // Proceed to stub lookup (step 5)
++        }
+ 
++        // 5. Handle invocation by finding stubbed answer or returning default answer
++        // This part is reached for normal invocations, OR for invocations on different mocks during verification.
+         StubbedInvocationMatcher stubbedInvocation = invocationContainerImpl.findAnswerFor(invocation);
+ 
+         if (stubbedInvocation != null) {
++            // Found a stubbed answer
+             stubbedInvocation.captureArgumentsFrom(invocation);
+             return stubbedInvocation.answer(invocation);
+         } else {
++            // No stub found, use default answer
+             Object ret = mockSettings.getDefaultAnswer().answer(invocation);
+ 
+-            // redo setting invocation for potential stubbing in case of partial
+-            // mocks / spies.
+-            // Without it, the real method inside 'when' might have delegated
+-            // to other self method and overwrite the intended stubbed method
+-            // with a different one. The reset is required to avoid runtime exception that validates return type with stubbed method signature.
++            // If we were starting a stubbing (`when(mock.foo())`), the potential stubbing might have been overwritten
++            // by delegated calls if mock is a spy/partial mock. Reset it.
++            // This should only happen if verificationMode was initially null (i.e., not verifying).
++            if (verificationMode == null) {
+                  invocationContainerImpl.resetInvocationForPotentialStubbing(invocationMatcher);
++            }
+             return ret;
+         }
+     }
+\ No newline at end of file

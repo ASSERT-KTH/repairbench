@@ -1,0 +1,297 @@
+diff --git a/tmp/8a317f69-a2cc-49d0-9fd6-c9f859e97838_buggy.java b/tmp/7b57240a-cb25-4431-aac4-47ecec1be716_fixed.java
+index 7d7ab59..889c799 100644
+--- a/tmp/8a317f69-a2cc-49d0-9fd6-c9f859e97838_buggy.java
++++ b/tmp/7b57240a-cb25-4431-aac4-47ecec1be716_fixed.java
+@@ -1,124 +1,247 @@
+   /**
+    * Attempts to minimize the number of explicit exit points in a control
+    * structure to take advantage of the implied exit at the end of the
+    * structure.  This is accomplished by removing redundant statements, and
+    * moving statements following a qualifying IF node into that node.
+    * For example:
+    *
+    * function () {
+    *   if (x) return;
+    *   else blah();
+    *   foo();
+    * }
+    *
+    * becomes:
+    *
+    * function () {
+    *  if (x) ;
+    *  else {
+    *    blah();
+    *    foo();
+    *  }
+    *
+    * @param n The execution node of a parent to inspect.
+    * @param exitType The type of exit to look for.
+    * @param labelName If parent is a label the name of the label to look for,
+    *   null otherwise.
+    * @nullable labelName non-null only for breaks within labels.
+    */
+   void tryMinimizeExits(Node n, int exitType, String labelName) {
+ 
+-    // Just an 'exit'.
+-    if (matchingExitNode(n, exitType, labelName)) {
+-      NodeUtil.removeChild(n.getParent(), n);
+-      compiler.reportCodeChange();
+-      return;
+-    }
++    // Do not minimize exits in FINALLY blocks. This is accomplished by
++    // checking before removing an exit node below.
++    // However, we still need to traverse into the finally block.
+ 
+-    // Just an 'if'.
++    // Recurse base cases: Handle control structures first.
+     if (n.isIf()) {
++      // Recurse on the IF branches first.
+       Node ifBlock = n.getFirstChild().getNext();
+       tryMinimizeExits(ifBlock, exitType, labelName);
+       Node elseBlock = ifBlock.getNext();
+       if (elseBlock != null) {
+         tryMinimizeExits(elseBlock, exitType, labelName);
+       }
++      // After processing children, the IF is done for this call.
++      // The IF might be processed later as part of a BLOCK.
+       return;
+     }
+ 
+-    // Just a 'try/catch/finally'.
+     if (n.isTry()) {
++      // Recurse into TRY structure.
+       Node tryBlock = n.getFirstChild();
+       tryMinimizeExits(tryBlock, exitType, labelName);
+       Node allCatchNodes = NodeUtil.getCatchBlock(n);
+       if (NodeUtil.hasCatchHandler(allCatchNodes)) {
+         Preconditions.checkState(allCatchNodes.hasOneChild());
+         Node catchNode = allCatchNodes.getFirstChild();
+         Node catchCodeBlock = catchNode.getLastChild();
+         tryMinimizeExits(catchCodeBlock, exitType, labelName);
+       }
+-      /* Don't try to minimize the exits of finally blocks, as this
+-       * can cause problems if it changes the completion type of the finally
+-       * block. See ECMA 262 Sections 8.9 & 12.14
+-       */
+       if (NodeUtil.hasFinally(n)) {
+         Node finallyBlock = n.getLastChild();
++        // Recursively process the finally block, but exits within it will be
++        // protected by the check in the base case below.
+         tryMinimizeExits(finallyBlock, exitType, labelName);
+       }
++      return;
+     }
+ 
+-    // Just a 'label'.
+     if (n.isLabel()) {
++      // Recurse into the label body.
+       Node labelBlock = n.getLastChild();
+       tryMinimizeExits(labelBlock, exitType, labelName);
++      return;
++    }
++
++    // Base Case: Is 'n' the exit node itself?
++    if (matchingExitNode(n, exitType, labelName)) {
++      // Check if 'n' is inside a finally block before removing.
++      if (!isInFinallyBlock(n)) {
++        Node parent = n.getParent();
++        // Ensure parent allows removal (is Block, Script, or Label body).
++        if (parent != null && (parent.isBlock() || parent.isScript() || parent.isLabel())) {
++             NodeUtil.removeChild(parent, n);
++             compiler.reportCodeChange();
++        }
++      }
++      // Whether removed or not, we processed this node.
++      return;
+     }
+ 
+-    // TODO(johnlenz): The last case of SWITCH statement?
+ 
+-    // The rest assumes a block with at least one child, bail on anything else.
+-    if (!n.isBlock() || n.getLastChild() == null) {
++    // --- Handle BLOCK or SCRIPT node ---
++    // Only blocks and scripts contain sequences of statements to optimize further.
++    if (!n.isBlock() && !n.isScript()) {
+       return;
+     }
+ 
+-    // Multiple if-exits can be converted in a single pass.
+-    // Convert "if (blah) break;  if (blah2) break; other_stmt;" to
+-    // become "if (blah); else { if (blah2); else { other_stmt; } }"
+-    // which will get converted to "if (!blah && !blah2) { other_stmt; }".
+-    for (Node c : n.children()) {
++    // Iterate through children to process IF statements and recurse.
++    // Use explicit next sibling handling due to potential node removals/moves.
++    Node currentChild = n.getFirstChild();
++    while (currentChild != null) {
++        Node nextChild = currentChild.getNext(); // Store next before possible modifications
++
++        // Recurse into the child first. This handles nested structures and
++        // exit removals within them (respecting finally blocks).
++        tryMinimizeExits(currentChild, exitType, labelName);
++
++        // After recursion, check if the child is an IF node and still exists.
++        if (currentChild.isIf() && currentChild.getParent() == n) {
++            Node ifNode = currentChild;
++            // Re-fetch branches as recursion might have altered them.
++            Node trueBlock = ifNode.getFirstChild().getNext();
++            Node falseBlock = trueBlock.getNext();
++
++            // Check if exactly one branch *now* ends with the target exit type.
++            // The exit node itself should have already been removed by the recursive
++            // call above if it wasn't in a finally block.
++            boolean trueExits = blockEndsWithExit(trueBlock, exitType, labelName);
++            boolean falseExits = (falseBlock != null) && blockEndsWithExit(falseBlock, exitType, labelName);
++
++            // Determine if the exit node (if it existed) was protected.
++            boolean wasProtected = false;
++            if (trueExits != falseExits) {
++                 Node exitBlock = trueExits ? trueBlock : falseBlock;
++                 Node lastNode = exitBlock.getLastChild();
++                 // Check if the last node *before potential removal* was an exit in finally.
++                 // This requires looking at the original state or inferring.
++                 // Simpler: If blockEndsWithExit is true, but the node is still there,
++                 // it must have been protected.
++                 if (trueExits && lastNode != null && matchingExitNode(lastNode, exitType, labelName)) {
++                    wasProtected = true; // trueBlock ended with exit, but it's still there.
++                 } else if (falseExits && falseBlock.getLastChild() != null
++                            && matchingExitNode(falseBlock.getLastChild(), exitType, labelName)) {
++                    wasProtected = true; // elseBlock ended with exit, but it's still there.
++                 }
++            }
++
++
++            // If exactly one branch exited *and* the exit was not protected by finally,
++            // move subsequent code into the other branch.
++            if (trueExits != falseExits && !wasProtected) {
++                Node targetBlock = trueExits ? falseBlock : trueBlock;
++
++                // Move statements following the IF node.
++                Node subsequentNode = ifNode.getNext();
++                if (subsequentNode != null) { // Only move if there's something after the IF
++                    Node originalTargetBlock = targetBlock; // Remember if we created it
++
++                    // Ensure the target block exists.
++                    if (targetBlock == null) {
++                        targetBlock = IR.block().srcref(ifNode); // Use IR factory methods
++                        if (trueExits) { // Target is the ELSE block
++                            ifNode.addChildToBack(targetBlock);
++                        } else { // Target is the THEN block (must exist)
++                            // This case implies falseExits was true, so elseBlock must exist.
++                           Preconditions.checkState(false, "Cannot move code to a non-existent THEN block");
++                        }
++                    }
+ 
+-      // An 'if' block to process below.
+-      if (c.isIf()) {
+-        Node ifTree = c;
+-        Node trueBlock, falseBlock;
++                    // Move all subsequent siblings into the target block.
++                    boolean codeMoved = false;
++                    while (subsequentNode != null) {
++                        Node nodeToMove = subsequentNode;
++                        subsequentNode = subsequentNode.getNext(); // Advance pointer first
+ 
+-        // First, the true condition block.
+-        trueBlock = ifTree.getFirstChild().getNext();
+-        falseBlock = trueBlock.getNext();
+-        tryMinimizeIfBlockExits(trueBlock, falseBlock,
+-            ifTree, exitType, labelName);
++                        n.removeChild(nodeToMove); // Remove from parent block 'n'
++                        targetBlock.addChildToBack(nodeToMove);
++                        codeMoved = true;
++                    }
+ 
+-        // Now the else block.
+-        // The if blocks may have changed, get them again.
+-        trueBlock = ifTree.getFirstChild().getNext();
+-        falseBlock = trueBlock.getNext();
+-        if (falseBlock != null) {
+-          tryMinimizeIfBlockExits(falseBlock, trueBlock,
+-              ifTree, exitType, labelName);
++                    // Report change if nodes were moved or block created.
++                    if (codeMoved || originalTargetBlock == null) {
++                         compiler.reportCodeChange();
++                    }
++                    // Update nextChild for the outer loop since siblings were moved.
++                    nextChild = ifNode.getNext(); // Should be null or point after moved section
+                 }
+             }
++        }
++        // Move to the next child for the next iteration.
++        currentChild = nextChild;
++    }
++
++
++    // After processing children, check the last child of the block again.
++    // Redundant exits at the end of the block are handled here. Loop handles
++    // cascading removals (e.g. "return; return;" -> "return;" -> "").
++    while (true) {
++      Node lastChild = n.getLastChild();
++      if (lastChild == null) {
++        break; // Block is empty.
++      }
++
++      // Store the node instance to check if it gets removed/replaced by the call.
++      Node originalLastChild = lastChild;
++      // Recurse into the last child. This might remove it if it's an exit.
++      tryMinimizeExits(lastChild, exitType, labelName);
+ 
+-      if (c == n.getLastChild()) {
++      // If the last child didn't change identity (i.e., wasn't removed or replaced)
++      // then we're done with this block's tail optimization for this pass.
++      if (n.getLastChild() == originalLastChild) {
+           break;
+       }
++      // Otherwise, the last child changed (likely removed), loop again to process
++      // the node that is *now* the last child.
++    }
+   }
+ 
+-    // Now try to minimize the exits of the last child, if it is removed
+-    // look at what has become the last child.
+-    for (Node c = n.getLastChild(); c != null; c = n.getLastChild()) {
+-      tryMinimizeExits(c, exitType, labelName);
+-      // If the node is still the last child, we are done.
+-      if (c == n.getLastChild()) {
++  /** Helper function: Checks if node 'n' is contained within a FINALLY block. */
++  private boolean isInFinallyBlock(Node n) {
++      // Walk up ancestors checking if any is a finally block of a TRY node.
++      for (Node ancestor = n; ancestor != null; ancestor = ancestor.getParent()) {
++          Node parent = ancestor.getParent();
++          // Check if 'ancestor' is the finally block (last child) of a TRY node.
++          if (parent != null && parent.isTry() && parent.getLastChild() == ancestor) {
++              // Ensure 'ancestor' is actually the block node, not just contained within.
++              // The check parent.getLastChild() == ancestor confirms 'ancestor' is the finally block itself.
++              // If n is this ancestor or any node inside it, return true.
++              return true;
++          }
++          // Stop searching at function/script boundaries, as TRY cannot cross these.
++          if (ancestor.isFunction() || ancestor.isScript()) {
+               break;
+           }
+       }
++      return false;
+   }
++
++  /**
++   * Helper function: Checks if a block ends with a specific exit type node.
++   * Does not consider whether the exit is in a finally block by itself.
++   */
++  private boolean blockEndsWithExit(Node block, int exitType, String labelName) {
++      if (block != null && block.isBlock()) {
++          Node last = block.getLastChild();
++          // Check if the last child exists and matches the exit criteria.
++          return last != null && matchingExitNode(last, exitType, labelName);
++      }
++      return false;
++  }
++
++  // Assumes existence of:
++  // matchingExitNode(Node, int, String) : boolean
++  // compiler.reportCodeChange() : void
++  // NodeUtil methods (removeChild is implicitly used via n.removeChild)
++  // Preconditions.checkState
++  // IR factory methods (e.g., IR.block())
+\ No newline at end of file

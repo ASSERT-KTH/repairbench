@@ -1,0 +1,246 @@
+diff --git a/tmp/8059c6b0-3b18-4da5-8960-750e8e69147c_buggy.java b/tmp/9846aeb7-d53b-46cc-aeae-c29bf6015bc4_fixed.java
+index ef65dd9..e7a7413 100644
+--- a/tmp/8059c6b0-3b18-4da5-8960-750e8e69147c_buggy.java
++++ b/tmp/9846aeb7-d53b-46cc-aeae-c29bf6015bc4_fixed.java
+@@ -1,92 +1,194 @@
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
++    // Ensure the structure is what we expect: array.join(separator)
+     if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
+       return;
+     }
+ 
+-    Node arrayNode = left.getFirstChild();
+-    Node functionName = arrayNode.getNext();
++    Node arrayNode = left.getFirstChild(); // The array literal node
++    Node functionName = arrayNode.getNext(); // The "join" string node
+ 
+-    if ((arrayNode.getType() != Token.ARRAYLIT) ||
++    // Check if it's an array literal and the function is "join"
++    if (arrayNode == null || !arrayNode.isArrayLit() ||
++        functionName == null || !functionName.isString() ||
+         !functionName.getString().equals("join")) {
+       return;
+     }
+ 
+     String joinString = NodeUtil.getStringValue(right);
++    // We can't fold non-string join separators.
++    if (joinString == null) {
++      return;
++    }
++
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+     StringBuilder sb = new StringBuilder();
+-    int foldedSize = 0;
+     Node elem = arrayNode.getFirstChild();
+-    // Merges adjacent String nodes.
++    boolean changed = false;
++    int originalChildCount = arrayNode.getChildCount();
++
++    // Iterate through the array elements, folding adjacent literals
+     while (elem != null) {
++      Node nextElem = elem.getNext(); // Store next element before potential modification/cloning
+       if (NodeUtil.isImmutableValue(elem)) {
+         if (sb.length() > 0) {
+           sb.append(joinString);
+         }
+-        sb.append(NodeUtil.getStringValue(elem));
++        // NodeUtil.getStringValue handles conversion from number, boolean, null etc.
++        String elemStr = NodeUtil.getStringValue(elem);
++        // Should not happen for known immutable types, but check defensively.
++        if (elemStr == null) {
++          // Treat as non-foldable
++          if (sb.length() > 0) {
++            // Try to preserve source info from the element before this problematic one
++            Node sourceInfoNode = sb.length() > 0 && arrayFoldedChildren.isEmpty() ? arrayNode.getFirstChild() : elem;
++            arrayFoldedChildren.add(Node.newString(sb.toString()).copyInformationFrom(sourceInfoNode));
++            sb = new StringBuilder();
++            changed = true;
++          }
++          arrayFoldedChildren.add(elem.cloneTree());
++          // Mark change if we add a non-literal element
++          changed = true;
++        } else {
++          int lengthBeforeAppend = sb.length();
++          sb.append(elemStr);
++          // Mark changed if we are appending to a non-empty sb (merging literals)
++          if (lengthBeforeAppend > 0) {
++               changed = true;
++          }
++        }
+       } else {
++        // Non-foldable element found
+         if (sb.length() > 0) {
+-          // + 2 for the quotes.
+-          foldedSize += sb.length() + 2;
+-          arrayFoldedChildren.add(Node.newString(sb.toString()));
++          // Use source info from the non-literal node as it marks the end of the literal sequence
++          arrayFoldedChildren.add(Node.newString(sb.toString()).copyInformationFrom(elem));
+           sb = new StringBuilder();
++          changed = true; // Flushed string builder
+         }
+-        foldedSize += InlineCostEstimator.getCost(elem);
+-        arrayFoldedChildren.add(elem);
++        arrayFoldedChildren.add(elem.cloneTree());
++        changed = true; // Involving a non-immutable element always implies change
+       }
+-      elem = elem.getNext();
++      elem = nextElem;
+     }
+ 
++    // Add any remaining accumulated string literal
+     if (sb.length() > 0) {
+-      // + 2 for the quotes.
+-      foldedSize += sb.length() + 2;
+-      arrayFoldedChildren.add(Node.newString(sb.toString()));
++      Node lastOriginalChild = arrayNode.getLastChild();
++      Node sourceInfoNode = lastOriginalChild != null ? lastOriginalChild : arrayNode;
++      Node foldedString = Node.newString(sb.toString()).copyInformationFrom(sourceInfoNode);
++      arrayFoldedChildren.add(foldedString);
++      // If we added a final string, and the list has more than one element now,
++      // or the original array had more than one element, consider it changed.
++      // Also counts as change if original was empty and now we have a string.
++       if (arrayFoldedChildren.size() > 1 || originalChildCount > 1 || (originalChildCount == 0 && arrayFoldedChildren.size() == 1) ) {
++          changed = true;
++       } else if (originalChildCount == 1 && arrayNode.getFirstChild() != null) {
++           // Check if the single resulting string is different from the original single element's string form.
++           String originalValueStr = NodeUtil.getStringValue(arrayNode.getFirstChild());
++           // If original couldn't be converted or is different from the result, it's a change.
++           if (originalValueStr == null || !originalValueStr.equals(foldedString.getString())) {
++               changed = true;
+            }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
++       }
++    }
++
++    // If the folding process resulted in no change, exit.
++    if (!changed) {
++       return;
++    }
++
+ 
++    // Calculate original size once.
+     int originalSize = InlineCostEstimator.getCost(n);
++    Node replacementNode = null;
++
+     switch (arrayFoldedChildren.size()) {
+       case 0:
+-        Node emptyStringNode = Node.newString("");
+-        parent.replaceChild(n, emptyStringNode);
++        // Input: [].join(...) -> Output: ""
++        replacementNode = Node.newString("");
+         break;
+ 
+-      case 1:
+-        Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
+-          return;
++      case 1: {
++        // Input: [x].join(...) or ['a','b'].join('') etc. -> Output: single node
++        Node foldedNode = arrayFoldedChildren.get(0);
++        if (foldedNode.isString()) {
++          // Result is already a string literal (e.g., "a,b", or "1")
++          replacementNode = foldedNode;
++        } else {
++          // Result is a single non-literal (e.g., foo from [foo].join(','))
++          // JS result is String(foo). Represent this as "" + foo for explicitness.
++          replacementNode = new Node(Token.ADD, Node.newString(""), foldedNode);
++          // Copy source info from the original call node 'n' to the new ADD node.
++          replacementNode.copyInformationFromForTree(n);
+         }
+-        arrayNode.detachChildren();
+-        if (foldedStringNode.getType() != Token.STRING) {
+-          // If the Node is not a string literal, ensure that
+-          // it is coerced to a string.
+-          Node replacement = new Node(Token.ADD,
+-              Node.newString(""), foldedStringNode);
+-          foldedStringNode = replacement;
+-        }
+-        parent.replaceChild(n, foldedStringNode);
+         break;
+-
+-      default:
+-        // No folding could actually be performed.
+-        if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+-          return;
+       }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += InlineCostEstimator.getCost(right);
+-        if (foldedSize > originalSize) {
+-          return;
+-        }
+-        arrayNode.detachChildren();
++
++      default: {
++        // Input: ['a', foo, 'b', 'c'].join(',') -> Output: ["a", foo, "b,c"].join(',')
++        // Estimate cost of the new expression: [folded1, nonLiteral, ...].join(separator)
++        Node newArrayNode = new Node(Token.ARRAYLIT);
+         for (Node node : arrayFoldedChildren) {
+-          arrayNode.addChildToBack(node);
++          newArrayNode.addChildToBack(node); // Nodes are already clones or new strings
+         }
+-        break;
++        newArrayNode.copyInformationFrom(arrayNode); // Copy array source info
++
++        Node newGetPropNode = new Node(Token.GETPROP, newArrayNode, functionName.cloneNode());
++        newGetPropNode.copyInformationFrom(left); // Copy getprop source info
++
++        // Must clone 'right' (separator) as it might be used elsewhere.
++        Node newCallNode = new Node(Token.CALL, newGetPropNode, right.cloneTree());
++        // Copy overall source info for the call.
++        newCallNode.copyInformationFromForTree(n);
++
++        int estimatedNewCost = InlineCostEstimator.getCost(newCallNode);
++
++        // Only replace/modify if cost is less than or equal. Allows equal for simplification.
++        if (estimatedNewCost > originalSize) {
++          return;
++        }
++
++        // Avoid trivial changes like ['a', 5] -> ["a", "5"] if cost is identical
++        // and child count is the same.
++        if (estimatedNewCost == originalSize && arrayFoldedChildren.size() == originalChildCount) {
++            // This check is potentially complex and might prevent useful normalization.
++            // Let's remove it for now and rely on the basic cost check.
++            // If specific cases need prevention, they can be added back.
++        }
++
++        // Perform the modification by updating the original array node's children.
++        arrayNode.detachChildren();
++        for(Node nodeToAdd : arrayFoldedChildren) {
++            arrayNode.addChildToBack(nodeToAdd);
++        }
++        // Node 'n' itself (the CALL node) is kept, but its operand (the ARRAYLIT) is modified.
++        t.getCompiler().reportCodeChange();
++        return; // Modification done in place, exit.
++      }
++    } // End switch
++
++    // Handle replacement cases (0 and 1)
++    if (replacementNode != null) {
++      int replacementCost = InlineCostEstimator.getCost(replacementNode);
++
++      // Only replace if cost is less than or equal. (Allow equal for simplification)
++      if (replacementCost > originalSize) {
++        return;
++      }
++
++      if (n == parent || !n.hasParent()) {
++        // Should not happen in typical AST structures handled by PeepholeOptimizationsPass.
++        return;
++      }
++      parent.replaceChild(n, replacementNode);
++      // Ensure the replacement node gets the source info from the original call node 'n'.
++      // Case 1 ADD node already copies info. String nodes (case 0 or case 1 literal) need it.
++      if (!replacementNode.isAdd()) {
++         replacementNode.copyInformationFromForTree(n);
+       }
+       t.getCompiler().reportCodeChange();
+     }
++  }
+\ No newline at end of file

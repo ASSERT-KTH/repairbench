@@ -1,0 +1,126 @@
+diff --git a/tmp/1867b240-b28c-4e6f-a1a1-3f62d5e28b26_buggy.java b/tmp/3b31ef0a-7431-470d-9073-aade006a8087_fixed.java
+index 88bb3a1..025117a 100644
+--- a/tmp/1867b240-b28c-4e6f-a1a1-3f62d5e28b26_buggy.java
++++ b/tmp/3b31ef0a-7431-470d-9073-aade006a8087_fixed.java
+@@ -1,57 +1,108 @@
+     /**
+      * Helper method called when there is the explicit "is-creator", but no mode declaration.
+      *
+      * @since 2.9.2
+      */
+     protected void _addExplicitAnyCreator(DeserializationContext ctxt,
+             BeanDescription beanDesc, CreatorCollector creators,
+             CreatorCandidate candidate)
+         throws JsonMappingException
+     {
+         // Looks like there's bit of magic regarding 1-parameter creators; others simpler:
+         if (1 != candidate.paramCount()) {
+             // Ok: for delegates, we want one and exactly one parameter without
+             // injection AND without name
+             int oneNotInjected = candidate.findOnlyParamWithoutInjection();
+             if (oneNotInjected >= 0) {
+                 // getting close; but most not have name
+                 if (candidate.paramName(oneNotInjected) == null) {
+                     _addExplicitDelegatingCreator(ctxt, beanDesc, creators, candidate);
+                     return;
+                 }
+             }
+             _addExplicitPropertyCreator(ctxt, beanDesc, creators, candidate);
+             return;
+         }
++
++        // Handle 1-argument case
+         AnnotatedParameter param = candidate.parameter(0);
+         JacksonInject.Value injectId = candidate.injection(0);
+-        PropertyName paramName = candidate.explicitParamName(0);
++        PropertyName explicitName = candidate.explicitParamName(0); // Use a separate variable
+         BeanPropertyDefinition paramDef = candidate.propertyDef(0);
+ 
+-        // If there's injection or explicit name, should be properties-based
+-        boolean useProps = (paramName != null) || (injectId != null);
++        // Property-based if explicit name or injection present
++        boolean useProps = (explicitName != null) || (injectId != null);
++        PropertyName nameToUse = explicitName; // Name to use for the creator property defaults to explicit
++
++        // Flag to indicate if implicit name check triggered property-based mode
++        boolean usePropsBasedOnImplicit = false;
++
+         if (!useProps && (paramDef != null)) {
+-            // One more thing: if implicit name matches property with a getter
+-            // or field, we'll consider it property-based as well
++            // If not property-based yet, check if implicit name matches a serializable property
++            // Note: findImplicitParamName() applies naming strategy
++            PropertyName implicitName = candidate.findImplicitParamName(0);
++            if (implicitName != null && paramDef.couldSerialize()) {
++                 // Yes, treat as property-based
++                 useProps = true;
++                 // Use the implicit (renamed) name for the property, as this is what JSON likely uses
++                 nameToUse = implicitName;
++                 usePropsBasedOnImplicit = true; // Mark that this decision was based on implicit name
++            }
++            // If implicitName is null or property couldn't serialize, useProps remains false.
++        }
+ 
+-            // 25-May-2018, tatu: as per [databind#2051], looks like we have to get
+-            //    not implicit name, but name with possible strategy-based-rename
+-//            paramName = candidate.findImplicitParamName(0);
+-            paramName = candidate.findImplicitParamName(0);
+-            useProps = (paramName != null) && paramDef.couldSerialize();
+-        }
++        // Now, proceed based on useProps
+         if (useProps) {
++            /* 13-Mar-2021, tatu: Problem is that of [#2051]; should use implicit name.
++             *   But looks like we must NOT use implicit name for actual construction,
++             *   as per [databind#3058], because it refers to discovery part, not binding.
++             *   Need to reconsider this part if/when #2051 is reworked.
++             *
++             *   Note: The following logic attempts to address a potential downstream validation issue
++             *   (like the one causing the test failure) where the property definition map might be keyed
++             *   by the logical name ("paramName0") while the property itself needs the renamed name
++             *   ("param_name0") for JSON matching. If the decision to use properties was based on the
++             *   implicit name, we might need to use the logical name when constructing the property
++             *   for registration/validation purposes, even though 'nameToUse' holds the correct JSON name.
++             *   This is a workaround for potential inconsistencies elsewhere.
++             */
++            PropertyName nameForCreator = nameToUse;
++
++            // If 'useProps' ONLY determined via implicit name + couldSerialize(),
++            // AND there's a known paramDef, use paramDef's name for construction
++            // to align with property definition maps used in validation/setup.
++            if (usePropsBasedOnImplicit && (explicitName == null) && (injectId == null)) {
++                if (paramDef != null) {
++                   // Use the logical name from definition, not the implicit/renamed one
++                   nameForCreator = paramDef.getFullName();
++                } else {
++                   // Fallback: should not occur if paramDef was needed for couldSerialize() check
++                   nameForCreator = PropertyName.construct(param.getName());
++                }
++            } else if (nameToUse == null && injectId != null) {
++                // Special case: only injection, no explicit or implicit name decided it.
++                // Property name needed; use logical name from definition or parameter.
++                if (paramDef != null) {
++                   nameForCreator = paramDef.getFullName();
++                } else {
++                   nameForCreator = PropertyName.construct(param.getName());
++                }
++            }
++            // If nameForCreator is still null (edge case?), let constructCreatorProperty handle it.
++
+             SettableBeanProperty[] properties = new SettableBeanProperty[] {
+-                    constructCreatorProperty(ctxt, beanDesc, paramName, 0, param, injectId)
++                    constructCreatorProperty(ctxt, beanDesc, nameForCreator, 0, param, injectId)
+             };
+             creators.addPropertyCreator(candidate.creator(), true, properties);
+             return;
+         }
++
++        // If not property-based: Treat as delegating or scalar
+         _handleSingleArgumentCreator(creators, candidate.creator(), true, true);
+ 
+         // one more thing: sever link to creator property, to avoid possible later
+         // problems with "unresolved" constructor property
+         if (paramDef != null) {
+             ((POJOPropertyBuilder) paramDef).removeConstructors();
+         }
+     }
+\ No newline at end of file

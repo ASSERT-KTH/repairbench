@@ -1,0 +1,136 @@
+diff --git a/tmp/cd1b946f-717c-42a6-9ef3-03732c02e718_buggy.java b/tmp/c465bdd6-cfad-46f1-adc7-a3491722ca86_fixed.java
+index 233a867..bddff9d 100644
+--- a/tmp/cd1b946f-717c-42a6-9ef3-03732c02e718_buggy.java
++++ b/tmp/c465bdd6-cfad-46f1-adc7-a3491722ca86_fixed.java
+@@ -1,73 +1,106 @@
+   /**
+    * Determines whether a function can be inlined at a particular call site.
+    * There are several criteria that the function and reference must hold in
+    * order for the functions to be inlined:
+    * 1) If a call's arguments have side effects,
+    * the corresponding argument in the function must only be referenced once.
+    * For instance, this will not be inlined:
+    * <pre>
+    *     function foo(a) { return a + a }
+    *     x = foo(i++);
+    * </pre>
++   * 2) If the function body has side effects, arguments that might be affected
++   * by those side effects (e.g. are not literals or local variables) must
++   * not be used within the function body, as the order of evaluation would
++   * change.
++   * For instance, this will not be inlined:
++   * <pre>
++   *     function foo(a) { x=1; return a; }
++   *     y = foo(x); // x might be changed by x=1 before being used.
++   * </pre>
+    */
+   private CanInlineResult canInlineReferenceDirectly(
+       Node callNode, Node fnNode) {
+     if (!isDirectCallNodeReplacementPossible(fnNode)) {
+       return CanInlineResult.NO;
+     }
+ 
+     Node block = fnNode.getLastChild();
+-
++    // Check for side effects in the function body. This check is potentially expensive,
++    // so we do it once outside the loop.
++    boolean functionBodyHasSideEffects = NodeUtil.mayHaveSideEffects(block, compiler);
+ 
+     // CALL NODE: [ NAME, ARG1, ARG2, ... ]
+     Node cArg = callNode.getFirstChild().getNext();
+ 
+     // Functions called via 'call' and 'apply' have a this-object as
+     // the first parameter, but this is not part of the called function's
+-    // parameter list.
++    // parameter list. Adjust cArg accordingly.
+     if (!callNode.getFirstChild().isName()) {
+       if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
++        // TODO(johnlenz): Support replace this with a value. Currently,
++        // if 'this' is passed explicitly and it's not the global 'this',
++        // we don't inline.
+         if (cArg == null || !cArg.isThis()) {
+           return CanInlineResult.NO;
+         }
++        // Skip the 'this' argument.
+         cArg = cArg.getNext();
+       } else {
+         // ".apply" call should be filtered before this.
+         Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+       }
+     }
+ 
+     // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+     Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+-    while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
++
++    // Iterate through parameters and arguments simultaneously.
++    while (fnParam != null || cArg != null) {
++      // Check constraints on the current parameter and argument pair.
++      if (fnParam != null && cArg != null) {
++        String paramName = fnParam.getString();
++        // If the parameter is unused, skip side effect checks for this pair.
++        // An unused parameter does not cause the argument to be evaluated more
++        // than once, nor does it matter if side effects in the body change
++        // the argument value before the parameter is used (since it isn't used).
++        int refCount = NodeUtil.getNameReferenceCount(block, paramName);
++        if (refCount > 0) {
++            // Rule 1: If argument evaluation has side effects, the parameter must be used at most once.
++            // Note: refCount > 0 is checked above, so we only need check > 1 here.
++            if (NodeUtil.mayHaveSideEffects(cArg, compiler) && refCount > 1) {
++                return CanInlineResult.NO;
++            }
++
++            // Rule 2: If function body has side-effects, and this parameter is used,
++            // the argument must be something safe (like a literal or local variable)
++            // whose value cannot be affected by the function body's side effects
++            // before the parameter is used. Approximated by evaluatesToLocalValue.
++            // This prevents Issue 1101 where `f(a) { SIDE_EFFECT; USE a; }` called with
++            // `f(x)` could evaluate x differently after inlining.
++            if (functionBodyHasSideEffects && !NodeUtil.evaluatesToLocalValue(cArg)) {
++                return CanInlineResult.NO;
++            }
++        }
++      }
++
++      // Check constraints on extra arguments (passed but no corresponding parameter).
++      if (cArg != null && fnParam == null) {
++          // If an extra argument has side effects, its evaluation must be preserved.
++          // Direct inlining can't guarantee this, so disallow.
++          if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
++              return CanInlineResult.NO;
++          }
++      }
++
++      // Move to the next parameter and argument.
+       if (fnParam != null) {
+-        if (cArg != null) {
+-
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+-          if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
+-            return CanInlineResult.NO;
+-          }
+-        }
+-
+-        // Move to the next name.
+         fnParam = fnParam.getNext();
+       }
+-
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+       if (cArg != null) {
+-        if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+-          return CanInlineResult.NO;
+-        }
+         cArg = cArg.getNext();
+       }
+     }
+ 
+     return CanInlineResult.YES;
+   }
+\ No newline at end of file

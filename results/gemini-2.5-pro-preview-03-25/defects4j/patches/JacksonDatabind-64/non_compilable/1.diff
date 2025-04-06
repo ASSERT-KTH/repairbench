@@ -1,0 +1,212 @@
+diff --git a/tmp/646faee0-aa0a-44de-8106-e3a557c2b78b_buggy.java b/tmp/bdb6fc17-d3a6-4b12-a2c1-09efe3dbb8b2_fixed.java
+index 48fe2c7..e42b7cc 100644
+--- a/tmp/646faee0-aa0a-44de-8106-e3a557c2b78b_buggy.java
++++ b/tmp/bdb6fc17-d3a6-4b12-a2c1-09efe3dbb8b2_fixed.java
+@@ -1,133 +1,197 @@
+     /**
+      * @param contentTypeSer Optional explicit type information serializer
+      *    to use for contained values (only used for properties that are
+      *    of container type)
+      */
+     @SuppressWarnings("deprecation")
+     protected BeanPropertyWriter buildWriter(SerializerProvider prov,
+             BeanPropertyDefinition propDef, JavaType declaredType, JsonSerializer<?> ser,
+             TypeSerializer typeSer, TypeSerializer contentTypeSer,
+             AnnotatedMember am, boolean defaultUseStaticTyping)
+         throws JsonMappingException
+     {
+         // do we have annotation that forces type to use (to declared type or its super type)?
+         JavaType serializationType;
+         try {
+             serializationType = findSerializationType(am, defaultUseStaticTyping, declaredType);
+         } catch (JsonMappingException e) {
++            // XXX: maybe specify property name?
++            // 28-May-2018, tatu: As per [databind#2045], need to avoid NPE if `propDef == null`
++            if (propDef == null) {
++                return prov.reportBadDefinition(declaredType, e.getMessage());
++            }
+             return prov.reportBadPropertyDefinition(_beanDesc, propDef, e.getMessage());
+         }
+ 
+         // Container types can have separate type serializers for content (value / element) type
+         if (contentTypeSer != null) {
+             /* 04-Feb-2010, tatu: Let's force static typing for collection, if there is
+              *    type information for contents. Should work well (for JAXB case); can be
+              *    revisited if this causes problems.
+              */
+             if (serializationType == null) {
+ //                serializationType = TypeFactory.type(am.getGenericType(), _beanDesc.getType());
+                 serializationType = declaredType;
+             }
+             JavaType ct = serializationType.getContentType();
+             // Not exactly sure why, but this used to occur; better check explicitly:
+             if (ct == null) {
+-                prov.reportBadPropertyDefinition(_beanDesc, propDef,
++                // 03-Aug-2016, tatu: Let's allow this for non-container types, needed for cases like
++                //   [databind#1351] where annotation forces use of abstract type. May need to refine?
++                 // 13-Oct-2016, tatu: As per [databind#1417], this is probably too lax an allowal,
++                 //   made stricter.
++//                if (!declaredType.isContainerType()) { // related to [databind#1351] ?
++//                     ; // as per comment above, do accept
++//                } else {
++                    return prov.reportBadPropertyDefinition(_beanDesc, propDef,
+                             "serialization type "+serializationType+" has no content");
+-            }
++//                }
++            } else { // only apply on container types, usually(?)
+                  serializationType = serializationType.withContentTypeHandler(contentTypeSer);
+                  ct = serializationType.getContentType();
+             }
++        }
+ 
+         Object valueToSuppress = null;
+         boolean suppressNulls = false;
+ 
+         // 12-Jul-2016, tatu: [databind#1256] Need to make sure we consider type refinement
+         JavaType actualType = (serializationType == null) ? declaredType : serializationType;
+         
+         // 17-Aug-2016, tatu: Default inclusion covers global default (for all types), as well
+         //   as type-default for enclosing POJO. What we need, then, is per-type default (if any)
+         //   for declared property type... and finally property annotation overrides
+         JsonInclude.Value inclV = _config.getDefaultPropertyInclusion(actualType.getRawClass(),
+                 _defaultInclusion);
+ 
+         // property annotation override
+         
+         inclV = inclV.withOverrides(propDef.findInclusion());
+         JsonInclude.Include inclusion = inclV.getValueInclusion();
+ 
+         if (inclusion == JsonInclude.Include.USE_DEFAULTS) { // should not occur but...
+             inclusion = JsonInclude.Include.ALWAYS;
+         }
+         
+         switch (inclusion) {
+         case NON_DEFAULT:
+             // 11-Nov-2015, tatu: This is tricky because semantics differ between cases,
+             //    so that if enclosing class has this, we may need to access values of property,
+             //    whereas for global defaults OR per-property overrides, we have more
+             //    static definition. Sigh.
+             // First: case of class/type specifying it; try to find POJO property defaults
+ 
+             // 16-Oct-2016, tatu: Note: if we can not for some reason create "default instance",
+             //    revert logic to the case of general/per-property handling, so both
+             //    type-default AND null are to be excluded.
+             //    (as per [databind#1417]
+             if (_useRealPropertyDefaults) {
+                  // 07-Sep-2016, tatu: may also need to front-load access forcing now
+-                if (prov.isEnabled(MapperFeature.CAN_OVERRIDE_ACCESS_MODIFIERS)) {
+-                    am.fixAccess(_config.isEnabled(MapperFeature.OVERRIDE_PUBLIC_ACCESS_MODIFIERS));
++                 // 23-Jul-2018, tatu: [databind#1998]: During build phase, CAN_OVERRIDE_ACCESS_MODIFIERS
++                 //    must be forced
++                 final boolean canOverrideAcc = _config.canOverrideAccessModifiers();
++                 final boolean forceAccess = canOverrideAcc
++                         && _config.isEnabled(MapperFeature.OVERRIDE_PUBLIC_ACCESS_MODIFIERS);
++                if (canOverrideAcc) {
++                    am.fixAccess(forceAccess);
+                 }
+-                valueToSuppress = getPropertyDefaultValue(propDef.getName(), am, actualType);
+-            } else {
++                // NOTE: needs to be called BEFORE determining `valueToSuppress`, to force access
++                // to check exceptions etc
++                Object bean;
++                try {
++                    bean = (_defaultBean == null) ? null : _defaultBean.value;
++                } catch (Exception e) {
++                    return prov.reportBadDefinition(_beanDesc.getType(),
++                            String.format("Failed to access default instance of type %s to check for default value of property '%s': %s",
++                                    _beanDesc.getType(), propDef.getName(), e.getMessage()),
++                            e);
++                }
++                // If we couldn't obtain the default bean, fall back to static default for type
++                // which is what [databind#1417] calls for
++                if (bean == null) {
+                      valueToSuppress = getDefaultValue(actualType);
+                      suppressNulls = true;
++                } else {
++                    valueToSuppress = getPropertyDefaultValue(propDef.getName(), am, bean);
+                 }
++            } else {
++                // When not using "real" defaults, find statically defined one for type
++                valueToSuppress = getDefaultValue(actualType);
++                // [databind#1351] / [databind#1417]: Should not force null-suppression here
++//                suppressNulls = true; // NO! Let below check handle it
++            }
++
++            // And if default value is null, we assume explicit handling for nulls is needed
++            // (we don't represent null default value with 'valueToSuppress')
+             if (valueToSuppress == null) {
+                 suppressNulls = true;
+             } else {
+                 if (valueToSuppress.getClass().isArray()) {
+                     valueToSuppress = ArrayBuilders.getArrayComparator(valueToSuppress);
+                 }
+             }
+             break;
+         case NON_ABSENT: // new with 2.6, to support Guava/JDK8 Optionals
+             // always suppress nulls
+             suppressNulls = true;
+             // and for referential types, also "empty", which in their case means "absent"
+             if (actualType.isReferenceType()) {
+                 valueToSuppress = BeanPropertyWriter.MARKER_FOR_EMPTY;
+             }
+             break;
+         case NON_EMPTY:
+             // always suppress nulls
+             suppressNulls = true;
+             // but possibly also 'empty' values:
+             valueToSuppress = BeanPropertyWriter.MARKER_FOR_EMPTY;
+             break;
+         case NON_NULL:
+             suppressNulls = true;
+             // fall through
+         case ALWAYS: // default
+         default:
+             // we may still want to suppress empty collections, as per [JACKSON-254]:
+-            if (actualType.isContainerType()
++            // 08-Nov-2015, tatu: Except if based on concrete type, should apply?
++            // 21-May-2016, tatu: Also, should not block potentially custom check for emptiness
++            //    via `JsonSerializer.isEmpty()`...
++             // Let's do this: only check for empty containers if property type is container OR content type is specified.
++            // 28-Oct-2016, tatu: As per [databind#1402], need to allow underlying serializer
++            //    to indicate emptiness, regardless of declared type. The most straightforward
++            //     way is to simply use marker value...
++            if (actualType.isContainerType() // probably redundant check; contentType check is enough?
+                     && !_config.isEnabled(SerializationFeature.WRITE_EMPTY_JSON_ARRAYS)) {
+                 valueToSuppress = BeanPropertyWriter.MARKER_FOR_EMPTY;
+             }
+             break;
+         }
+-        BeanPropertyWriter bpw = new BeanPropertyWriter(propDef,
+-                am, _beanDesc.getClassAnnotations(), declaredType,
++
++        // 21-Aug-2018, tatu: Crap. Need access to `ConfigOverride` for property...
++        // TODO: Fix me! Probably need to pass from `BasicBeanDescription`?
++        // Needs to be done AFTER inclusion check, but BEFORE BeanPropertyWriter is created.
++        /*
++        Boolean propUseStatic = null;
++        PropertyMetadata md = propDef.getMetadata();
++        if (md != null) {
++             propUseStatic = md.getMergeInfo().useStatic;
++        }
++        if (propUseStatic == null) {
++             ConfigOverride co = _config.findConfigOverride(actualType.getRawClass());
++             propUseStatic = co.getMergeInfo().useStatic;
++        }
++        */
++        
++        BeanPropertyWriter bpw = _constructWriter(prov, propDef, am, declaredType,
+                 ser, typeSer, serializationType, suppressNulls, valueToSuppress);
+ 
+         // How about custom null serializer?
+         Object serDef = _annotationIntrospector.findNullSerializer(am);
+         if (serDef != null) {
+             bpw.assignNullSerializer(prov.serializerInstance(am, serDef));
+         }
+         // And then, handling of unwrapping
+         NameTransformer unwrapper = _annotationIntrospector.findUnwrappingNameTransformer(am);
+         if (unwrapper != null) {
+             bpw = bpw.unwrappingWriter(unwrapper);
+         }
+         return bpw;
+     }
+\ No newline at end of file

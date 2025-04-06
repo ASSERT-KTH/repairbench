@@ -1,0 +1,191 @@
+diff --git a/tmp/333b9372-0643-4156-90b7-104576565344_buggy.java b/tmp/c12a7734-d218-40d8-b18a-f446bf5e1e7f_fixed.java
+index 9240541..ff96c69 100644
+--- a/tmp/333b9372-0643-4156-90b7-104576565344_buggy.java
++++ b/tmp/c12a7734-d218-40d8-b18a-f446bf5e1e7f_fixed.java
+@@ -1,121 +1,177 @@
+     private Position decodePosition(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         int status = buf.readUnsignedShort();
+ 
+         position.setValid(BitUtil.check(status, 15));
+ 
+         position.set(Position.KEY_STATUS, status);
+         position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+         int event = buf.readUnsignedShort();
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, event);
+ 
+         String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
++        try {
+             DateBuilder dateBuilder = new DateBuilder()
+                     .setYear(Integer.parseInt(time.substring(0, 2)))
+                     .setMonth(Integer.parseInt(time.substring(2, 4)))
+                     .setDay(Integer.parseInt(time.substring(4, 6)))
+                     .setHour(Integer.parseInt(time.substring(6, 8)))
+                     .setMinute(Integer.parseInt(time.substring(8, 10)))
+                     .setSecond(Integer.parseInt(time.substring(10, 12)));
+             position.setTime(dateBuilder.getDate());
++        } catch (NumberFormatException e) {
++            Log.warning("Failed to parse time: " + time, e);
++            // Continue without time if parsing fails
++        }
++
+ 
+         position.setLongitude(buf.readInt() * 0.00001);
+         position.setLatitude(buf.readInt() * 0.00001);
+ 
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+         position.setCourse(buf.readUnsignedShort());
+         position.setAltitude(buf.readUnsignedShort());
+ 
+-        position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
++        // This might be a trip odometer or partial value, potentially overwritten by subtype 0x0010
++        position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000L);
+ 
+         Network network = new Network();
+ 
+         while (buf.readableBytes() > 4) {
+             int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
++            int length = buf.readUnsignedShort() - 4; // Length includes subtype and length fields themselves
++            if (length < 0 || length > buf.readableBytes()) {
++                Log.warning("Invalid length for subtype " + subtype + ": " + (length + 4));
++                break; // Avoid IndexOutOfBoundsException
++            }
+             int endIndex = buf.readerIndex() + length;
+             switch (subtype) {
+                 case 0x0001:
+                     int coolantTemperature = buf.readUnsignedByte() - 40;
+                     if (coolantTemperature <= 215) {
+                         position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                     }
+                     int rpm = buf.readUnsignedShort();
+                     if (rpm <= 65535) {
+                         position.set(Position.KEY_RPM, rpm);
+                     }
+                     position.set("averageSpeed", buf.readUnsignedByte());
+                     buf.readUnsignedShort(); // interval fuel consumption
+                     position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
+                     position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+                     buf.readUnsignedInt(); // trip id
+                     if (buf.readerIndex() < endIndex) {
+                         position.set("adBlueLevel", buf.readUnsignedByte() * 0.4);
+                     }
+                     break;
+                 case 0x0005:
+                     position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+-                    position.set(Position.KEY_HDOP, buf.readUnsignedByte());
++                    position.set(Position.KEY_HDOP, buf.readUnsignedByte() * 0.1); // Adjust scale if needed
+                     buf.readUnsignedInt(); // run time
+                     break;
+                 case 0x0009:
+                     position.set(
+-                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
++                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim());
++                    break;
++                case 0x0010:
++                    // Total Odometer (usually in km)
++                    String odometerStr = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim();
++                    try {
++                        // Assuming the value is in kilometers, convert to meters (Traccar standard)
++                        position.set(Position.KEY_ODOMETER, Double.parseDouble(odometerStr) * 1000);
++                    } catch (NumberFormatException e) {
++                        Log.warning("Failed to parse odometer (subtype 0x0010): " + odometerStr, e);
++                    }
+                     break;
+                 case 0x0011:
+-                    position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
++                    position.set(Position.KEY_HOURS, UnitsConverter.msFromHours(buf.readUnsignedInt() * 0.05));
+                     break;
+                 case 0x0014:
+-                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
++                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() * 100.0 / 255.0);
+                     position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+                     position.set("airTemp", buf.readUnsignedByte() - 40);
+                     position.set("airFlow", buf.readUnsignedShort() * 0.01);
+-                    position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
++                    position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() * 100.0 / 255.0);
+                     break;
+                 case 0x0020:
+                     String[] cells = buf.readCharSequence(
+                             length, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String cell : cells) {
++                        if (cell.isEmpty()) {
++                            continue;
++                        }
+                         String[] values = cell.split("@");
++                        try {
++                            if (values.length >= 4) {
+                                 network.addCellTower(CellTower.from(
+                                         Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                         Integer.parseInt(values[2], 16), Long.parseLong(values[3], 16)));
++                            } else {
++                                Log.warning("Malformed cell tower string: " + cell);
++                            }
++                        } catch (NumberFormatException e) {
++                             Log.warning("Failed to parse cell tower: " + cell, e);
++                        }
+                     }
+                     break;
+                 case 0x0021:
+                     String[] points = buf.readCharSequence(
+                             length, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String point : points) {
++                         if (point.isEmpty()) {
++                            continue;
++                        }
+                         String[] values = point.split("@");
++                        try {
++                            if (values.length >= 2) {
+                                 network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
++                             } else {
++                                Log.warning("Malformed wifi access point string: " + point);
++                            }
++                        } catch (NumberFormatException e) {
++                            Log.warning("Failed to parse wifi access point: " + point, e);
++                        }
+                     }
+                     break;
+                 default:
++                    // Skip unknown subtype data
+                     buf.skipBytes(length);
+                     break;
+             }
++            // Ensure reader index is correctly positioned even if subtype handler had issues
++            if (buf.readerIndex() > endIndex) {
++                 Log.warning("Reader index (" + buf.readerIndex() + ") beyond expected end (" + endIndex + ") for subtype " + subtype);
++                 // Attempt recovery if possible, or just break if data seems corrupted
++                 if (endIndex >= buf.writerIndex()) { // Check if endIndex is valid
++                     buf.readerIndex(endIndex); // Try to reset to expected position
++                 } else {
++                     break; // Stop processing if end index is out of bounds
++                 }
++            } else {
+                 buf.readerIndex(endIndex);
+             }
++        }
+ 
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+-        sendResponse(channel, MSG_POSITION_RSP, index, null);
++        // Response might depend on the command type, ensure this is correct for MSG_POSITION
++        sendResponse(channel, remoteAddress, MSG_POSITION_RSP, index, null);
+ 
+         return position;
+     }
+\ No newline at end of file

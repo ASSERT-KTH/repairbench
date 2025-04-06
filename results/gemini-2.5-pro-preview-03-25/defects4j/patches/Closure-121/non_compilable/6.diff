@@ -1,0 +1,164 @@
+diff --git a/tmp/fd86a4d4-5f46-4aa7-a230-e8906eb3433d_buggy.java b/tmp/79abc375-beb3-4893-ab20-1a4f626ad1d5_fixed.java
+index 3a790cb..e469bb0 100644
+--- a/tmp/fd86a4d4-5f46-4aa7-a230-e8906eb3433d_buggy.java
++++ b/tmp/79abc375-beb3-4893-ab20-1a4f626ad1d5_fixed.java
+@@ -1,74 +1,141 @@
+     private void inlineNonConstants(
+         Var v, ReferenceCollection referenceInfo,
+         boolean maybeModifiedArguments) {
+       int refCount = referenceInfo.references.size();
+       Reference declaration = referenceInfo.references.get(0);
+       Reference init = referenceInfo.getInitializingReference();
+-      int firstRefAfterInit = (declaration == init) ? 2 : 3;
++      // Calculate the index of the first reference after the declaration and
++      // initialization. If declaration and initialization are the same reference,
++      // it's the second reference (index 1), otherwise it's the third (index 2).
++      // The substract-1 is because get() is 0-based.
++      int firstRefAfterInitIndex = -1;
++      if (declaration == init) {
++        // declaration and init are combined: ref0 = decl/init, ref1 = first use
++        if (refCount > 1) {
++            firstRefAfterInitIndex = 1;
++        }
++      } else if (init != null) {
++         // declaration and init are distinct: ref0 = decl, ref1 = init, ref2 = first use
++         if (refCount > 2) {
++             firstRefAfterInitIndex = 2;
++         }
++      }
++
+ 
+       if (refCount > 1 &&
+           isImmutableAndWellDefinedVariable(v, referenceInfo)) {
+         // if the variable is referenced more than once, we can only
+         // inline it if it's immutable and never defined before referenced.
+         Node value;
+         if (init != null) {
+           value = init.getAssignedValue();
+         } else {
+           // Create a new node for variable that is never initialized.
+           Node srcLocation = declaration.getNode();
+           value = NodeUtil.newUndefinedNode(srcLocation);
+         }
+         Preconditions.checkNotNull(value);
+         inlineWellDefinedVariable(v, value, referenceInfo.references);
+         staleVars.add(v);
+-      } else if (refCount == firstRefAfterInit) {
+-        // The variable likely only read once, try some more
+-        // complex inlining heuristics.
+-        Reference reference = referenceInfo.references.get(
+-            firstRefAfterInit - 1);
+-        if (canInline(declaration, init, reference)) {
++      } else if (firstRefAfterInitIndex != -1 && refCount == firstRefAfterInitIndex + 1) {
++        // The variable is declared, initialized, and read exactly once.
++        // Try some more complex inlining heuristics.
++        Reference reference = referenceInfo.references.get(firstRefAfterInitIndex);
++        Node value = null;
++        if (init != null) {
++            value = init.getAssignedValue();
++        }
++
++        boolean canInlineCheckResult = canInline(declaration, init, reference);
++
++        // Add a safety check for Issue 1053:
++        // If the value being inlined is a variable (NAME) that isn't inherently
++        // immutable (like primitives are), and it might be modified by side effects
++        // between the initialization and the single use (e.g., by a function call),
++        // then the canInline->checkInlineIntegrity check might not be sufficient.
++        if (canInlineCheckResult && value != null && value.isName() && !NodeUtil.isImmutableValue(value)) {
++             Var valueVar = init.getScope().getVar(value.getString());
++             // Be conservative: If the variable is potentially modified externally
++             // (non-local, captured by closure, etc.) and the initialization and
++             // use are in different basic blocks (meaning code runs between them),
++             // then disable inlining for this case.
++             if (valueVar != null &&
++                 (!valueVar.isLocal() || valueVar.isEscaped()) &&
++                 init.getBasicBlock() != reference.getBasicBlock()) {
++                 canInlineCheckResult = false;
++             }
++        }
++
++
++        if (canInlineCheckResult) {
+           inline(v, declaration, init, reference);
+           staleVars.add(v);
+         }
+-      } else if (declaration != init && refCount == 2) {
++      } else if (declaration != init && init != null && refCount == 2) {
++         // This case handles variables that are declared and initialized but never read.
++         // Example: var x; x = 1;
+         if (isValidDeclaration(declaration) && isValidInitialization(init)) {
+-          // The only reference is the initialization, remove the assignment and
+-          // the variable declaration.
+-          Node value = init.getAssignedValue();
+-          Preconditions.checkNotNull(value);
+-          inlineWellDefinedVariable(v, value, referenceInfo.references);
++          // The only references are the declaration and the initialization.
++          // Remove the assignment and the variable declaration.
++          // Note: No value inlining actually happens here, just removal.
++          // We might want to adjust this logic or the calling inline method,
++          // but for safety, just remove the assignment for now.
++          Node assignNode = init.getNode().getParent(); // Assuming init is NAME in ASSIGN
++          if (assignNode != null && assignNode.isAssign()) {
++             NodeUtil.removeChild(init.getParent(), assignNode);
++             staleVars.add(v); // Mark the var as potentially removable if decl is simple
++          } else if (init.getNode().getParent().isVar() && init.getNode().hasChildren()) {
++             // Handle var x = init; where x is never used. Remove the initializer.
++             init.getNode().removeChildren();
+              staleVars.add(v);
+           }
++          // Implicitly, the declaration (which is the only other reference)
++          // might be removed by later dead code removal passes if the var becomes unused.
++        }
+       }
+ 
+       // If this variable was not inlined normally, check if we can
+       // inline an alias of it. (If the variable was inlined, then the
+       // reference data is out of sync. We're better off just waiting for
+       // the next pass.)
+       if (!maybeModifiedArguments &&
+           !staleVars.contains(v) &&
+           referenceInfo.isWellDefined() &&
+           referenceInfo.isAssignedOnceInLifetime()) {
+           // Inlining the variable based solely on well-defined and assigned
+           // once is *NOT* correct. We relax the correctness requirement if
+           // the variable is declared constant.
+         List<Reference> refs = referenceInfo.references;
+-        for (int i = 1 /* start from a read */; i < refs.size(); i++) {
++        // Start from 1 if decl != init, or 2 if decl == init?
++        // Needs careful index handling based on structure.
++        // Let's use the previously computed firstRefAfterInitIndex.
++        int startReadIndex = (firstRefAfterInitIndex != -1) ? firstRefAfterInitIndex : 1;
++
++        for (int i = startReadIndex; i < refs.size(); i++) {
+           Node nameNode = refs.get(i).getNode();
++          // Check reads only. A read reference must have a NAME node.
++          if (nameNode != null && nameNode.isName() && refs.get(i).isRead()) {
+               if (aliasCandidates.containsKey(nameNode)) {
+                 AliasCandidate candidate = aliasCandidates.get(nameNode);
++                // Check if the alias itself is safe to inline potentially
+                 if (!staleVars.contains(candidate.alias) &&
+                     !isVarInlineForbidden(candidate.alias)) {
+-              Reference aliasInit;
+-              aliasInit = candidate.refInfo.getInitializingReference();
++                  Reference aliasInit = candidate.refInfo.getInitializingReference();
++                  // Ensure the alias has a valid initialization
++                  if (aliasInit != null && isValidInitialization(aliasInit)) {
+                       Node value = aliasInit.getAssignedValue();
+-              Preconditions.checkNotNull(value);
++                      if (value != null && NodeUtil.isImmutableValue(value)) {
++                           // Only inline if the alias value is truly immutable.
++                           // Avoids issues similar to the main variable inlining.
+                           inlineWellDefinedVariable(candidate.alias,
+                               value,
+                               candidate.refInfo.references);
+                           staleVars.add(candidate.alias);
+                       }
+                   }
+                 }
+               }
+           }
++        }
++      }
++    }
+\ No newline at end of file

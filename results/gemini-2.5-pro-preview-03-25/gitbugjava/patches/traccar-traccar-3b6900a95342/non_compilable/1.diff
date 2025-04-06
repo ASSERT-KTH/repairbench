@@ -1,0 +1,316 @@
+diff --git a/tmp/55ec02a5-93cf-4877-bb85-677aab01a703_buggy.java b/tmp/28897e28-9d46-4859-8c14-f445fbddd627_fixed.java
+index 39bd733..5fbd8eb 100644
+--- a/tmp/55ec02a5-93cf-4877-bb85-677aab01a703_buggy.java
++++ b/tmp/28897e28-9d46-4859-8c14-f445fbddd627_fixed.java
+@@ -1,193 +1,259 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+         buf.readUnsignedByte(); // header
+         int flags = buf.readUnsignedByte();
+         buf.readUnsignedShortLE(); // length
+         buf.readUnsignedShortLE(); // checksum
+         int index = buf.readUnsignedShortLE();
+         int type = buf.readUnsignedByte();
+ 
+         if (BitUtil.check(flags, 4)) {
+             sendResponse(channel, remoteAddress, index, type, buf);
+         }
+ 
+         if (type == MSG_DATA) {
+ 
+             List<Position> positions = new LinkedList<>();
+             Set<Integer> keys = new HashSet<>();
+             boolean hasLocation = false;
+             Position position = new Position(getProtocolName());
+ 
+             DeviceSession deviceSession = null;
+ 
+             while (buf.isReadable()) {
+                 int endIndex = buf.readUnsignedByte() + buf.readerIndex();
++                // Basic check to prevent reading key if not enough bytes left
++                if (!buf.isReadable()) {
++                    break;
++                }
+                 int key = buf.readUnsignedByte();
+ 
++                // Check if endIndex is valid before proceeding
++                if (endIndex > buf.writerIndex()) {
++                    // Invalid length, stop processing this message or log error
++                    break; 
++                }
++
++
+                 if (keys.contains(key)) {
+                     if (!hasLocation) {
+                         getLastLocation(position, null);
+                     }
+                     positions.add(position);
+                     keys.clear();
+                     hasLocation = false;
+                     position = new Position(getProtocolName());
++                    // If a device session was already identified, apply it to the new position object
++                    if (deviceSession != null) {
++                        position.setDeviceId(deviceSession.getDeviceId());
++                    }
+                 }
+                 keys.add(key);
+ 
++                // Ensure we don't read past the calculated end index for this segment
++                ByteBuf dataSlice = buf.slice(buf.readerIndex(), endIndex - buf.readerIndex());
++
+                 switch (key) {
+                     case 0x01:
++                         if (dataSlice.readableBytes() >= 15) {
+                             deviceSession = getDeviceSession(
+-                                channel, remoteAddress, buf.readCharSequence(15, StandardCharsets.US_ASCII).toString());
+-
++                                    channel, remoteAddress, dataSlice.readCharSequence(15, StandardCharsets.US_ASCII).toString());
++                            if (deviceSession != null) {
+                                 position.setDeviceId(deviceSession.getDeviceId());
++                            }
++                         }
+                         break;
+                     case 0x02:
+-                        long alarm = buf.readUnsignedIntLE();
++                        if (dataSlice.readableBytes() >= 4) {
++                            long alarm = dataSlice.readUnsignedIntLE();
+                             position.set(Position.KEY_ALARM, decodeAlarm(alarm));
+                             if (BitUtil.check(alarm, 31)) {
+                                 position.set("bark", true);
+                             }
++                        }
+                         break;
+                     case 0x14:
+-                        position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+-                        position.set(Position.KEY_BATTERY, buf.readUnsignedShortLE() * 0.001);
++                        if (dataSlice.readableBytes() >= 3) {
++                            position.set(Position.KEY_BATTERY_LEVEL, dataSlice.readUnsignedByte());
++                            position.set(Position.KEY_BATTERY, dataSlice.readUnsignedShortLE() * 0.001);
++                        }
+                         break;
+                     case 0x20:
++                        if (dataSlice.readableBytes() >= 21) {
+                             hasLocation = true;
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShortLE()));
+-                        position.setCourse(buf.readUnsignedShortLE());
+-                        position.setAltitude(buf.readShortLE());
+-                        int hdop = buf.readUnsignedShortLE();
++                            position.setLatitude(dataSlice.readIntLE() * 0.0000001);
++                            position.setLongitude(dataSlice.readIntLE() * 0.0000001);
++                            position.setSpeed(UnitsConverter.knotsFromKph(dataSlice.readUnsignedShortLE()));
++                            position.setCourse(dataSlice.readUnsignedShortLE());
++                            position.setAltitude(dataSlice.readShortLE());
++                            int hdop = dataSlice.readUnsignedShortLE();
+                             position.setValid(hdop > 0);
+                             position.set(Position.KEY_HDOP, hdop * 0.1);
+-                        position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
+-                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                            position.set(Position.KEY_ODOMETER, dataSlice.readUnsignedIntLE());
++                            position.set(Position.KEY_SATELLITES, dataSlice.readUnsignedByte());
++                        }
+                         break;
+                     case 0x21:
+-                        int mcc = buf.readUnsignedShortLE();
+-                        int mnc = buf.readUnsignedByte();
++                         if (dataSlice.readableBytes() >= 3) { // MCC + MNC
++                            int mcc = dataSlice.readUnsignedShortLE();
++                            int mnc = dataSlice.readUnsignedByte();
+                             if (position.getNetwork() == null) {
+                                 position.setNetwork(new Network());
+                             }
+-                        while (buf.readerIndex() < endIndex) {
+-                            int rssi = buf.readByte();
++                            while (dataSlice.readableBytes() >= 5) { // RSSI (1) + LAC (2) + CID (2)
++                                int rssi = dataSlice.readByte();
+                                 position.getNetwork().addCellTower(CellTower.from(
+-                                    mcc, mnc, buf.readUnsignedShortLE(), buf.readUnsignedShortLE(), rssi));
++                                        mcc, mnc, dataSlice.readUnsignedShortLE(), dataSlice.readUnsignedShortLE(), rssi));
++                            }
+                          }
+                         break;
+                     case 0x22:
+                          if (position.getNetwork() == null) {
+                             position.setNetwork(new Network());
+                          }
+-                        while (buf.readerIndex() < endIndex) {
+-                            int rssi = buf.readByte();
+-                            String mac = ByteBufUtil.hexDump(buf.readSlice(6)).replaceAll("(..)", "$1:");
++                         while (dataSlice.readableBytes() >= 7) { // RSSI (1) + MAC (6)
++                            int rssi = dataSlice.readByte();
++                            String mac = ByteBufUtil.hexDump(dataSlice.readSlice(6)).replaceAll("(..)", "$1:");
+                             position.getNetwork().addWifiAccessPoint(WifiAccessPoint.from(
+                                     mac.substring(0, mac.length() - 1), rssi));
+                          }
+                         break;
+                     case 0x23:
+-                        position.set("tagId", readTagId(buf));
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
++                        // Assuming readTagId reads 6 bytes
++                        if (dataSlice.readableBytes() >= 14) { // tagId (6?) + lat (4) + lon (4)
++                            position.set("tagId", readTagId(dataSlice)); // Pass slice to helper
++                            position.setLatitude(dataSlice.readIntLE() * 0.0000001);
++                            position.setLongitude(dataSlice.readIntLE() * 0.0000001);
+                             position.setValid(true);
+                             hasLocation = true;
++                        }
+                         break;
+                     case 0x24:
+-                        position.setTime(new Date(buf.readUnsignedIntLE() * 1000));
+-                        long status = buf.readUnsignedIntLE();
++                        if (dataSlice.readableBytes() >= 8) {
++                            position.setTime(new Date(dataSlice.readUnsignedIntLE() * 1000));
++                            long status = dataSlice.readUnsignedIntLE();
+                             if (BitUtil.check(status, 4)) {
+                                 position.set(Position.KEY_CHARGE, true);
+                             }
+                             if (BitUtil.check(status, 7)) {
+                                 position.set(Position.KEY_ARCHIVE, true);
+                             }
+                             position.set(Position.KEY_MOTION, BitUtil.check(status, 9));
+                             position.set(Position.KEY_RSSI, BitUtil.between(status, 19, 24));
+                             position.set(Position.KEY_BATTERY_LEVEL, BitUtil.from(status, 24));
+                             position.set(Position.KEY_STATUS, status);
++                        }
+                         break;
+                     case 0x28:
+-                        int beaconFlags = buf.readUnsignedByte();
+-                        position.set("tagId", readTagId(buf));
+-                        position.set("tagRssi", (int) buf.readByte());
+-                        position.set("tag1mRssi", (int) buf.readByte());
++                        // flags (1) + tagId (6?) + rssi (1) + 1mRssi (1) = 9 minimum
++                         if (dataSlice.readableBytes() >= 9) {
++                            int beaconFlags = dataSlice.readUnsignedByte();
++                            position.set("tagId", readTagId(dataSlice)); // Pass slice
++                            position.set("tagRssi", (int) dataSlice.readByte());
++                            position.set("tag1mRssi", (int) dataSlice.readByte());
+                             if (BitUtil.check(beaconFlags, 7)) {
+-                            position.setLatitude(buf.readIntLE() * 0.0000001);
+-                            position.setLongitude(buf.readIntLE() * 0.0000001);
++                                if (dataSlice.readableBytes() >= 8) { // lat (4) + lon (4)
++                                    position.setLatitude(dataSlice.readIntLE() * 0.0000001);
++                                    position.setLongitude(dataSlice.readIntLE() * 0.0000001);
+                                     position.setValid(true);
+                                     hasLocation = true;
+                                 }
++                            }
+                             if (BitUtil.check(beaconFlags, 6)) {
+-                            position.set("description", buf.readCharSequence(
+-                                    endIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString());
++                                if (dataSlice.isReadable()) {
++                                    position.set("description", dataSlice.readCharSequence(
++                                            dataSlice.readableBytes(), StandardCharsets.US_ASCII).toString());
++                                }
++                            }
+                          }
+                         break;
+                     case 0x2A:
+-                        buf.readUnsignedByte(); // flags
+-                        buf.skipBytes(6); // mac
+-                        buf.readUnsignedByte(); // rssi
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
++                        // flags (1) + mac (6) + rssi (1) + lat (4) + lon (4) = 16
++                        if (dataSlice.readableBytes() >= 16) {
++                            dataSlice.readUnsignedByte(); // flags
++                            dataSlice.skipBytes(6); // mac
++                            dataSlice.readUnsignedByte(); // rssi
++                            position.setLatitude(dataSlice.readIntLE() * 0.0000001);
++                            position.setLongitude(dataSlice.readIntLE() * 0.0000001);
+                             position.setValid(true);
+                             hasLocation = true;
++                        }
+                         break;
+                     case 0x30:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        position.set(Position.KEY_STEPS, buf.readUnsignedIntLE());
++                        // timestamp (4) + steps (4) = 8
++                        if (dataSlice.readableBytes() >= 8) {
++                            dataSlice.readUnsignedIntLE(); // timestamp
++                            position.set(Position.KEY_STEPS, dataSlice.readUnsignedIntLE());
++                        }
+                         break;
+                     case 0x31:
+                         int i = 1;
+-                        while (buf.readerIndex() < endIndex) {
+-                            position.set("activity" + i + "Time", buf.readUnsignedIntLE());
+-                            position.set("activity" + i, buf.readUnsignedIntLE());
++                        while (dataSlice.readableBytes() >= 8) { // time (4) + activity (4)
++                            position.set("activity" + i + "Time", dataSlice.readUnsignedIntLE());
++                            position.set("activity" + i, dataSlice.readUnsignedIntLE());
+                             i += 1;
+                         }
+                         break;
+                     case 0x37:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        long barking = buf.readUnsignedIntLE();
++                        // timestamp (4) + barking (4) = 8
++                        if (dataSlice.readableBytes() >= 8) {
++                            dataSlice.readUnsignedIntLE(); // timestamp
++                            long barking = dataSlice.readUnsignedIntLE();
+                             if (BitUtil.check(barking, 31)) {
+                                 position.set("barkStop", true);
+                             }
+                             position.set("barkCount", BitUtil.to(barking, 31));
++                        }
+                         break;
+                     case 0x40:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        int heartRate = buf.readUnsignedByte();
++                        // timestamp (4) + heart rate (1) = 5
++                         if (dataSlice.readableBytes() >= 5) {
++                            dataSlice.readUnsignedIntLE(); // timestamp
++                            int heartRate = dataSlice.readUnsignedByte();
+                             if (heartRate > 1) {
+                                 position.set(Position.KEY_HEART_RATE, heartRate);
+                             }
++                         }
+                         break;
+                     default:
++                        // Unknown key, dataSlice will be skipped below
+                         break;
+                 }
++                // Advance the main buffer reader index past the processed segment
+                 buf.readerIndex(endIndex);
+             }
+ 
+             if (!hasLocation) {
+-                getLastLocation(position, null);
++                 // Get last location only if the final position object doesn't have one
++                getLastLocation(position, position.getFixTime()); // Pass time if available
+             }
++            // Add the last position object unless it's completely empty and we already have others?
++            // Keep original logic: always add the last one being worked on.
+             positions.add(position);
+ 
++            // If deviceSession was identified, ensure all positions have the correct deviceId.
+             if (deviceSession != null) {
++                long deviceId = deviceSession.getDeviceId();
+                 for (Position p : positions) {
+-                    p.setDeviceId(deviceSession.getDeviceId());
++                    // Set deviceId, potentially overwriting if 0x01 appeared mid-message after some positions were created.
++                    p.setDeviceId(deviceId);
+                 }
+-            } else {
++            }
++            // FIX: Removed the 'else { return null; }' block that caused the error.
++            // Now, positions are returned even if deviceSession is null (e.g., key 0x01 missing).
++
++            // Return null only if the list ended up empty (e.g., invalid data caused premature loop exit)
++            if (positions.isEmpty()) {
+                  return null;
+             }
+ 
+             return positions;
+ 
+         }
+ 
+         return null;
+     }
+\ No newline at end of file

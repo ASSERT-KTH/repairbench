@@ -1,0 +1,152 @@
+diff --git a/tmp/57d91c09-84de-46a6-b211-3a1070f76455_buggy.java b/tmp/5607f905-9cef-46d9-a403-f451e1fa460d_fixed.java
+index d926eea..751545e 100644
+--- a/tmp/57d91c09-84de-46a6-b211-3a1070f76455_buggy.java
++++ b/tmp/5607f905-9cef-46d9-a403-f451e1fa460d_fixed.java
+@@ -1,48 +1,121 @@
+     @Override
+     public JsonSerializer<?> createContextual(SerializerProvider serializers,
+             BeanProperty property) throws JsonMappingException
+     {
+         if (property == null) {
+             return this;
+         }
+         JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+         if (format == null) {
++            // If no overrides, and currently configured for timestamp, should revert to default format
++            // (see [databind#2407])
++            if ((_useTimestamp != null) && _useTimestamp.booleanValue()) {
++                 // Let's assume null format means "use standard"
++                 return withFormat(Boolean.FALSE, null);
++            }
+             return this;
+         }
++
+         // Simple case first: serialize as numeric timestamp?
+         JsonFormat.Shape shape = format.getShape();
+         if (shape.isNumeric()) {
+-            return withFormat(Boolean.TRUE, null);
++            // If specifying that shape, and not already configured similarly, create new
++            // NOTE: `_useTimestamp` is `Boolean`, not `boolean`, can be null
++            Boolean useTimestamp = Boolean.TRUE;
++            // Use Objects.equals() for null-safe comparison
++            if (java.util.Objects.equals(_useTimestamp, useTimestamp)) {
++                return this;
++            }
++            return withFormat(useTimestamp, null);
+         }
+ 
+-        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+-        // First: custom pattern will override things
+-                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+-                                || format.hasLocale() || format.hasTimeZone()) {
+-                    TimeZone tz = format.getTimeZone();
+-                    final String pattern = format.hasPattern()
+-                                    ? format.getPattern()
+-                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+-            final Locale loc = format.hasLocale()
+-                            ? format.getLocale()
+-                            : serializers.getLocale();
+-                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+-                    if (tz == null) {
+-                        tz = serializers.getTimeZone();
+-                    }
+-            df.setTimeZone(tz);
+-            return withFormat(Boolean.FALSE, df);
++        // Otherwise, need to figure out format String:
++        // If shape explicitly defined as STRING, definitely not timestamp.
++        // Otherwise depends on defaults... Assume null means "default" for timestamp
++        final Boolean useTimestamp = (shape == JsonFormat.Shape.STRING) ? Boolean.FALSE : null;
++        final TimeZone tz = format.getTimeZone();
++        final Locale loc = format.hasLocale() ? format.getLocale() : serializers.getLocale();
++        final String pattern = format.hasPattern() ? format.getPattern() : null;
++        DateFormat df = null; // The new DateFormat to use, if different from current
++
++        // Case 1: Annotation specified pattern: create new SimpleDateFormat
++        if (pattern != null && pattern.length() > 0) {
++            df = new SimpleDateFormat(pattern, loc);
++            // Timezone override? If annotation did not specify, use SerializerProvider's default.
++            TimeZone actualTz = (tz == null) ? serializers.getTimeZone() : tz;
++            df.setTimeZone(actualTz);
++        }
++        // Case 2: No pattern, but Locale or TimeZone specified in annotation
++        else if (format.hasLocale() || tz != null) {
++            // Need to base modifications on the existing format (`_customFormat` or global default)
++            DateFormat baseFormat = _customFormat;
++            if (baseFormat == null) {
++                baseFormat = serializers.getConfig().getDateFormat();
+             }
+ 
+-        // Otherwise, need one of these changes:
++            // Special handling for StdDateFormat (which is immutable wrt configuration)
++            if (baseFormat instanceof StdDateFormat) {
++                StdDateFormat std = (StdDateFormat) baseFormat;
++                // Apply overrides if specified in annotation
++                if (tz != null) {
++                    std = std.withTimeZone(tz);
++                }
++                // Use format.hasLocale() to check if annotation explicitly set locale
++                if (format.hasLocale()) {
++                    std = std.withLocale(loc);
++                }
++                df = std;
++            }
++            // Otherwise, assume SimpleDateFormat or similar cloneable/modifiable
++            else {
++                // We must have a SimpleDateFormat, or we cannot proceed
++                if (!(baseFormat instanceof SimpleDateFormat)) {
++                    // Cannot reliably modify locale/timezone for unknown DateFormat types
++                    serializers.reportBadDefinition(handledType(), String.format(
++                            "Cannot modify existing format (%s) configured via `ObjectMapper.setDateFormat()`: not a SimpleDateFormat instance",
++                            baseFormat.getClass().getName()));
++                    return this; // Return unmodified serializer as a fallback
++                }
+ 
++                // Clone the base SimpleDateFormat to allow modification
++                SimpleDateFormat sdf = (SimpleDateFormat) baseFormat.clone();
+ 
+-        // Jackson's own `StdDateFormat` is quite easy to deal with...
++                // Apply TimeZone override. Use annotation's TZ if present, otherwise SerializerProvider's default.
++                // This aligns with behavior when pattern IS specified.
++                TimeZone actualTz = (tz != null) ? tz : serializers.getTimeZone();
++                sdf.setTimeZone(actualTz);
+ 
+-        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+-        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+-        //    So: require it be `SimpleDateFormat`; can't config other types
+-//            serializers.reportBadDefinition(handledType(), String.format(
+-            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
++                // Apply Locale override (requires recreation for SimpleDateFormat)
++                if (format.hasLocale()) {
++                    // Recreate SimpleDateFormat with the original pattern but new Locale
++                    sdf = new SimpleDateFormat(sdf.toPattern(), loc);
++                    // Reapply the effective timezone as recreation might reset it
++                    sdf.setTimeZone(actualTz);
++                }
++                df = sdf;
++            }
++        }
++        // Case 3: Shape is explicitly STRING, but no pattern/locale/timezone overrides in annotation
++        else if (shape == JsonFormat.Shape.STRING) {
++             // Use the default string format. If already configured for string format, no change needed.
++             if (_useTimestamp == null || !_useTimestamp.booleanValue()) { // Already using string format?
++                 // If _customFormat is null, using global default string format -> OK
++                 // If _customFormat is non-null, using that specific string format -> OK
++                return this;
++            }
++            // Need to switch from timestamp to the default string format.
++            // `withFormat(Boolean.FALSE, null)` should handle reverting to the default.
++            return withFormat(Boolean.FALSE, null);
++        } else {
++             // No overrides relevant to string formatting, and shape wasn't explicitly STRING. Return self.
+              return this;
+         }
++
++        // Check if the resulting configuration (useTimestamp, df) is the same as the current one
++        // Use Objects.equals for null-safe comparison
++        if (java.util.Objects.equals(useTimestamp, _useTimestamp) && java.util.Objects.equals(df, _customFormat)) {
++             return this; // No change needed
++        }
++        // If configuration changed, return a new serializer instance with the modifications
++        return withFormat(useTimestamp, df);
++    }
+\ No newline at end of file

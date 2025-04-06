@@ -1,0 +1,272 @@
+diff --git a/tmp/44dabc02-2e30-446a-b393-b1f9316f03d4_buggy.java b/tmp/9663953b-9c8d-4954-a37b-72bd568e8cc7_fixed.java
+index 6f24eb6..91934dc 100644
+--- a/tmp/44dabc02-2e30-446a-b393-b1f9316f03d4_buggy.java
++++ b/tmp/9663953b-9c8d-4954-a37b-72bd568e8cc7_fixed.java
+@@ -1,99 +1,202 @@
++import com.google.javascript.jscomp.AbstractCompiler; // Assuming these imports
++import com.google.javascript.jscomp.CheckLevel;
++import com.google.javascript.jscomp.DiagnosticType;
++import com.google.javascript.jscomp.JSError;
++import com.google.javascript.jscomp.NodeTraversal;
++import com.google.javascript.jscomp.Scope;
++import com.google.javascript.jscomp.TypeValidator;
++import com.google.javascript.rhino.JSDocInfo;
++import com.google.javascript.rhino.JSDocInfo.Visibility;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.Token;
++import com.google.javascript.rhino.jstype.FunctionType;
++import com.google.javascript.rhino.jstype.JSType;
++import com.google.javascript.rhino.jstype.ObjectType;
++import javax.annotation.Nullable; // Assuming nullable annotations
++
++// Assume fields like compiler, validator, currentClass are available in the class containing this method
++// Assume helper methods dereference, isValidPrivateConstructorAccess exist
++// Assume DiagnosticType constants BAD_PRIVATE_PROPERTY_ACCESS, BAD_PROTECTED_PROPERTY_ACCESS,
++// PRIVATE_OVERRIDE, VISIBILITY_MISMATCH are defined in the class or accessible.
++
++  /** Helper to normalize a type for comparisons involving classes and prototypes. */
++  private JSType normalizeClassType(@Nullable ObjectType objectType) {
++    if (objectType == null) {
++      return null;
++    }
++    // If it's a prototype, get the function it's the prototype of.
++    if (objectType.isFunctionPrototypeType() && objectType.getOwnerFunction() != null) {
++      return objectType.getOwnerFunction();
++    }
++    // If it's an instance, get its constructor.
++    FunctionType constructor = objectType.getConstructor();
++    if (constructor != null) {
++        return constructor;
++    }
++    // Otherwise, return the type itself (e.g., if it's already a constructor)
++    return objectType;
++  }
++
+   /**
+    * Determines whether the given property is visible in the current context.
+    * @param t The current traversal.
+    * @param getprop The getprop node.
++   * @param parent The parent of the getprop node.
+    */
+   private void checkPropertyVisibility(NodeTraversal t,
+       Node getprop, Node parent) {
+-    ObjectType objectType =
+-        ObjectType.cast(dereference(getprop.getFirstChild().getJSType()));
++    Node objectNode = getprop.getFirstChild();
++    // Use JSType directly, as dereference might handle union types etc.
++    // Use restrictByNotNullOrUndefined to handle potential null/undefined in unions.
++    JSType jsType = objectNode.getJSType();
++    if (jsType == null) {
++        return; // Not enough type info
++    }
++    // If the type is a union, check each type in the union.
++    // For simplicity here, we focus on the object type part. A full solution might iterate.
++    ObjectType objectType = ObjectType.cast(jsType.restrictByNotNullOrUndefined());
++
++    if (objectType == null) {
++      // If the type is not an object after restricting, we can't check visibility.
++      return;
++    }
++
+     String propertyName = getprop.getLastChild().getString();
+ 
+-    if (objectType != null) {
+-      // Is this a normal property access, or are we trying to override
+-      // an existing property?
+-      boolean isOverride = t.inGlobalScope() &&
+-          parent.getType() == Token.ASSIGN &&
+-          parent.getFirstChild() == getprop;
+-
+-      // Find the lowest property defined on a class with visibility
+-      // information.
+-      if (isOverride) {
+-        objectType = objectType.getImplicitPrototype();
++    boolean isAssign = parent.getType() == Token.ASSIGN && parent.getFirstChild() == getprop;
++
++    // --- Override Check ---
++    // Check happens ONLY if this is an assignment.
++    if (isAssign) {
++      ObjectType proto = objectType.getImplicitPrototype();
++      JSDocInfo superDocInfo = null;
++      ObjectType superOwnerType = null;
++
++      // Find the property definition on the superclass hierarchy.
++      for (; proto != null; proto = proto.getImplicitPrototype()) {
++        superDocInfo = proto.getOwnPropertyJSDocInfo(propertyName);
++        if (superDocInfo != null &&
++            superDocInfo.getVisibility() != Visibility.INHERITED) {
++          superOwnerType = proto;
++          break;
++        }
++      }
++
++      // If we are overriding a property defined on a superclass...
++      if (superOwnerType != null) {
++        Visibility superVisibility = superDocInfo.getVisibility();
++        boolean superInDifferentFile = !t.getInput().getName().equals(superDocInfo.getSourceName());
++        // isPrototypeAssign specifically checks for assignments like Foo.prototype.bar = ... in global scope
++        boolean isPrototypeAssign = t.inGlobalScope() && isAssign;
++
++        // Check 1: Overriding a @private property from a different file.
++        if (superVisibility == Visibility.PRIVATE && superInDifferentFile) {
++            // Report PRIVATE_OVERRIDE for 'this.prop = ...' cases (isPrototypeAssign=false)
++            // but skip for 'Class.prototype.prop = ...' cases (isPrototypeAssign=true),
++            // letting the Access Check below report BAD_PRIVATE_PROPERTY_ACCESS instead, per test expectations.
++            if (!isPrototypeAssign) {
++                 compiler.report(
++                     t.makeError(getprop, PRIVATE_OVERRIDE,
++                         propertyName, superOwnerType.toString()));
++                 return; // Disallow this override.
++            }
++            // If it IS isPrototypeAssign, we skip the PRIVATE_OVERRIDE report here and proceed.
++        }
++
++        // Check 2: Visibility mismatch.
++        JSDocInfo overridingInfo = parent.getJSDocInfo(); // JSDoc on the ASSIGN node
++        // Also consider JSDoc directly on the overriding property, e.g., @private this.foo = ...
++        // The 'objectType' represents the type being assigned to (e.g., SubFoo instance or SubFoo.prototype)
++        JSDocInfo localDocInfo = objectType.getOwnPropertyJSDocInfo(propertyName);
++        // Prefer JSDoc on the ASSIGN node if present, otherwise use JSDoc on the property itself.
++        JSDocInfo effectiveOverridingInfo = (overridingInfo != null) ? overridingInfo : localDocInfo;
++
++        // Determine the overriding visibility, defaulting to INHERITED if none specified.
++        Visibility overridingVisibility = Visibility.INHERITED;
++        if (effectiveOverridingInfo != null && effectiveOverridingInfo.getVisibility() != Visibility.INHERITED) {
++            overridingVisibility = effectiveOverridingInfo.getVisibility();
++        }
++
++
++        // We only report mismatch if the overriding property has an *explicit* visibility
++        // that differs from the super property's visibility.
++        if (overridingVisibility != Visibility.INHERITED &&
++            overridingVisibility != superVisibility) {
++          compiler.report(
++              t.makeError(getprop, VISIBILITY_MISMATCH,
++                  propertyName, superOwnerType.toString(),
++                  superVisibility.name(), overridingVisibility.name()));
++           return; // Mismatched visibility is an error.
++        }
++        // If we passed override checks, proceed to normal access checks below.
+       }
++    }
++
++    // --- Access Check ---
++    // Find the *most specific* JSDoc for the property being accessed (could be local or inherited).
++    // This determines the visibility rules for the access itself.
+     JSDocInfo docInfo = null;
+-      for (; objectType != null;
+-           objectType = objectType.getImplicitPrototype()) {
+-        docInfo = objectType.getOwnPropertyJSDocInfo(propertyName);
++    ObjectType ownerType = null;
++    ObjectType currentSearchType = objectType;
++    for (; currentSearchType != null;
++         currentSearchType = currentSearchType.getImplicitPrototype()) {
++      docInfo = currentSearchType.getOwnPropertyJSDocInfo(propertyName);
+       if (docInfo != null &&
+           docInfo.getVisibility() != Visibility.INHERITED) {
++        ownerType = currentSearchType;
+         break;
+       }
+     }
+ 
+-      if (objectType == null) {
+-        // We couldn't find a visibility modifier; assume it's public.
++    if (ownerType == null) {
++      // No visibility found anywhere (neither locally nor inherited), treat as public.
+       return;
+     }
+ 
+-      boolean sameInput =
+-          t.getInput().getName().equals(docInfo.getSourceName());
++    // Found JSDoc. Perform access checks based on *this* JSDoc.
+     Visibility visibility = docInfo.getVisibility();
+-      JSType ownerType = normalizeClassType(objectType);
+-      if (isOverride) {
+-        // Check an ASSIGN statement that's trying to override a property
+-        // on a superclass.
+-        JSDocInfo overridingInfo = parent.getJSDocInfo();
+-        Visibility overridingVisibility = overridingInfo == null ?
+-            Visibility.INHERITED : overridingInfo.getVisibility();
++    boolean sameInput = t.getInput().getName().equals(docInfo.getSourceName());
++
++    // Note: If an illegal override (like PRIVATE_OVERRIDE for 'this.prop=') was caught above,
++    // we would have returned already. The prototype assignment case falls through intentionally.
+ 
+-        // Check that (a) the property *can* be overridden, and
+-        // (b) that the visibility of the override is the same as the
+-        // visibility of the original property.
+-        if (visibility == Visibility.PRIVATE && !sameInput) {
+-          compiler.report(
+-              t.makeError(getprop, PRIVATE_OVERRIDE,
+-                  objectType.toString()));
+-        } else if (overridingVisibility != Visibility.INHERITED &&
+-            overridingVisibility != visibility) {
+-          compiler.report(
+-              t.makeError(getprop, VISIBILITY_MISMATCH,
+-                  visibility.name(), objectType.toString(),
+-                  overridingVisibility.name()));
+-        }
+-      } else {
+     if (sameInput) {
+-          // private access is always allowed in the same file.
+-          return;
+-        } else if (visibility == Visibility.PRIVATE &&
+-            (currentClass == null || ownerType.differsFrom(currentClass))) {
+-          if (docInfo.isConstructor() &&
+-              isValidPrivateConstructorAccess(parent)) {
++        // Private/protected access is allowed in the same file.
+         return;
+     }
+ 
+-          // private access is not allowed outside the file from a different
+-          // enclosing class.
++    // Access from a different file.
++    if (visibility == Visibility.PRIVATE) {
++        // Check if it's a valid private constructor access across files.
++        if (docInfo.isConstructor() && isValidPrivateConstructorAccess(parent)) {
++             return; // Allowed.
++        }
++
++        // Report private access OR prototype-override from a different file.
++        // This path catches normal private access from another file, AND
++        // the Class.prototype.privateProp = ... case from another file.
+         compiler.report(
+-              t.makeError(getprop,
+-                  BAD_PRIVATE_PROPERTY_ACCESS,
++            t.makeError(getprop, BAD_PRIVATE_PROPERTY_ACCESS,
+                 propertyName,
+-                  validator.getReadableJSTypeName(
+-                      getprop.getFirstChild(), true)));
++                validator.getReadableJSTypeName(objectNode, true))); // Use objectNode's type name for the message
++        return; // Disallowed access.
++
+     } else if (visibility == Visibility.PROTECTED) {
+-          // There are 3 types of legal accesses of a protected property:
+-          // 1) Accesses in the same file
+-          // 2) Overriding the property in a subclass
+-          // 3) Accessing the property from inside a subclass
+-          // The first two have already been checked for.
+-          if (currentClass == null || !currentClass.isSubtype(ownerType)) {
++        // Check if we are in a subclass of the owner type.
++        JSType ownerClassType = normalizeClassType(ownerType);
++        // Assume currentClass is the type of the class/scope we are currently in (needs to be maintained by the calling class).
++        JSType currentClassNormalized = normalizeClassType(ObjectType.cast(currentClass));
++
++        boolean isSubclass = (currentClassNormalized != null && ownerClassType != null &&
++                              currentClassNormalized.isSubtype(ownerClassType));
++        if (!isSubclass) {
++             // Report protected access from outside a subclass (and not in same file).
+              compiler.report(
+                 t.makeError(getprop, BAD_PROTECTED_PROPERTY_ACCESS,
+                     propertyName,
+-                    validator.getReadableJSTypeName(
+-                        getprop.getFirstChild(), true)));
+-          }
+-        }
++                    validator.getReadableJSTypeName(objectNode, true))); // Use objectNode's type name
++             return; // Disallowed access.
+         }
++        // else: Protected access from subclass in different file is allowed.
+     }
+   }
+\ No newline at end of file

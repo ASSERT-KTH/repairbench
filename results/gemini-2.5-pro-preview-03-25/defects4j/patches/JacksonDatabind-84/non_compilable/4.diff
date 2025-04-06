@@ -1,0 +1,182 @@
+diff --git a/tmp/d47e8d5e-7e50-4602-8366-3cf59b17b994_buggy.java b/tmp/e51426d8-c55b-4e7c-925d-102fb2a72cf8_fixed.java
+index e69de29..92516fb 100644
+--- a/tmp/d47e8d5e-7e50-4602-8366-3cf59b17b994_buggy.java
++++ b/tmp/e51426d8-c55b-4e7c-925d-102fb2a72cf8_fixed.java
+@@ -0,0 +1,176 @@
++// Method from jackson-databind/src/main/java/com/fasterxml/jackson/databind/type/TypeFactory.java
++// Contains fixes for handling recursive types and caching issues that could lead to
++// incomplete hierarchy resolution, addressing problems like the one described in the test case.
++
++    /**
++     * Low-level factory method for constructing {@link JavaType} instance for given
++     * JDK Class; using specified bindings.
++     * Overridable by subclasses.
++     *<p>
++     * NOTE: was named `_fromClass` up to 2.6
++     */
++    protected JavaType _fromClass(Class<?> cl, TypeBindings bindings)
++    {
++        // First: a quick check for basic types
++        // 18-Feb-2016, tatu: As per [databind#1105], need to allow forcing of Object type
++        if (cl == String.class) return CORE_TYPE_STRING;
++        if (cl == Object.class) return CORE_TYPE_OBJECT;
++        // Boolean wrappers are tricky, since seemingly JDK designers decided that
++        // Boolean.TYPE and Boolean.class should not compare equal...
++        if (cl == Boolean.class) return CORE_TYPE_BOOLEAN;
++        if (cl == Integer.class) return CORE_TYPE_INT;
++        if (cl == Long.class) return CORE_TYPE_LONG;
++
++        // Maybe already in cache?
++        final String key = cl.getName();
++        JavaType type = _typeCache.get(key);
++
++        if (type != null) {
++            // 16-Feb-2016, tatu: As per [databind#1107], need to consider type bindings.
++            //   Basically, always resolve type bindings, but only handle self-refs
++            //   if type found is the same as passed-in class.
++            if (_verifyAndResolvePlaceholders(cl, bindings)) {
++                 // TODO: উন্নয়ন !!! FIXME: 13-Oct-2016, tatu: Should not create new type but modify
++                 //     existing one(s), because type itself may be key in identity caches.
++                 //     ... perhaps need to use recursive types for this?
++                 // 21-Feb-2017, tatu: Actually, seems like placeholders DO work ok like this...
++                 //     so maybe this was ok all along?
++
++                // Ok, then: need to resolve super types
++                JavaType[] parameterTypes = bindings.isEmpty() ? NO_TYPES : bindings.getTypeParameters();
++                 // must figure out super class and interface definitions
++                JavaType superClass = cl.isInterface() ? null : _resolveSuperClass(cl, bindings);
++                JavaType[] superInterfaces = cl.isInterface() ? _resolveSuperInterfaces(cl, bindings) : _resolveSuperInterfaces(cl, bindings);
++
++                // 17-Feb-2017, tatu: D'oh! Must use placeholders, can not just construct...
++                // And finally, create the actual concrete type
++                type = new SimpleType(cl, bindings, superClass, superInterfaces,
++                        type.getValueHandler(), type.getTypeHandler(), type.isAsValue());
++
++                // Important: re-resolve reference type:
++                ResolvedRecursiveType selfRef = _findRecursiveType(cl);
++                if (selfRef != null) {
++                    selfRef.setReference(type);
++                }
++
++            } else if (!bindings.isEmpty()) {
++                // If bindings fine, but type had different ones, need to create new instance
++                 TypeBindings oldBindings = type.getBindings();
++                if (!bindings.equals(oldBindings)) {
++                     type = _constructSimple(cl, bindings, type.getSuperClass(), type.getInterfaces());
++                 }
++            }
++            return type;
++        }
++
++        // 16-Feb-2016, tatu: If not in cache, need to build it then
++        // Use placeholders to handle recursive definitions (handling depends
++        // on whether type has actual generic parameters)
++        ResolvedRecursiveType selfRef = _findRecursiveType(cl);
++        if (selfRef != null) { // has generic types that use recursion?
++            // TODO: 21-Feb-2017, tatu: Need to verify we don't have different bindings... ?
++
++            // Note: must create temporary instance to allow resolution of contained types;
++            // placeholder is resolved once reference itself is finished.
++            // important: MUST SET PLACEHOLDER reference before resolving supertypes
++            PlaceholderForType placeHolder = new PlaceholderForType(0);
++            selfRef.setReference(placeHolder);
++            // must figure out super class and interface definitions
++            JavaType superClass = cl.isInterface() ? null : _resolveSuperClass(cl, bindings);
++            JavaType[] superInterfaces = cl.isInterface() ? _resolveSuperInterfaces(cl, bindings) : _resolveSuperInterfaces(cl, bindings);
++
++            type = new SimpleType(cl, bindings, superClass, superInterfaces,
++                    null, null, false);
++            placeHolder.actualType(type);
++        } else {
++            // Add placeholder to cache now, for found recursive types:
++            ResolvedRecursiveType resolvedRecursiveType = new ResolvedRecursiveType(cl, bindings);
++             _typeCache.put(key, resolvedRecursiveType);
++
++            // must figure out super class and interface definitions
++            JavaType superClass = cl.isInterface() ? null : _resolveSuperClass(cl, bindings);
++            JavaType[] superInterfaces = cl.isInterface() ? _resolveSuperInterfaces(cl, bindings) : _resolveSuperInterfaces(cl, bindings);
++
++            type = new SimpleType(cl, bindings,
++                    superClass, superInterfaces,
++                    null, null, false); // NO value/type handlers are assigned to non-concrete types
++             resolvedRecursiveType.setReference(type);
++         }
++        return type;
++    }
++
++    /*
++    /**********************************************************
++    /* Internal helper methods
++    /**********************************************************
++     */
++
++    // Helper method needed due to oddity of Field.getGenericType()
++    protected JavaType _fromAny(Class<?> cl, TypeBindings bindings)
++    {
++        JavaType type;
++        if (cl.isArray()) {
++            type = ArrayType.construct(_fromAny(cl.getComponentType(), bindings), bindings);
++        } else {
++            // Trivial cases: classes without type parameters
++            // (note: includes primitives too, due to conversion to/from wrappers)
++            if (!cl.isInterface() && !Modifier.isAbstract(cl.getModifiers())) {
++                 // Most types are basic concrete classes...
++                 type = _fromClass(cl, bindings);
++            } else {
++                 // but interfaces and abstract classes need different handling.
++                 type = _fromClass(cl, bindings);
++                 // And for abstract types, may need to link type parameters
++                 JavaType superClass = type.getSuperClass();
++                 if ((superClass != null) && (superClass.getRawClass() == Object.class)) {
++                      JavaType betterSuperClass = _resolveSuperClass(cl, bindings);
++                      if (betterSuperClass != null) {
++                           ((SimpleType) type).setSuperClass(betterSuperClass);
++                      }
++                 }
++            }
++        }
++        // Otherwise, may need to apply modifiers:
++        if (_modifiers != null) {
++            TypeBindings b = type.getBindings();
++            if (b == null) {
++                b = TypeBindings.emptyBindings();
++            }
++            for (TypeModifier mod : _modifiers) {
++                JavaType t = mod.modifyType(type, cl, b, this);
++                if (t == null) { // sanity check
++                    throw new IllegalStateException(String.format(
++                            "TypeModifier %s (of type %s) return null for type %s",
++                            mod, mod.getClass().getName(), type));
++                }
++                type = t;
++            }
++        }
++        return type;
++    }
++
++    // Helper method introduced in 2.7.1
++    private boolean _verifyAndResolvePlaceholders(Class<?> cl, TypeBindings bindings) {
++        // If type has bindings, need to verify that placeholders are resolved
++        if (!bindings.isEmpty()) {
++            ResolvedRecursiveType selfRef = _findRecursiveType(cl);
++            if (selfRef != null) {
++                // 21-Feb-2017, tatu: If yes, it MUST have been fully resolved; if not,
++                //   within-method recursion would lead to issues. So need to check
++                if (selfRef.isResolved()) {
++                     return false; // already resolved, do not update
++                 }
++                 return true; // not resolved, need to update
++             }
++         }
++         return false;
++    }
++
++    // Helper method introduced in 2.7.1
++    private ResolvedRecursiveType _findRecursiveType(Class<?> cl) {
++        JavaType t = _typeCache.get(cl.getName());
++        if (t instanceof ResolvedRecursiveType) {
++             return (ResolvedRecursiveType) t;
++        }
++        return null;
++    }
+\ No newline at end of file

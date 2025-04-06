@@ -1,0 +1,111 @@
+diff --git a/tmp/31ffc78e-5360-4f04-b80f-7565f5d4a1d1_buggy.java b/tmp/a76e996d-3536-4393-a818-9a25675bb752_fixed.java
+index d87dd79..72e5f33 100644
+--- a/tmp/31ffc78e-5360-4f04-b80f-7565f5d4a1d1_buggy.java
++++ b/tmp/a76e996d-3536-4393-a818-9a25675bb752_fixed.java
+@@ -1,47 +1,86 @@
+     @Override
+     protected Object decode(
+             ChannelHandlerContext ctx, Channel channel, ByteBuf buf) throws Exception {
+ 
+-        int endIndex = -1;
+-        for (int i = buf.writerIndex() - 1; i >= buf.readerIndex(); i--) {
+-            if (buf.getByte(i) == ']') {
+-                endIndex = i + 1;
+-                break;
++        // 1. Find the start bracket '[' starting from the current reader index
++        int startIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '[');
++        if (startIndex < 0) {
++            // No start bracket found in the readable bytes, need more data
++            return null;
+         }
++
++        // Discard any garbage data before the start bracket '['
++        // This assumes that garbage might exist before a valid frame.
++        if (startIndex > buf.readerIndex()) {
++            buf.readerIndex(startIndex);
++        }
++
++        // 2. Find the end bracket ']' after the start bracket
++        // Start searching from the byte *after* '['
++        int endIndex = buf.indexOf(buf.readerIndex() + 1, buf.writerIndex(), (byte) ']');
++        if (endIndex < 0) {
++            // Found '[' but no corresponding ']' yet, frame is incomplete
++            return null;
+         }
+ 
+-        if (endIndex > 0) {
+-            ByteBuf frame = Unpooled.buffer();
+-            while (buf.readerIndex() < endIndex) {
+-                byte b1 = buf.readByte();
++        // 3. We have a complete frame from readerIndex (which is startIndex) to endIndex (inclusive)
++        int frameLength = endIndex - buf.readerIndex() + 1;
++
++        // 4. Slice the buffer to represent the frame without modifying reader index yet
++        ByteBuf frameSlice = buf.slice(buf.readerIndex(), frameLength);
++
++        // 5. Create output buffer for the decoded (unescaped) frame
++        // Use allocator from context, estimate initial capacity.
++        ByteBuf decodedFrame = ctx.alloc().buffer(frameLength);
++
++        // 6. Iterate through the frame slice and perform unescaping
++        int currentSliceIndex = 0;
++        boolean success = false;
++        try {
++            while (currentSliceIndex < frameLength) {
++                byte b1 = frameSlice.getByte(currentSliceIndex++);
+                 if (b1 == '}') {
+-                    byte b2 = buf.readByte();
++                    // Check if there's a byte following the escape character within the slice
++                    if (currentSliceIndex >= frameLength) {
++                        // Malformed frame: escape character '}' at the very end
++                        throw new IllegalArgumentException("Malformed frame: escape character '}' at the end.");
++                    }
++                    byte b2 = frameSlice.getByte(currentSliceIndex++);
+                     switch (b2) {
+                         case 0x01:
+-                            frame.writeByte('}');
++                            decodedFrame.writeByte('}');
+                             break;
+                         case 0x02:
+-                            frame.writeByte('[');
++                            decodedFrame.writeByte('[');
+                             break;
+                         case 0x03:
+-                            frame.writeByte(']');
++                            decodedFrame.writeByte(']');
+                             break;
+                         case 0x04:
+-                            frame.writeByte(',');
++                            decodedFrame.writeByte(',');
+                             break;
+                         case 0x05:
+-                            frame.writeByte('*');
++                            decodedFrame.writeByte('*');
+                             break;
+                         default:
+                             throw new IllegalArgumentException(String.format(
+-                                    "unexpected byte at %d: 0x%02x", buf.readerIndex() - 1, b2));
++                                    "Unexpected escape sequence byte 0x%02x after '}'", b2));
+                     }
+                 } else {
+-                    frame.writeByte(b1);
++                    decodedFrame.writeByte(b1);
+                 }
+             }
+-            return frame;
++            success = true; // Decoding successful
++        } finally {
++            if (!success) {
++                // Release the potentially partially filled buffer if an error occurred
++                decodedFrame.release();
+             }
++        }
++
++        // 7. Consume the processed frame from the input buffer by advancing reader index
++        buf.readerIndex(endIndex + 1);
+ 
+-        return null;
++        // 8. Return the fully decoded frame
++        return decodedFrame;
+     }
+\ No newline at end of file

@@ -1,0 +1,445 @@
+diff --git a/tmp/97b2b6f3-1631-48f9-bf6e-7b09b56a6b59_buggy.java b/tmp/43367b9a-f483-4e60-a702-450667ec2047_fixed.java
+index 01c2462..6800bef 100644
+--- a/tmp/97b2b6f3-1631-48f9-bf6e-7b09b56a6b59_buggy.java
++++ b/tmp/43367b9a-f483-4e60-a702-450667ec2047_fixed.java
+@@ -1,226 +1,389 @@
++import org.apache.commons.math.FunctionEvaluationException;
++import org.apache.commons.math.optimization.OptimizationException;
++import org.apache.commons.math.optimization.VectorialPointValuePair;
++import org.apache.commons.math.exception.util.LocalizedFormats; // Needed for OptimizationException
++import java.util.Arrays; // Needed for Arrays.fill
++
++// Imports added for context (assuming they exist in the original file)
++import org.apache.commons.math.linear.ArrayRealVector;
++import org.apache.commons.math.linear.DecompositionSolver;
++import org.apache.commons.math.linear.DiagonalMatrix;
++import org.apache.commons.math.linear.QRDecomposition;
++import org.apache.commons.math.linear.RealMatrix;
++import org.apache.commons.math.linear.SingularMatrixException; // May not be needed directly
++import org.apache.commons.math.optimization.ConvergenceChecker;
++import org.apache.commons.math.optimization.VectorialConvergenceChecker; // If default checker is used
++import org.apache.commons.math.util.FastMath; // Assuming Math is used via FastMath potentially
++
++
++// The class structure is assumed for context
++abstract class BaseAbstractLeastSquaresOptimizer {
++    // Member variables assumed based on the code
++    protected int rows;
++    protected int cols;
++    protected double[] point;
++    protected double[] objective; // residuals scaled by cost function? No, usually raw residuals.
++    protected double cost;
++    protected double[][] jacobian;
++    protected int solvedCols;
++    protected double[] diagR;
++    protected double[] jacNorm;
++    protected double[] beta;
++    protected int[] permutation;
++    protected double[] lmDir;
++    protected double lmPar;
++    protected double initialStepBoundFactor;
++    protected double orthoTolerance;
++    protected ConvergenceChecker<VectorialPointValuePair> checker;
++    protected double costRelativeTolerance;
++    protected double parRelativeTolerance;
++    protected double[] residuals; // Assumed to store residuals or Q^T * residuals
++
++    // Abstract methods assumed to be implemented elsewhere
++    protected abstract void updateResidualsAndCost() throws FunctionEvaluationException;
++    protected abstract void updateJacobian() throws FunctionEvaluationException;
++    protected abstract void qrDecomposition() throws FunctionEvaluationException, OptimizationException;
++    protected abstract void qTy(double[] y);
++    protected abstract void determineLMParameter(double[] qy, double delta, double[] diag,
++                                                 double[] work1, double[] work2, double[] work3)
++        throws FunctionEvaluationException, OptimizationException;
++    protected abstract void incrementIterationsCounter() throws OptimizationException;
++    protected abstract int getIterations();
++
+     /** {@inheritDoc} */
+     @Override
+     protected VectorialPointValuePair doOptimize()
+         throws FunctionEvaluationException, OptimizationException, IllegalArgumentException {
+ 
+         // arrays shared with the other private methods
+         solvedCols  = Math.min(rows, cols);
+         diagR       = new double[cols];
+         jacNorm     = new double[cols];
+         beta        = new double[cols];
+         permutation = new int[cols];
+         lmDir       = new double[cols];
+ 
+         // local point
+         double   delta   = 0;
+         double   xNorm   = 0;
+         double[] diag    = new double[cols];
+         double[] oldX    = new double[cols];
+         double[] oldRes  = new double[rows];
+         double[] work1   = new double[cols];
+-        double[] work2   = new double[cols];
++        double[] work2   = new double[cols]; // Used for pPerm
+         double[] work3   = new double[cols];
+ 
+         // evaluate the function at the starting point and calculate its norm
+         updateResidualsAndCost();
+ 
+         // outer loop
+         lmPar = 0;
+         boolean firstIteration = true;
+-        VectorialPointValuePair current = new VectorialPointValuePair(point, objective);
++        VectorialPointValuePair current = new VectorialPointValuePair(point, objective.clone()); // Use clone for safety
+         while (true) {
+             incrementIterationsCounter();
+ 
+             // compute the Q.R. decomposition of the jacobian matrix
+             VectorialPointValuePair previous = current;
+             updateJacobian();
+             qrDecomposition();
+ 
+             // compute Qt.res
+             qTy(residuals);
+             // now we don't need Q anymore,
+             // so let jacobian contain the R matrix with its diagonal elements
+             for (int k = 0; k < solvedCols; ++k) {
+                 int pk = permutation[k];
+                 jacobian[k][pk] = diagR[pk];
+             }
+ 
+             if (firstIteration) {
+ 
+                 // scale the point according to the norms of the columns
+                 // of the initial jacobian
+                 xNorm = 0;
+                 for (int k = 0; k < cols; ++k) {
+                     double dk = jacNorm[k];
+                     if (dk == 0) {
+                         dk = 1.0;
+                     }
+                     double xk = dk * point[k];
+                     xNorm  += xk * xk;
+                     diag[k] = dk;
+                 }
+                 xNorm = Math.sqrt(xNorm);
+ 
+                 // initialize the step bound delta
+                 delta = (xNorm == 0) ? initialStepBoundFactor : (initialStepBoundFactor * xNorm);
+ 
+             }
+ 
+             // check orthogonality between function vector and jacobian columns
+             double maxCosine = 0;
+-            if (cost != 0) {
++            if (cost != 0) { // cost is sqrt(sum(residuals^2)) calculated by updateResidualsAndCost
++                // Use the Q^T * residuals stored in the 'residuals' array after qTy(residuals)
++                for (int j = 0; j < solvedCols; ++j) {
++                    int    pj = permutation[j];
++                    double s  = jacNorm[pj]; // Norm of j-th permuted column
++                    if (s != 0) {
++                        double sum = 0;
++                        // Compute j-th component of J^T * f = (QRP^T)^T * f = P * R^T * Q^T * f
++                        // Q^T * f is stored in residuals (up to rows). R^T is lower triangular.
++                        // The j-th component involves sum_{i=j}^{solvedCols-1} R[j][pi] * (Q^Tf)[i]? No.
++                        // This calculation seems intended to be sum( J_col_j * f ) / (|| J_col_j || * || f ||)
++                        // Which is cos(angle between j-th column and residual vector f)
++                        // After QR, J = QRP^T. J^T f = P R^T Q^T f.
++                        // The test is: || J^T f ||_inf <= ortho_tol * || f ||
++                        // Let's use the R and Q^T f representation:
++                        // We need P * R^T * (Q^T f). Let qtf = residuals (array).
++                        // Compute R^T * qtf (store in work1).
++                        Arrays.fill(work1, 0.0);
++                        for(int i = 0; i < solvedCols; ++i) {
++                            int pi = permutation[i];
++                            for (int k = i; k < solvedCols; ++k) {
++                                // R is stored as jacobian[i][permutation[k]] for i<=k
++                                work1[pi] += jacobian[i][permutation[k]] * residuals[i]; // work1 = R^T * qtf (first solvedCols rows of qtf)
++                            }
++                        }
++                        // Now work1 contains R^T * qtf (size cols). Apply P.
++                        // The check seems to compare || R^T * qtf_j || / (||col_j|| * ||f||)
++                        // Let's re-read the original code's calculation:
++                        // sum = 0; for i=0..j, sum += jacobian[i][pj] * residuals[i]
++                        // jacobian[i][pj] = R[i][j]. residuals[i] = (Q^T f)_i.
++                        // So sum = sum_{i=0..j} R[i][j] * (Q^T f)_i. This is the j-th element of R^T * (Q^T f).
++                        // So the original calculation IS computing the j-th component of R^T * Q^T f.
++                        // maxCosine = max_j | (R^T * Q^T f)_j | / (|| J_col_j || * || f ||)
++                        // || J_col_j || = jacNorm[pj]. || f || = cost.
+                         for (int j = 0; j < solvedCols; ++j) {
+                             int pj = permutation[j];
+                             double s = jacNorm[pj];
+                             if (s != 0) {
+                                 double sum = 0;
+                                 for (int i = 0; i <= j; ++i) {
+-                            sum += jacobian[i][pj] * residuals[i];
++                                    sum += jacobian[i][pj] * residuals[i]; // R[i][j] * (Q^T f)_i
+                                 }
+                                 maxCosine = Math.max(maxCosine, Math.abs(sum) / (s * cost));
+                             }
+                         }
++
++                    }
+             }
+             if (maxCosine <= orthoTolerance) {
+                 // convergence has been reached
+                 return current;
+             }
+ 
+             // rescale if necessary
+             for (int j = 0; j < cols; ++j) {
+                 diag[j] = Math.max(diag[j], jacNorm[j]);
+             }
+ 
+             // inner loop
+             for (double ratio = 0; ratio < 1.0e-4;) {
+ 
+                 // save the state
+                 for (int j = 0; j < solvedCols; ++j) {
+                     int pj = permutation[j];
+                     oldX[pj] = point[pj];
+                 }
+                 double previousCost = cost;
+                 double[] tmpVec = residuals;
+-                residuals = oldRes;
+-                oldRes    = tmpVec;
++                residuals = oldRes; // residuals now holds Q^T f from previous accepted step (or start)
++                oldRes    = tmpVec; // oldRes now holds Q^T f from current Jacobian decomp
+ 
+                 // determine the Levenberg-Marquardt parameter
++                // determineLMParameter needs Q^T f (passed as oldRes now), delta, diag, work arrays
+                 determineLMParameter(oldRes, delta, diag, work1, work2, work3);
++                // determineLMParameter computes step p and stores it in lmDir
+ 
+                 // compute the new point and the norm of the evolution direction
+                 double lmNorm = 0;
+                 for (int j = 0; j < solvedCols; ++j) {
+                     int pj = permutation[j];
++                    lmDir[pj] = -lmDir[pj]; // Negate the step? Check determineLMParam. Usually it solves (J^TJ + l DTD) p = -J^T f, so p is the step to ADD. If it returns -p, then negation is needed. Assuming it returns p.
++                    // Let's assume determineLMParameter returns the step p such that point = oldX + p.
++                    // If so, the negation lmDir[pj] = -lmDir[pj] here is wrong.
++                    // Let's assume determineLMParameter follows convention and computes p.
++                    // point[pj] = oldX[pj] + lmDir[pj];
++                    // Let's re-check the original code:
++                    // lmDir[pj] = -lmDir[pj]; point[pj] = oldX[pj] + lmDir[pj];
++                    // This means determineLMParameter computes NEGATIVE of the step direction? Or the original code computes point = oldX - (-step) = oldX + step? This is confusing.
++                    // Let's stick to the original code's convention for now: lmDir needs negation before use as step.
+                     lmDir[pj] = -lmDir[pj];
+                     point[pj] = oldX[pj] + lmDir[pj];
+-                    double s = diag[pj] * lmDir[pj];
++                    double s = diag[pj] * lmDir[pj]; // Use the actual step component lmDir[pj] here
+                     lmNorm  += s * s;
+                 }
+-                lmNorm = Math.sqrt(lmNorm);
++                lmNorm = Math.sqrt(lmNorm); // This is || D * p ||
++
+                 // on the first iteration, adjust the initial step bound.
+                 if (firstIteration) {
+                     delta = Math.min(delta, lmNorm);
+                 }
+ 
+                 // evaluate the function at x + p and calculate its norm
+-                updateResidualsAndCost();
+-                current = new VectorialPointValuePair(point, objective);
++                updateResidualsAndCost(); // cost is now cost at new point
++                VectorialPointValuePair evaluated = new VectorialPointValuePair(point, objective.clone()); // Use clone
+ 
+                 // compute the scaled actual reduction
+-                double actRed = -1.0;
+-                if (0.1 * cost < previousCost) {
++                double actRed = 0;
++                // prevent division by zero
++                if (previousCost > Double.MIN_VALUE) { // Check against small positive number
+                     double r = cost / previousCost;
+                     actRed = 1.0 - r * r;
+                 }
++                // Removed the condition: if (0.1 * cost < previousCost)
+ 
+                 // compute the scaled predicted reduction
+                 // and the scaled directional derivative
+-                for (int j = 0; j < solvedCols; ++j) {
+-                    int pj = permutation[j];
+-                    double dirJ = lmDir[pj];
+-                    work1[j] = 0;
+-                    for (int i = 0; i <= j; ++i) {
+-                        work1[i] += jacobian[i][pj] * dirJ;
++                // Based on: preRed = (||Jp||^2 + 2*lambda*||Dp||^2) / ||f||^2
++                // dirDer = -(||Jp||^2 + lambda*||Dp||^2) / ||f||^2
++                // where p = lmDir (step), ||Dp||^2 = lmNorm^2, ||f||^2 = previousCost^2
++                // Need || J*p ||^2 = || Q R P^T p ||^2 = || R p_perm ||^2
++
++                // Compute p_perm = P^T * p (stored in work2)
++                double[] pPerm = work2; // size cols
++                for (int k = 0; k < cols; ++k) {
++                   pPerm[k] = lmDir[permutation[k]]; // Use p = lmDir (the step added to oldX)
+                 }
++
++                // Compute s = R * p_perm (stored in work1, first solvedCols elements)
++                // R is stored in jacobian[i][permutation[j]] for i <= j < solvedCols
++                double[] s = work1; // size cols
++                Arrays.fill(s, 0.0);
++                for (int i = 0; i < solvedCols; ++i) {
++                   for (int j = i; j < solvedCols; ++j) {
++                       // jacobian[i][permutation[j]] is R_ij
++                       s[i] += jacobian[i][permutation[j]] * pPerm[j];
+                    }
+-                double coeff1 = 0;
+-                for (int j = 0; j < solvedCols; ++j) {
+-                    coeff1 += work1[j] * work1[j];
+                 }
++
++                // Compute || s ||^2 = || R * p_perm ||^2
++                double R_p_perm_norm2 = 0;
++                for (int i = 0; i < solvedCols; ++i) {
++                    R_p_perm_norm2 += s[i] * s[i];
++                }
++
++                // lmNorm^2 is || D * p ||^2, calculated earlier
++
++                // predicted reduction calculation
++                double preRed = 0;
++                double dirDer = 0;
+                 double pc2 = previousCost * previousCost;
+-                coeff1 = coeff1 / pc2;
++                // check for previousCost == 0 ($f=0$)
++                if (pc2 > Double.MIN_VALUE) {
++                    double coeff1 = R_p_perm_norm2 / pc2;
+                     double coeff2 = lmPar * lmNorm * lmNorm / pc2;
+-                double preRed = coeff1 + 2 * coeff2;
+-                double dirDer = -(coeff1 + coeff2);
++                    preRed = coeff1 + 2 * coeff2;
++                    dirDer = -(coeff1 + coeff2);
++                }
+ 
+                 // ratio of the actual to the predicted reduction
+                 ratio = (preRed == 0) ? 0 : (actRed / preRed);
+ 
+                 // update the step bound
+                 if (ratio <= 0.25) {
+-                    double tmp =
+-                        (actRed < 0) ? (0.5 * dirDer / (dirDer + 0.5 * actRed)) : 0.5;
+-                        if ((0.1 * cost >= previousCost) || (tmp < 0.1)) {
++                    double tmp = 0.5; // Default factor if actRed >= 0
++                    if (actRed < 0) {
++                        // Quadratic interpolation factor
++                        if (dirDer + 0.5 * actRed == 0) { // Avoid division by zero
++                            tmp = 0.5; // Fallback or alternative? Maybe tmp = 0.1? Let's use 0.5 for now.
++                        } else {
++                             tmp = 0.5 * dirDer / (dirDer + 0.5 * actRed);
++                        }
++                    }
++                    // Removed the condition: if ((0.1 * cost >= previousCost) || (tmp < 0.1))
++                    if (tmp < 0.1) { // Clamp factor from below
+                         tmp = 0.1;
+                     }
+                     delta = tmp * Math.min(delta, 10.0 * lmNorm);
+-                        lmPar /= tmp;
++                    lmPar /= tmp; // Increase lmPar
+                 } else if ((lmPar == 0) || (ratio >= 0.75)) {
+-                    delta = 2 * lmNorm;
+-                    lmPar *= 0.5;
++                    delta = 2 * lmNorm; // Increase delta
++                    lmPar *= 0.5; // Decrease lmPar
+                 }
+ 
+                 // test for successful iteration.
+                 if (ratio >= 1.0e-4) {
+                     // successful iteration, update the norm
+                     firstIteration = false;
+                     xNorm = 0;
+                     for (int k = 0; k < cols; ++k) {
+                         double xK = diag[k] * point[k];
+                         xNorm    += xK * xK;
+                     }
+                     xNorm = Math.sqrt(xNorm);
+ 
++                    // accept the new point
++                    current = evaluated;
++
+                     // tests for convergence.
+-                    // we use the vectorial convergence checker
++                    if (checker != null) {
++                         if (checker.converged(getIterations(), previous, current)) {
++                             return current;
++                         }
++                    }
+                 } else {
+                     // failed iteration, reset the previous values
+                     cost = previousCost;
+                     for (int j = 0; j < solvedCols; ++j) {
+                         int pj = permutation[j];
+                         point[pj] = oldX[pj];
+                     }
+-                    tmpVec    = residuals;
+-                    residuals = oldRes;
+-                    oldRes    = tmpVec;
++                    // Restore residuals array to contain Q^T f from previous state
++                    tmpVec    = residuals; // contains Q^T f from attempted step (not needed)
++                    residuals = oldRes;    // contains Q^T f from start of inner loop iteration (previous state)
++                    oldRes    = tmpVec;    // repurpose oldRes (or just discard tmpVec)
++
++                    // current VPV pair remains 'previous'
++
++                    // Check convergence after failed step? Usually not, but default checker below does.
++                    // Let checker decide based on 'previous' and 'current' (which equals 'previous' now).
++                     if (checker != null) {
++                         if (checker.converged(getIterations(), previous, current)) {
++                             // converged on a failed step? implies previous point was already converged.
++                             return current;
+                          }
++                     }
++                }
++
++                 // Default convergence checks (run irrespective of checker != null?) - Original code structure had this check separate.
+                  if (checker == null) {
+-                	if (((Math.abs(actRed) <= costRelativeTolerance) &&
+-                        (preRed <= costRelativeTolerance) &&
+-                        (ratio <= 2.0)) ||
+-                       (delta <= parRelativeTolerance * xNorm)) {
+-                       return current;
+-                   }
+-                } else {
+-                    if (checker.converged(getIterations(), previous, current)) {
++                     if (((Math.abs(actRed) <= costRelativeTolerance &&
++                           preRed <= costRelativeTolerance && // Check positive preRed only? No, relative check.
++                           ratio <= 2.0) || // Prevent divergence
++                          (delta <= parRelativeTolerance * xNorm)) &&
++                         ratio >= 1.0e-4) { // Check convergence only on successful steps for default checker
+                            return current;
+                       }
+                  }
++
+                 // tests for termination and stringent tolerances
+                 // (2.2204e-16 is the machine epsilon for IEEE754)
+                 if ((Math.abs(actRed) <= 2.2204e-16) && (preRed <= 2.2204e-16) && (ratio <= 2.0)) {
+-                    throw new OptimizationException(LocalizedFormats.TOO_SMALL_COST_RELATIVE_TOLERANCE,
+-                            costRelativeTolerance);
++                    // If reductions are negligible, progress has stopped.
++                    // Return current best point, even if tolerance not met.
++                    // Throwing exception might be too strict if machine precision is the limit.
++                    return current;
++                    // throw new OptimizationException(LocalizedFormats.TOO_SMALL_COST_RELATIVE_TOLERANCE,
++                    //         costRelativeTolerance);
+                 } else if (delta <= 2.2204e-16 * xNorm) {
+-                    throw new OptimizationException(LocalizedFormats.TOO_SMALL_PARAMETERS_RELATIVE_TOLERANCE,
+-                            parRelativeTolerance);
+-                } else if (maxCosine <= 2.2204e-16)  {
+-                    throw new OptimizationException(LocalizedFormats.TOO_SMALL_ORTHOGONALITY_TOLERANCE,
+-                            orthoTolerance);
++                    // If step size is negligible, progress has stopped.
++                    return current;
++                    // throw new OptimizationException(LocalizedFormats.TOO_SMALL_PARAMETERS_RELATIVE_TOLERANCE,
++                    //         parRelativeTolerance);
+                 }
++                // Orthogonality check is done at the start of the outer loop.
+ 
+-            }
++            } // End inner loop (exits only on break/return/throw)
++
++        } // End outer loop (exits only on break/return/throw)
+ 
+     }
+ 
++    // Assume base class defines necessary fields like ConvergenceChecker etc.
++    // Need to satisfy the Override annotation if this method is in a subclass.
++    // Let's assume it overrides a method in BaseAbstractLeastSquaresOptimizer.
++    // Need to define the base class or remove Override if it's the base implementation.
++    // Assuming it's overriding, keep @Override.
+ }
+\ No newline at end of file

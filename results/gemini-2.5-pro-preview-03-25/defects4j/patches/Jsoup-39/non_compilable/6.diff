@@ -1,0 +1,143 @@
+diff --git a/tmp/d183f971-2ade-4ee5-892f-a6349fc950be_buggy.java b/tmp/cfda8d93-2474-4135-8d37-78156d43b5d5_fixed.java
+index c4b260c..a9cc059 100644
+--- a/tmp/d183f971-2ade-4ee5-892f-a6349fc950be_buggy.java
++++ b/tmp/cfda8d93-2474-4135-8d37-78156d43b5d5_fixed.java
+@@ -1,51 +1,116 @@
+     // todo - this is getting gnarly. needs a rewrite.
+     static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
+         String docData;
+         Document doc = null;
++        final String defaultCharset = Parser.DEFAULT_CHARSET; // Assumption: UTF-8
++
++        // ***** Metalista fix starts *****
++        // Maintain position for potential rewind/reset later
++        byteData.mark();
++        // ***** Metalista fix ends *****
++
++
+         if (charsetName == null) { // determine from meta. safe parse as UTF-8
+-            // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
++            // 1. Decode tentatively using default charset
+             docData = Charset.forName(defaultCharset).decode(byteData).toString();
++            // 2. Parse tentatively
+             doc = parser.parseInput(docData, baseUri);
++            // 3. Check meta tags
+             Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+-            if (meta != null) { // if not found, will keep utf-8 as best attempt
+-                String foundCharset;
++            String foundCharset = null; // Use a separate variable for found charset
++            if (meta != null) {
+                 if (meta.hasAttr("http-equiv")) {
+                     foundCharset = getCharsetFromContentType(meta.attr("content"));
+-                    if (foundCharset == null && meta.hasAttr("charset")) {
++                }
++                // Look for HTML5 meta charset, prefer it if found
++                if (meta.hasAttr("charset")) {
++                    String charsetAttr = meta.attr("charset");
++                    if (charsetAttr != null && charsetAttr.length() > 0) {
+                          try {
+-                            if (Charset.isSupported(meta.attr("charset"))) {
+-                                foundCharset = meta.attr("charset");
++                             if (Charset.isSupported(charsetAttr)) {
++                                 foundCharset = charsetAttr; // Prefer this if supported
+                              }
+                          } catch (IllegalCharsetNameException e) {
+-                            foundCharset = null;
++                             // ignore illegal name
+                          }
+                     }
+-                } else {
+-                    foundCharset = meta.attr("charset");
+                 }
+ 
+-                if (foundCharset != null && foundCharset.length() != 0 && !foundCharset.equals(defaultCharset)) { // need to re-decode
++                // 4. If a potentially different charset found, clean and validate it
++                if (foundCharset != null && foundCharset.length() != 0) {
++                    // Clean quotes possibly added by Content-Type parser
+                     foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+-                    charsetName = foundCharset;
+-                    byteData.rewind();
+-                    docData = Charset.forName(foundCharset).decode(byteData).toString();
+-                    doc = null;
++                     try {
++                         if (Charset.isSupported(foundCharset)) {
++                             // It's supported. Check if different from default.
++                             if (!foundCharset.equalsIgnoreCase(defaultCharset)) {
++                                 // Different and supported. Need to re-decode.
++                                 charsetName = foundCharset; // Update the effective charset name
++                                 // ***** Metalista fix starts *****
++                                 byteData.reset(); // Rewind to marked position
++                                 // ***** Metalista fix ends *****
++                                 docData = Charset.forName(charsetName).decode(byteData).toString();
++                                 doc = null; // Force re-parse later
++                             } else {
++                                 // Found charset is same as default. Stick with initial parse.
++                                 // Set charsetName to reflect this.
++                                 charsetName = defaultCharset;
+                              }
++                         } else {
++                              // Found charset is not supported. Stick with initial parse.
++                              // Set charsetName to reflect this.
++                              charsetName = defaultCharset;
++                         }
++                     } catch (IllegalCharsetNameException e) {
++                         // Found charset is illegal. Stick with initial parse.
++                         // Set charsetName to reflect this.
++                         charsetName = defaultCharset;
++                     }
++                } else {
++                    // No charset found in meta. Stick with initial parse.
++                    // Set charsetName to reflect this.
++                    charsetName = defaultCharset;
++                }
++            } else {
++                 // No meta tags found. Stick with initial parse.
++                 // Set charsetName to reflect this.
++                 charsetName = defaultCharset;
+             }
+         } else { // specified by content type header (or by user on file load)
+             Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+             docData = Charset.forName(charsetName).decode(byteData).toString();
++            // doc remains null, will be parsed later
+         }
+-        // UTF-8 BOM indicator. takes precedence over everything else. rarely used. re-decodes incase above decoded incorrectly
+-        if (docData.length() > 0 && docData.charAt(0) == 65279) {
+-            byteData.rewind();
+-            docData = Charset.forName(defaultCharset).decode(byteData).toString();
+-            docData = docData.substring(1);
+-            charsetName = defaultCharset;
++
++        // 5. BOM Check (needs to happen *after* initial decode/meta check)
++        // docData holds the data decoded with either specified, meta-detected, or default charset.
++        if (docData.length() > 0 && docData.charAt(0) == 65279) { // Check for UTF-8 BOM 0xFEFF
++            // ***** Metalista fix starts *****
++            byteData.reset(); // Rewind buffer to start
++            // ***** Metalista fix ends *****
++            docData = Charset.forName(defaultCharset).decode(byteData).toString(); // Re-decode FULLY as UTF-8
++            docData = docData.substring(1); // Strip BOM
++            charsetName = defaultCharset; // BOM overrides any prior charset determination
++            doc = null; // <<< FIX 1: Force re-parse with BOM-stripped UTF-8 data
+         }
++
++        // 6. Final Parse if needed
+         if (doc == null) {
++            // Happens if:
++            // - charsetName was explicitly provided (and no BOM found)
++            // - charsetName was null, meta tag specified a *different* supported charset
++            // - BOM was found (forces doc=null)
+             doc = parser.parseInput(docData, baseUri);
+-            doc.outputSettings().charset(charsetName);
+         }
++
++        // 7. Set output charset
++        // Ensure charsetName reflects the final used charset (might have been forced to defaultCharset by BOM or if auto-detect found nothing/default)
++        if (charsetName == null) {
++            // If null here, it means specified charset was null, and no meta tags were found or processed successfully.
++            // Should default to UTF-8 as per initial tentative parse.
++             charsetName = defaultCharset;
++        }
++        doc.outputSettings().charset(charsetName); // <<< FIX 2: Always set the output charset based on determined input charset
++
+         return doc;
+     }
+\ No newline at end of file

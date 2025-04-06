@@ -1,0 +1,240 @@
+diff --git a/tmp/c1c28296-f402-444f-b997-227d3b7b6513_buggy.java b/tmp/b8c9e677-ce07-46f2-b47c-42a88e83e3a4_fixed.java
+index 2a0dceb..f0f94c2 100644
+--- a/tmp/c1c28296-f402-444f-b997-227d3b7b6513_buggy.java
++++ b/tmp/b8c9e677-ce07-46f2-b47c-42a88e83e3a4_fixed.java
+@@ -1,68 +1,205 @@
+     private Position decode4(
+             Channel channel, SocketAddress remoteAddress, String[] values) throws ParseException {
+         int index = 0;
+ 
+-        String type = values[index++].substring(5);
++        // Check message header format consistency (e.g., "ST410STT")
++        if (values[0].length() <= 5) {
++             Log.warn("Invalid header format for STT/ALT message: {}", values[0]);
++             return null; // Invalid header format
++        }
++        String type = values[index++].substring(5); // Extracts "STT" or "ALT"
+ 
++        // Double-check type (should already be validated by caller routing to decode4)
+         if (!type.equals("STT") && !type.equals("ALT")) {
+             return null;
+         }
+ 
++        // Get device session using the second field (IMEI/ID)
++        if (index >= values.length) {
++             Log.warn("Missing device ID in STT/ALT message");
++             return null;
++        }
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, values[index++]);
+         if (deviceSession == null) {
++            // Logging is usually handled within getDeviceSession
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+         position.set(Position.KEY_TYPE, type);
+ 
++        // Firmware Version
++        if (index < values.length) {
+             position.set(Position.KEY_VERSION_FW, values[index++]);
+-        index += 1; // model
++        } else { return position; } // Return partial position if data ends abruptly
+ 
++        // Model field (index 3 in original split, e.g., "03") - skip it
++        if (index < values.length) {
++            index += 1;
++        } else { return position; }
++
++        // Network Info (Cell Towers)
+         Network network = new Network();
+-
+         for (int i = 0; i < 7; i++) {
+-            int cid = Integer.parseInt(values[index++]);
+-            int mcc = Integer.parseInt(values[index++]);
+-            int mnc = Integer.parseInt(values[index++]);
+-            int lac, rssi;
+-            if (i == 0) {
+-                rssi = Integer.parseInt(values[index++]);
+-                lac = Integer.parseInt(values[index++]);
+-            } else {
+-                lac = Integer.parseInt(values[index++]);
+-                rssi = Integer.parseInt(values[index++]);
++            // Check bounds for a full cell record: cid, mcc, mnc, (rssi/lac), (lac/rssi), timing advance
++            // Need 6 fields per iteration
++            if (index + 5 >= values.length) {
++                 Log.debug("Not enough fields left for cell tower {}", i);
++                 break; // Stop processing cells if data runs out
+             }
+-            index += 1; // timing advance
+-            if (cid > 0) {
++            String cidStr = values[index++];
++            String mccStr = values[index++];
++            String mncStr = values[index++];
++            String lacStr, rssiStr;
++            if (i == 0) { // First cell has rssi then lac
++                rssiStr = values[index++];
++                lacStr = values[index++];
++            } else { // Subsequent cells have lac then rssi
++                lacStr = values[index++];
++                rssiStr = values[index++];
++            }
++            index += 1; // skip timing advance field
++
++            try {
++                // Attempt to parse only if key fields seem non-empty/valid (basic check on CID)
++                if (!cidStr.isEmpty() && !cidStr.equals("0")) { // Check CID > 0 as per original logic
++                    int cid = Integer.parseInt(cidStr);
++                    // Ensure other fields are parseable, handle potential empty strings gracefully
++                    int mcc = Integer.parseInt(mccStr.isEmpty() ? "0" : mccStr);
++                    int mnc = Integer.parseInt(mncStr.isEmpty() ? "0" : mncStr);
++                    int lac = Integer.parseInt(lacStr.isEmpty() ? "0" : lacStr);
++                    int rssi = Integer.parseInt(rssiStr.isEmpty() ? "0" : rssiStr);
+                     network.addCellTower(CellTower.from(mcc, mnc, lac, cid, rssi));
+                 }
++            } catch (NumberFormatException e) {
++                Log.warn("Ignoring invalid network cell data. Error: {}, Values: [cid={}, mcc={}, mnc={}, lac={}, rssi={}]",
++                         e.getMessage(), cidStr, mccStr, mncStr, lacStr, rssiStr);
++                // Continue to the next cell
+             }
+-
++        }
++        // Add network object to position only if it contains data
++        // Use appropriate check for network data presence (implementation might vary)
++        if (network.getCellTowers() != null && !network.getCellTowers().isEmpty()) {
+              position.setNetwork(network);
++        }
++
++        // Battery Voltage
++        if (index < values.length && !values[index].isEmpty()) {
++            try {
++                position.set(Position.KEY_BATTERY, Double.parseDouble(values[index]));
++            } catch (NumberFormatException e) {
++                Log.warn("Ignoring invalid battery data: {}", values[index]);
++            }
++        }
++        index++;
++
++        // Archive Flag ("0" means historical/buffered)
++        if (index < values.length) {
++            // Use Boolean.TRUE to avoid potential ClassCastException if attribute expects Boolean object
++            position.set(Position.KEY_ARCHIVE, values[index].equals("0") ? Boolean.TRUE : null);
++        }
++        index++;
+ 
+-        position.set(Position.KEY_BATTERY, Double.parseDouble(values[index++]));
+-        position.set(Position.KEY_ARCHIVE, values[index++].equals("0") ? true : null);
+-        position.set(Position.KEY_INDEX, Integer.parseInt(values[index++]));
+-        position.set(Position.KEY_STATUS, Integer.parseInt(values[index++]));
++        // Report Index (Sequence Number)
++        if (index < values.length && !values[index].isEmpty()) {
++            try {
++                position.set(Position.KEY_INDEX, Integer.parseInt(values[index]));
++            } catch (NumberFormatException e) {
++                 Log.warn("Ignoring invalid index data: {}", values[index]);
++            }
++        }
++        index++;
++
++        // Device Status (input/output status bits or code)
++        if (index < values.length && !values[index].isEmpty()) {
++             try {
++                 position.set(Position.KEY_STATUS, Integer.parseInt(values[index]));
++             } catch (NumberFormatException e) {
++                 Log.warn("Ignoring invalid status data: {}", values[index]);
++             }
++        }
++        index++;
+ 
+-        if (values[index].length() == 3) {
+-            index += 1; // collaborative network
++        // Optional Collaborative Network field (seems to be 3 chars long)
++        if (index < values.length && values[index].length() == 3) {
++            // Potentially store this value if needed, otherwise just skip
++            // position.set("collaborativeNetwork", values[index]);
++            index += 1;
+         }
+ 
++        // Date and Time (Combined from two fields: yyyyMMdd and HH:mm:ss)
++        if (index + 1 < values.length) {
++            String date = values[index];
++            String time = values[index + 1];
++            if (!date.isEmpty() && !time.isEmpty()) {
+                 DateFormat dateFormat = new SimpleDateFormat("yyyyMMddHH:mm:ss");
+                 dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+-        position.setTime(dateFormat.parse(values[index++] + values[index++]));
++                try {
++                    position.setTime(dateFormat.parse(date + time));
++                } catch (ParseException e) {
++                    Log.warn("Failed to parse Suntech time: {}{}, using reception time.", date, time, e);
++                    position.setTime(new Date()); // Fallback to current server time
++                }
++            } else {
++                 Log.warn("Empty date/time fields for Suntech STT/ALT message, using reception time.");
++                 position.setTime(new Date()); // Fallback if fields are empty
++            }
++            index += 2; // Advance past date and time fields
++        } else {
++            Log.warn("Missing date/time fields for Suntech STT/ALT message, using reception time.");
++            position.setTime(new Date()); // Fallback if fields are missing
++            // Advance index if possible, to avoid issues with subsequent checks
++            if (index < values.length) index++;
++            if (index < values.length) index++;
++        }
+ 
+-        position.setLatitude(Double.parseDouble(values[index++]));
+-        position.setLongitude(Double.parseDouble(values[index++]));
+-        position.setSpeed(UnitsConverter.knotsFromKph(Double.parseDouble(values[index++])));
+-        position.setCourse(Double.parseDouble(values[index++]));
++        // GPS Data (Latitude, Longitude, Speed, Course, Satellites)
++        boolean gpsParsedSuccessfully = false;
++        // Check if there are enough fields for the 5 core GPS values
++        if (index + 4 < values.length) {
++             try {
++                 // Attempt to parse only if fields are not empty
++                 String latStr = values[index];
++                 String lonStr = values[index + 1];
++                 String speedStr = values[index + 2];
++                 String courseStr = values[index + 3];
++                 String satStr = values[index + 4];
+ 
+-        position.set(Position.KEY_SATELLITES, Integer.parseInt(values[index++]));
++                 if (!latStr.isEmpty() && !lonStr.isEmpty() && !speedStr.isEmpty() && !courseStr.isEmpty() && !satStr.isEmpty()) {
++                     position.setLatitude(Double.parseDouble(latStr));
++                     position.setLongitude(Double.parseDouble(lonStr));
++                     position.setSpeed(UnitsConverter.knotsFromKph(Double.parseDouble(speedStr)));
++                     position.setCourse(Double.parseDouble(courseStr));
++                     position.set(Position.KEY_SATELLITES, Integer.parseInt(satStr));
++                     gpsParsedSuccessfully = true; // Mark GPS data as successfully parsed
++                 } else {
++                    Log.warn("Empty GPS fields encountered in Suntech STT/ALT message. Fields: [{}, {}, {}, {}, {}]",
++                             latStr, lonStr, speedStr, courseStr, satStr);
++                 }
++             } catch (NumberFormatException e) {
++                 Log.warn("Ignoring invalid GPS data: {}. Fields: [{}, {}, {}, {}, {}]", e.getMessage(),
++                          values[index], values[index + 1], values[index + 2], values[index + 3], values[index + 4]);
++                 // gpsParsedSuccessfully remains false
++             }
++             index += 5; // Advance index past the 5 GPS fields
++        } else {
++             Log.debug("Not enough fields for GPS data in Suntech STT/ALT message.");
++             // Advance index past potential remaining fields if any
++             index = values.length;
++        }
+ 
+-        position.setValid(values[index++].equals("1"));
++        // GPS Fix Validity ("1" means valid fix)
++        if (index < values.length && !values[index].isEmpty()) {
++             // Use the explicit validity field but only if GPS data was parsed numerically okay
++             position.setValid(gpsParsedSuccessfully && values[index].equals("1"));
++             index++;
++        } else {
++             // If validity field is missing or empty, validity depends solely on whether GPS data was parsed
++             position.setValid(gpsParsedSuccessfully);
++        }
++
++        // Note: There might be more optional fields after validity depending on specific STT/ALT variants
+ 
+         return position;
+     }
+\ No newline at end of file

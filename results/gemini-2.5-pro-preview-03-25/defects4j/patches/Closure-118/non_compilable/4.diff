@@ -1,0 +1,137 @@
+diff --git a/tmp/58fc125f-fac8-431f-82e1-e1b72d8b48a3_buggy.java b/tmp/89c6bbdc-01c6-4c33-8f07-3d68aff8fbe1_fixed.java
+index 0b7c52e..49c42a8 100644
+--- a/tmp/58fc125f-fac8-431f-82e1-e1b72d8b48a3_buggy.java
++++ b/tmp/89c6bbdc-01c6-4c33-8f07-3d68aff8fbe1_fixed.java
+@@ -1,27 +1,119 @@
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.NodeUtil;
++import com.google.javascript.rhino.jstype.JSType;
++import com.google.javascript.jscomp.NodeTraversal;
++import com.google.javascript.jscomp.Compiler;
++import com.google.javascript.jscomp.JSError;
++import com.google.javascript.jscomp.Warnings;
++// Assuming T is JSType or can be cast from JSType
++// Assuming relevant member variables (compiler, propertiesToErrorFor, typeSystem etc.) exist
++// Assuming Property class and getProperty method exist
++// Assuming TypeSystem<T> typeSystem and processProperty method exist
++
+     /**
+      * Processes a OBJECTLIT node.
+      */
+     private void handleObjectLit(NodeTraversal t, Node n) {
+       for (Node child = n.getFirstChild();
+           child != null;
+           child = child.getNext()) {
+-        // Maybe STRING, GET, SET
+-
+-        // We should never see a mix of numbers and strings.
+-        String name = child.getString();
+-        T type = typeSystem.getType(getScope(), n, name);
++        // Child node is STRING_KEY, GETTER_DEF, SETTER_DEF, or MEMBER_FUNCTION_DEF
++        // Use NodeUtil to get the key name robustly. Handles quoted/unquoted keys, getters, setters.
++        String name = NodeUtil.getObjectLitKeyName(child);
++        if (name == null) {
++          // This indicates an unexpected structure or a key type we don't handle.
++          // MEMBER_FUNCTION_DEF nodes are handled by handleFunction if needed by the pass. Skip here.
++          if (!child.isMemberFunctionDef()) {
++             // TODO(user): Consider logging or reporting an error for unexpected child types.
++          }
++          continue;
++        }
+ 
+         Property prop = getProperty(name);
+-        if (!prop.scheduleRenaming(child,
+-                                   processProperty(t, prop, type, null))) {
+-          // TODO(user): It doesn't look like the user can do much in this
+-          // case right now.
++
++        // Determine the type of the object that this literal initializes or represents.
++        // This is the type on which the properties should be recorded for disambiguation.
++        JSType ownerType = null;
++        Node parent = n.getParent();
++        if (parent != null) {
++           // Case 1: Assignment, e.g., obj.prop = { key: value } or Class.prototype = { key: value }
++           // Check if the object literal 'n' is the RHS of an ASSIGN node.
++           if (parent.isAssign() && n == parent.getLastChild()) {
++             Node lhs = parent.getFirstChild();
++             // The type of the LHS is the context type we need.
++             ownerType = lhs.getJSType();
++           // Case 2: Variable declaration, e.g., var x = { key: value }
++           // Check if the object literal 'n' is the initializer for a NAME node in a VAR declaration.
++           } else if (parent.isName() && n == parent.getLastChild()) {
++             Node gramps = parent.getParent();
++             if (gramps != null && gramps.isVar()) {
++                // The type of the variable (NAME node) is the context type.
++                ownerType = parent.getJSType();
++             }
++           // Case 3: Property value in another object literal, e.g., var obj = { outer: { inner: value } }
++           // Check if the object literal 'n' is the value associated with a STRING_KEY.
++           } else if (parent.isStringKey() && n == parent.getLastChild()) {
++              // The relevant type is often the type inferred for the object literal 'n' itself,
++              // which might reflect the structure { outer: { inner: ... } }.
++              ownerType = n.getJSType();
++           // Case 4: Return statement: return { ... }
++           } else if (parent.isReturn() && n == parent.getFirstChild()) {
++               // Use the type inferred for the object literal 'n'. This might be influenced
++               // by the function's declared or inferred return type.
++               ownerType = n.getJSType();
++           // Case 5: Function argument: foo({ ... }), or new Foo({ ... })
++           // Check if 'n' is an argument to a CALL or NEW node (and not the function itself).
++           } else if ((parent.isCall() || parent.isNew()) && n != parent.getFirstChild()) {
++               // Use the type inferred for the object literal 'n'. Type inference might
++               // propagate parameter type information to the argument node.
++               ownerType = n.getJSType();
++           }
++           // Other potential contexts (e.g., array literals, default parameter values) could be added if necessary.
++        }
++
++        // If we couldn't determine the owner type from common expression contexts,
++        // fall back to the JSType attached to the OBJECTLIT node itself by type inference.
++        if (ownerType == null) {
++            ownerType = n.getJSType();
++        }
++
++        // DisambiguateProperties uses JSType as T.
++        // We need to provide the JSType to processProperty.
++        JSType typeForProp = ownerType;
++
++        // Skip processing if the determined type is null, unknown, or too general ({*}).
++        // Associating properties with such types provides no useful information for disambiguation
++        // and could lead to incorrect results.
++        if (typeForProp == null || typeForProp.isAllType() || typeForProp.isUnknownType()) {
++           continue;
++        }
++
++        // Process the property occurrence using the determined owner type.
++        // processProperty updates the property's type information and returns the resolved type.
++        // We need to cast JSType to T, assuming T is JSType or a compatible supertype.
++        @SuppressWarnings("unchecked")
++        T resolvedType = processProperty(t, prop, (T) typeForProp, null);
++
++        // Schedule the property key node (child) for potential renaming based on the gathered type info.
++        // scheduleRenaming returns false if this occurrence creates a type conflict (invalidation).
++        if (!prop.scheduleRenaming(child, resolvedType)) {
++          // Renaming failed, likely due to type invalidation. Report error if configured to do so.
+           if (propertiesToErrorFor.containsKey(name)) {
++            // Report the invalidation error using the standard warning format.
++            String ownerTypeName = typeForProp.toString();
++            // prop.getType() should return the first/representative type recorded for this property. Use "?>" if null.
++            String firstTypeName = (prop.getType() == null ? "<?>" : prop.getType().toString());
++
+             compiler.report(JSError.make(
+-                t.getSourceName(), child, propertiesToErrorFor.get(name),
+-                Warnings.INVALIDATION, name,
+-                (type == null ? "null" : type.toString()), n.toString(), ""));
++                t.getSourceName(),
++                child, // Location of the error (the property key node, e.g., 'a' in {'a':0})
++                propertiesToErrorFor.get(name), // Specific error message template from the map
++                Warnings.INVALIDATION, // Standard warning category for this type of conflict
++                name, // {0} Property name (e.g., "a")
++                ownerTypeName, // {1} Conflicting type name (the type where it's being redefined/used incompatibly)
++                firstTypeName // {2} Original type name (the type where it was first defined/used)
++                ));
+           }
+         }
+       }
+     }
+\ No newline at end of file

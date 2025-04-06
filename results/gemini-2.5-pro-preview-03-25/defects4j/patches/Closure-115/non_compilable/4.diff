@@ -1,0 +1,143 @@
+diff --git a/tmp/cc6d9beb-b123-46f3-8ab7-d1549b986662_buggy.java b/tmp/4e4400ed-2355-4668-99bd-23d377b9eb5a_fixed.java
+index 3075782..4d2038d 100644
+--- a/tmp/cc6d9beb-b123-46f3-8ab7-d1549b986662_buggy.java
++++ b/tmp/4e4400ed-2355-4668-99bd-23d377b9eb5a_fixed.java
+@@ -1,82 +1,97 @@
+   /**
+    * Determines whether a function can be inlined at a particular call site.
+    * There are several criteria that the function and reference must hold in
+    * order for the functions to be inlined:
+-   * 1) If a call's arguments have side effects,
++   * 1) If a call's arguments have side effects or are not idempotent,
+    * the corresponding argument in the function must only be referenced once.
+    * For instance, this will not be inlined:
+    * <pre>
+    *     function foo(a) { return a + a }
+-   *     x = foo(i++);
++   *     x = foo(i++); // 'i++' has side effects
++   *     y = foo(new Bar()); // 'new Bar()' is not idempotent
+    * </pre>
++   * 2) The function does not reference the 'arguments' object.
++   * 3) The function does not reference 'this'. (Handled by isDirectCallNodeReplacementPossible)
++   * 4) The function is not recursive. (Handled elsewhere)
++   * 5) The function is not defined using JS Doc 'noinline'. (Handled by isDirectCallNodeReplacementPossible)
+    */
+   private CanInlineResult canInlineReferenceDirectly(
+       Node callNode, Node fnNode) {
+     if (!isDirectCallNodeReplacementPossible(fnNode)) {
+       return CanInlineResult.NO;
+     }
+ 
+     Node block = fnNode.getLastChild();
+ 
+-    boolean hasSideEffects = false;
+-    if (block.hasChildren()) {
+-      Preconditions.checkState(block.hasOneChild());
+-      Node stmt = block.getFirstChild();
+-      if (stmt.isReturn()) {
+-        hasSideEffects = NodeUtil.mayHaveSideEffects(stmt.getFirstChild(), compiler);
++    // Don't inline functions that reference the arguments object. Inlining
++    // changes the arguments object.
++    if (NodeUtil.referencesArguments(block)) {
++      return CanInlineResult.NO;
+     }
+-    }
+-    // CALL NODE: [ NAME, ARG1, ARG2, ... ]
++
++    // CALL NODE: [ NAME/GETPROP, ARG1, ARG2, ... ]
+     Node cArg = callNode.getFirstChild().getNext();
+ 
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
+-    if (!callNode.getFirstChild().isName()) {
++    // Handle the ".call(thisObj, arg1, ...)" pattern specifically.
+     if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
++        // The first argument is the 'this' value.
++        // Direct inlining requires 'this' to be passed literally, as complex
++        // 'this' values are not substituted by this pass.
+         if (cArg == null || !cArg.isThis()) {
++            // TODO(johnlenz): Support replacing 'this' with a value.
+             return CanInlineResult.NO;
+         }
+-        cArg = cArg.getNext();
+-      } else {
+-        // ".apply" call should be filtered before this.
++        cArg = cArg.getNext(); // Skip the 'this' argument.
++    } else if (!callNode.getFirstChild().isName()) {
++        // Allow direct calls (NAME) or the handled .call pattern.
++        // Disallow .apply or other indirect calls (e.g., obj[method]()).
++        // .apply is handled by another pass.
+         Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+-      }
++        return CanInlineResult.NO;
+     }
+ 
+-    // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
++    // FUNCTION NODE -> LP NODE: [ NAME ARG1, NAME ARG2, ... ]
+     Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+     while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
++      // Check each parameter that is referenced in the function body.
+       if (fnParam != null) {
+-        if (cArg != null) {
+-          if (hasSideEffects && NodeUtil.canBeSideEffected(cArg)) {
+-            return CanInlineResult.NO;
+-          }
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+-          if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
+-            return CanInlineResult.NO;
+-          }
+-        }
++        String paramName = fnParam.getString();
++        // Only check parameters that are referenced.
++        if (NodeUtil.isNameReferenced(block, paramName)) {
++          int refCount = NodeUtil.getNameReferenceCount(block, paramName);
+ 
+-        // Move to the next name.
++          // If a parameter is referenced more than once...
++          if (refCount > 1) {
++            if (cArg != null) {
++              // ... the corresponding argument must be safe to duplicate.
++              // An argument is safe to duplicate if it has no side effects and
++              // is idempotent (evaluating it multiple times yields the same result
++              // without further side effects).
++              if (NodeUtil.mayHaveSideEffects(cArg, compiler) ||
++                  !NodeUtil.isIdempotentExpression(cArg)) {
++                // Unsafe to duplicate the argument expression.
++                return CanInlineResult.NO;
++              }
++            } else {
++              // Parameter is referenced multiple times, but no argument provided (undefined).
++              // This is safe, as 'undefined' is idempotent and has no side effects.
++              // No action needed.
++            }
++          }
++          // If refCount is 0 or 1, argument properties (side effects, idempotency)
++          // don't matter for duplication safety.
++        }
+         fnParam = fnParam.getNext();
+       }
+ 
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
++      // Move to the next call argument. Arguments without corresponding parameters
++      // are evaluated for their side effects but otherwise ignored unless
++      // 'arguments' is used (which we disallowed earlier).
+       if (cArg != null) {
+-        if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+-          return CanInlineResult.NO;
+-        }
+         cArg = cArg.getNext();
+       }
+     }
+ 
++    // If all checks pass, the function can be inlined directly.
+     return CanInlineResult.YES;
+   }
+\ No newline at end of file

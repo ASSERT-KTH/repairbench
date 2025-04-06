@@ -1,0 +1,137 @@
+diff --git a/tmp/2543c9cd-125c-4a78-9cf4-ca0d2ebb1a00_buggy.java b/tmp/2d3f0a0a-e9b3-47c5-9f5f-08f2aa90287b_fixed.java
+index c9c77a4..39d12e2 100644
+--- a/tmp/2543c9cd-125c-4a78-9cf4-ca0d2ebb1a00_buggy.java
++++ b/tmp/2d3f0a0a-e9b3-47c5-9f5f-08f2aa90287b_fixed.java
+@@ -1,35 +1,107 @@
++import java.io.UnsupportedEncodingException;
++import java.net.IDN;
++import java.net.MalformedURLException;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.URL;
++// Assuming StringUtil, Validate, appendToAscii, q, u are available in the context.
++// q is likely a StringBuilder, u is the original URL object.
++
+     URL build() {
+         try {
+-            // use the URI class to encode non-ascii in path
+-            URI uri = new URI(
+-                u.getProtocol(),
+-                u.getUserInfo(),
+-                IDN.toASCII(decodePart(u.getHost())), // puny-code
+-                u.getPort(),
+-                decodePart(u.getPath()),
+-                null, null // query and fragment appended later so as not to encode
+-            );
+-
+-            String normUrl = uri.toASCIIString();
++            // 1. Normalize host
++            // URL.getHost() is specified to return decoded host (punycode decoded, unicode)
++            String host = u.getHost();
++            String asciiHost = host; // default to original host
++            if (host != null) {
++                boolean needsEncoding = false;
++                for (int i = 0; i < host.length(); i++) {
++                    // Check for non-ASCII characters
++                    if (host.charAt(i) > 127) {
++                        needsEncoding = true;
++                        break;
++                    }
++                }
++                if (needsEncoding) {
++                    try {
++                        // Convert non-ASCII host to punycode according to IDN standard
++                        asciiHost = IDN.toASCII(host);
++                    } catch (IllegalArgumentException e) {
++                        // Host is invalid (e.g. too long, invalid chars as per IDN), return original URL.
++                        // MalformedURLException might be thrown later by new URL() if host is syntactically invalid.
++                        assert Validate.assertFail("Failed to normalize host " + host + ": " + e);
++                        // Return original URL 'u' as the build failed due to invalid host for IDN processing.
++                        return u;
++                    }
++                }
++            }
++
++            // 2. Get Raw Path from URL object to preserve original path encoding
++            // URL.getFile() returns the raw path and query component (e.g., "/path%20here?query=1")
++            String file = u.getFile();
++            String rawPath;
++            // Split file into path and query based on the '?' delimiter
++            int queryInFile = file.indexOf('?');
++            if (queryInFile != -1) {
++                rawPath = file.substring(0, queryInFile);
++                // The query part extracted from 'file' is ignored here.
++                // If 'q' is provided, it replaces the original query. If 'q' is null, the original query is dropped.
++            } else {
++                rawPath = file; // No query part, file is just the raw path
++            }
++            // Handle edge case: if URL was constructed like "http://example.com/"
++            // getFile() might be "/" but getPath() would be "/".
++            // If URL was "http://example.com", getFile() is "" and getPath() is "".
++            // Ensure path is "/" if the original URL's path component indicates it should be root.
++            if (rawPath.isEmpty() && "/".equals(u.getPath())) {
++                 rawPath = "/"; // Ensure root path "/" is preserved if it was the intended path
++            }
++
++            // 3. Manually build the final URL string component by component
++            StringBuilder finalUrl = StringUtil.borrowBuilder();
++            finalUrl.append(u.getProtocol()).append("://");
++            if (u.getUserInfo() != null) {
++                // Append user info. Assumes u.getUserInfo() returns the correct string representation.
++                // Note: RFC 3986 requires userinfo to be percent-encoded. If u.getUserInfo() isn't, this might be incorrect.
++                finalUrl.append(u.getUserInfo()).append('@');
++            }
++            finalUrl.append(asciiHost); // Use normalized host (punycode if needed)
++            if (u.getPort() != -1) {
++                finalUrl.append(':').append(u.getPort());
++            }
++
++            // Append the raw path extracted earlier, preserving its original encoding (e.g., %2B)
++            finalUrl.append(rawPath);
++
++            // 4. Append query ('q' overrides original) and fragment (original preserved)
++            // This logic replicates the behavior of the original code block.
+             if (q != null || u.getRef() != null) {
+-                StringBuilder sb = StringUtil.borrowBuilder().append(normUrl);
+                 if (q != null) {
+-                    sb.append('?');
+-                    appendToAscii(StringUtil.releaseBuilder(q), true, sb);
++                    // Append the new query string provided in 'q'.
++                    finalUrl.append('?');
++                    // appendToAscii encodes the query string; assumes 'q' is a StringBuilder managed by StringUtil
++                    appendToAscii(StringUtil.releaseBuilder(q), true, finalUrl);
+                 }
++                // Note: if q == null, the original query (from u.getFile()) is dropped.
++
+                 if (u.getRef() != null) {
+-                    sb.append('#');
+-                    appendToAscii(u.getRef(), false, sb);
++                    // Append the original fragment identifier.
++                    finalUrl.append('#');
++                    // appendToAscii encodes the fragment; assumes u.getRef() is a String
++                    appendToAscii(u.getRef(), false, finalUrl);
+                 }
+-                normUrl = StringUtil.releaseBuilder(sb);
+             }
+-            u =  new URL(normUrl);
+-            return u;
+-        } catch (MalformedURLException | URISyntaxException | UnsupportedEncodingException e) {
+-            // we assert here so that any incomplete normalization issues can be caught in devel. but in practise,
+-            // the remote end will be able to handle it, so in prod we just pass the original URL.
+-            // The UnsupportedEncodingException would never happen as always UTF8
+-            assert Validate.assertFail(e.toString());
++
++            // Convert the final built string to a URL object.
++            String normUrl = StringUtil.releaseBuilder(finalUrl);
++            return new URL(normUrl);
++
++        } catch (MalformedURLException | UnsupportedEncodingException e) {
++             // MalformedURLException from new URL(normUrl) if the reconstructed string is invalid.
++             // UnsupportedEncodingException from appendToAscii (should not happen with standard UTF-8).
++             assert Validate.assertFail("Failed to build URL: " + e);
++             // In case of failure, return the original, unmodified URL object.
+              return u;
+         }
++        // Note: Removed URISyntaxException catch block as java.net.URI is no longer the primary mechanism.
+     }
+\ No newline at end of file

@@ -1,0 +1,283 @@
+diff --git a/tmp/5ac5375a-8df8-431e-82d5-bf2e9cf7cbdd_buggy.java b/tmp/bc68ea82-3532-4012-8ec5-b0683ee7374a_fixed.java
+index be9c8a3..5329789 100644
+--- a/tmp/5ac5375a-8df8-431e-82d5-bf2e9cf7cbdd_buggy.java
++++ b/tmp/bc68ea82-3532-4012-8ec5-b0683ee7374a_fixed.java
+@@ -1,94 +1,219 @@
++import com.google.common.base.Preconditions;
++import com.google.javascript.jscomp.NodeUtil;
++import com.google.javascript.jscomp.ReferenceCollectingCallback.Reference;
++import com.google.javascript.rhino.Node;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
+     /**
+-     * Counts the number of direct (full) references to an object.
+-     * Specifically we check for references of the following type:
+-     * <pre>
+-     *   x;
+-     *   x.fn();
+-     * </pre>
++     * Checks if an object literal assignment can be inlined.
++     * An object literal assignment can be inlined if:
++     * 1. There's exactly one object literal assignment to the variable.
++     * 2. The assigned literal does not contain ES5 getters/setters, non-string keys, or self-references.
++     * 3. All other references to the variable are either:
++     *    - Simple variable declarations (var x;)
++     *    - Property assignments (e.g., x.prop = val;)
++     *    - Property reads of keys defined in the object literal (e.g., f(x.prop);)
++     * 4. The variable is not used in other ways (e.g., method calls x.method(), direct use f(x),
++     *    reassigned to non-literal values, reads of undefined/inherited properties).
+      */
+     private boolean isInlinableObject(List<Reference> refs) {
+-      boolean ret = false;
++      Node definingObjectLit = null;
++      Reference definingRef = null;
++      Node variableNode = null; // Store the node for the variable name
++
++      // First pass: Find the unique object literal assignment and validate it.
+       for (Reference ref : refs) {
++         Node name = ref.getNode();
++         // Initialize variableNode with the first valid NAME node encountered.
++         if (variableNode == null && name != null && name.isName()) {
++             variableNode = name;
++         }
++         // Basic check: Ensure all references point to the same variable name node.
++         // Skip refs with null names (shouldn't happen for variable references).
++         if (name == null || variableNode == null || variableNode != name) {
++             // This might happen for non-variable references if the list is mixed,
++             // or indicate an issue with the reference collection. Be lenient for now.
++             // Preconditions.checkState(variableNode == name, "References point to different variables: %s != %s", variableNode, name);
++             continue; // Skip potentially problematic references
++         }
++
++
++         if (isVarOrAssignExprLhs(name)) {
++             Node val = ref.getAssignedValue();
++             if (val != null && val.isObjectLit()) {
++                 // Check for get/set first (simple check)
++                 if (hasGetterSetter(val)) {
++                    return false; // Literal has unsupported features
++                 }
++                 // Check for self-reference (more complex)
++                 // Pass variableNode itself for potentially more accurate future checks if needed.
++                 if (isSelfReferential(val, name, refs)) {
++                    return false; // Literal has self-references
++                 }
++
++                 // Found a valid object literal assignment.
++                 if (definingObjectLit == null) {
++                    definingObjectLit = val;
++                    definingRef = ref;
++                    // Check keys here for early exit if non-string keys exist
++                    for (Node keyNode = definingObjectLit.getFirstChild(); keyNode != null; keyNode = keyNode.getNext()) {
++                         if (!keyNode.isStringKey()) {
++                            // Disallow non-string keys (computed, shorthand methods etc.)
++                            // Get/Set already handled by hasGetterSetter.
++                            return false;
++                         }
++                    }
++                 } else {
++                    // Found more than one object literal assignment. Disallow for simplicity.
++                    return false;
++                 }
++             } else if (val != null) {
++                 // Assigned something other than object literal (e.g., x = 1, x = foo()). Disallow.
++                 return false;
++             }
++             // val == null (var x;) is OK.
++         }
++      }
++
++      // If no defining object literal assignment found, cannot inline.
++      if (definingObjectLit == null) {
++          return false;
++      }
++
++      // Collect keys defined in the literal (already validated they are string keys).
++      Set<String> definedKeys = new HashSet<>();
++      for (Node keyNode = definingObjectLit.getFirstChild(); keyNode != null; keyNode = keyNode.getNext()) {
++          definedKeys.add(keyNode.getString());
++      }
++
++      // Second pass: Validate ALL references according to the rules.
++      for (Reference ref : refs) {
++          // Skip the reference that defined the object literal itself.
++          if (ref == definingRef) {
++              continue;
++          }
++          // Skip refs with null names encountered in pass 1.
++          if (ref.getNode() == null || ref.getNode() != variableNode) {
++              continue;
++          }
++
+           Node name = ref.getNode();
+           Node parent = ref.getParent();
+           Node gramps = ref.getGrandparent();
+ 
+-        // Ignore indirect references, like x.y (except x.y(), since
+-        // the function referenced by y might reference 'this').
+-        //
+           if (parent.isGetProp()) {
+-          Preconditions.checkState(parent.getFirstChild() == name);
+-          // A call target maybe using the object as a 'this' value.
+-          if (gramps.isCall()
+-              && gramps.getFirstChild() == parent) {
++              // Case: x.something
++              Node propNode = parent.getLastChild();
++              // We only handle string properties. Computed properties etc. are disallowed.
++              if (!propNode.isString()) {
+                  return false;
+               }
++              String propName = propNode.getString();
+ 
+-          // NOTE(nicksantos): This pass's object-splitting algorithm has
+-          // a blind spot. It assumes that if a property isn't defined on an
+-          // object, then the value is undefined. This is not true, because
+-          // Object.prototype can have arbitrary properties on it.
+-          //
+-          // We short-circuit this problem by bailing out if we see a reference
+-          // to a property that isn't defined on the object literal. This
+-          // isn't a perfect algorithm, but it should catch most cases.
++              // Case: x.method() - Disallow
++              if (gramps.isCall() && gramps.getFirstChild() == parent) {
++                  return false;
++              }
++
++              // Case: x.prop = value - Allow
++              if (gramps.isAssign() && gramps.getFirstChild() == parent) {
+                   continue;
+               }
+ 
+-        // Only rewrite VAR declarations or simple assignment statements
+-        if (!isVarOrAssignExprLhs(name)) {
++              // Case: x.prop read (e.g., f(x.prop) or x.prop.deeper)
++              // Allow ONLY if the key was defined in the original literal.
++              if (definedKeys.contains(propName)) {
++                  // Reading a known property defined in the literal.
++                  continue;
++              } else {
++                  // Reading unknown/inherited property or property added later.
++                  // Disallow to avoid prototype issues and complexity.
+                   return false;
+               }
+-
++          } else if (isVarOrAssignExprLhs(name)) {
++              // Case: Another assignment or var decl for the same variable 'name'
+               Node val = ref.getAssignedValue();
+               if (val == null) {
+-          // A var with no assignment.
++                  // Another 'var x;' is OK (might occur in loops etc.)
+                   continue;
++              } else {
++                  // Re-assignment x = ...; Pass 1 should have caught this if non-literal or >1 literal.
++                  // This implies a re-assignment after the initial defining literal,
++                  // which we disallowed in pass 1. Return false as a safeguard.
++                  return false;
+               }
+-
+-        // We're looking for object literal assignments only.
+-        if (!val.isObjectLit()) {
++          } else {
++              // Case: Direct use like f(x), x++, return x - DISALLOW
+               return false;
+           }
++      }
+ 
+-        // Make sure that the value is not self-refential. IOW,
+-        // disallow things like x = {b: x.a}.
+-        //
+-        // TODO: Only exclude unorderable self-referential
+-        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+-        // but x = {a: 1, b: x.a} is.
+-        //
+-        // Also, ES5 getters/setters aren't handled by this pass.
+-        for (Node child = val.getFirstChild(); child != null;
+-             child = child.getNext()) {
+-          if (child.isGetterDef() ||
+-              child.isSetterDef()) {
+-            // ES5 get/set not supported.
++      // If all references passed the checks.
++      return true;
++    }
++
++    /** Helper to check for ES5 getters/setters */
++    private boolean hasGetterSetter(Node objectLit) {
++        for (Node keyNode = objectLit.getFirstChild(); keyNode != null; keyNode = keyNode.getNext()) {
++            if (keyNode.isGetterDef() || keyNode.isSetterDef()) {
++                return true;
++            }
++        }
+         return false;
+     }
+ 
++    /**
++     * Helper to check for self-referential assignments like x = {a: x.b}.
++     * Uses the original logic structure which checks if the property value node
++     * is an ancestor of a reference's parent node within the object literal context.
++     */
++    private boolean isSelfReferential(Node objectLit, Node variableName, List<Reference> refs) {
++        for (Node keyNode = objectLit.getFirstChild(); keyNode != null; keyNode = keyNode.getNext()) {
++            // String key, get/set def. Get the value node.
++            Node childVal = keyNode.getLastChild(); // Value is last child (e.g., for STRING_KEY)
++            if (childVal == null) continue;
+ 
+-          Node childVal = child.getFirstChild();
+-          // Check if childVal is the parent of any of the passed in
+-          // references, as that is how self-referential assignments
+-          // will happen.
++            // Check if any reference 't' to 'variableName' occurs within 'childVal'.
++            // The original logic checks ancestry: Is childVal an ancestor of t.getParent()?
+             for (Reference t : refs) {
+-            Node refNode = t.getParent();
+-            while (!NodeUtil.isStatementBlock(refNode)) {
+-              if (refNode == childVal) {
+-                // There's a self-referential assignment
+-                return false;
++                // Ensure the reference node matches the variable we're checking.
++                if (t.getNode() != variableName) continue;
++
++                Node refParent = t.getParent();
++                // Walk up from the reference's parent node.
++                Node ancestor = refParent;
++                while (ancestor != null && ancestor != objectLit && !NodeUtil.isStatementBlock(ancestor)) {
++                     // If we find the property's value node during the walk up, it's self-referential.
++                     // e.g., x = { a: x.b } -> ref 'x' in x.b; parent is GETPROP(x.b); childVal is GETPROP(x.b). Match.
++                    if (ancestor == childVal) {
++                        return true; // Found self-reference
+                     }
+-              refNode = refNode.getParent();
++                    ancestor = ancestor.getParent();
+                 }
+             }
+         }
++        return false;
++    }
+ 
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+-        ret = true;
++    /** Returns true if the node n is the LHS of a var declaration or simple assignment. */
++    private static boolean isVarOrAssignExprLhs(Node n) {
++      // Check if n is a NAME node, which is expected for variables
++      if (n == null || !n.isName()) {
++        return false;
+       }
+-      return ret;
++      Node parent = n.getParent();
++      if (parent == null) {
++        return false;
++      }
++      // var n; or var n = ...; (NAME is child of VAR)
++      if (parent.isVar()) {
++        return true;
++      }
++      // n = ...; (NAME is first child of ASSIGN)
++      if (parent.isAssign() && parent.getFirstChild() == n) {
++        return true;
++      }
++      return false;
+     }
+\ No newline at end of file

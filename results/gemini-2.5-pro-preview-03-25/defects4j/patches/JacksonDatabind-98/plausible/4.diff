@@ -1,0 +1,122 @@
+diff --git a/tmp/09f0752f-8417-4db7-8990-6e37094ac138_buggy.java b/tmp/522f4769-dc2a-46a8-bdea-b1233f27bf69_fixed.java
+index afcc27c..eb58f8e 100644
+--- a/tmp/09f0752f-8417-4db7-8990-6e37094ac138_buggy.java
++++ b/tmp/522f4769-dc2a-46a8-bdea-b1233f27bf69_fixed.java
+@@ -1,61 +1,114 @@
+     /**
+      * Variant called when creation of the POJO involves buffering of creator properties
+      * as well as property-based creator.
+      */
+     public Object complete(JsonParser p, DeserializationContext ctxt,
+             PropertyValueBuffer buffer, PropertyBasedCreator creator)
+         throws IOException
+     {
+         // first things first: deserialize all data buffered:
+         final int len = _properties.length;
+         Object[] values = new Object[len];
+         for (int i = 0; i < len; ++i) {
+             String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
+             if (typeId == null) {
+                 // let's allow missing both type and property (may already have been set, too)
+                 if (_tokens[i] == null) {
+                     continue;
+                 }
+                 // but not just one
+                 // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
++                // 13-Dec-2015, tatu: ... OR, maybe property is declared as ignorable?
+                 if (!extProp.hasDefaultType()) {
+                     ctxt.reportInputMismatch(_beanType,
+                             "Missing external type id property '%s'",
+                             extProp.getTypePropertyName());
+                 } else {
+                     typeId = extProp.getDefaultTypeId();
+                 }
+             } else if (_tokens[i] == null) {
+                 SettableBeanProperty prop = extProp.getProperty();
++                // 13-Dec-2015, tatu: As per [databind#1028], may be acceptable for optional props
++                if (prop.isRequired() ||
++                        ctxt.isEnabled(DeserializationFeature.FAIL_ON_MISSING_EXTERNAL_TYPE_ID_PROPERTY)) {
+                     ctxt.reportInputMismatch(_beanType,
+                         "Missing property '%s' for external type id '%s'",
+-                        prop.getName(), _properties[i].getTypePropertyName());
++                        prop.getName(), extProp.getTypePropertyName());
++                } else {
++                    // Simply skip the property, results in `null` value assigned by creator/setter
++                    continue;
+                 }
++            }
++
++            // 05-Sep-2019, tatu: Note that `typeId` is ALWAYS `String` at this point;
++            //    if POJO has type id property of different type, conversion needed later on
+             values[i] = _deserialize(p, ctxt, i, typeId);
+ 
+             final SettableBeanProperty prop = extProp.getProperty();
+             // also: if it's creator prop, fill in
+             if (prop.getCreatorIndex() >= 0) {
+                 buffer.assignParameter(prop, values[i]);
+ 
+                 // [databind#999] And maybe there's creator property for type id too?
+                 SettableBeanProperty typeProp = extProp.getTypeProperty();
+                 // for now, should only be needed for creator properties, too
+                 if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
+                     // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
+                     //    apply deserializer... fun fun.
+-                    buffer.assignParameter(typeProp, typeId);
++                    // 16-Aug-2018, tatu: ... also, as per [databind#2113], need to handle `null`
++                    Object typeValue;
++                    // 05-Sep-2019, tatu: We should only use `TokenBuffer` if type is NOT String
++                    //    (or, more generally, something that can't be assigned from String)
++                    // First check: property type is `String`?
++                    if (typeProp.getType().hasRawClass(String.class)) {
++                        typeValue = typeId;
++                    } else {
++                        // Use TokenBuffer to wrap typeId String as a token stream, then deserialize
++                        TokenBuffer tb = new TokenBuffer(p, ctxt);
++                        tb.writeString(typeId);
++    
++                        // important: find deserializer capable of handling actual type from String token
++                        JsonDeserializer<Object> deser = ctxt.findContextualValueDeserializer(typeProp.getType(), typeProp);
++    
++                        // 05-Sep-2019, tatu: Need to be careful to use "scalar" settings when reading
++                        //   from buffer... although shouldn't matter greatly for primitives
++                        JsonParser bufferedParser = tb.asParser(p); // != null
++                        bufferedParser.nextToken(); // advances to VALUE_STRING
++                        typeValue = deser.deserialize(bufferedParser, ctxt);
++                        tb.close();
++                        // 29-Jul-2020, tatu: [databind#2793]: Need to ensure no extra tokens left (if any)
++                        //    Can be multiple? For now, assume just one optional END_OBJECT
++                        //    (will this ever work? How would END_OBJECT get there? For now, comment out)
++                        /*
++                        if (bufferedParser.nextToken() != null) {
++                             ctxt.reportWrongTokenException(typeProp.getType(), JsonToken.END_OBJECT,
++                                     "Expected END_OBJECT after external type id ('%s') property-based value",
++                                     typeProp.getName());
++                        }
++                        */
++                    }
++                    buffer.assignParameter(typeProp, typeValue);
+                 }
+             }
+         }
+         Object bean = creator.build(ctxt, buffer);
+         // third: assign non-creator properties
+         for (int i = 0; i < len; ++i) {
+             SettableBeanProperty prop = _properties[i].getProperty();
+             if (prop.getCreatorIndex() < 0) {
++                 // 13-Dec-2015, tatu: Is this check useful? What would `values[i]` be?
++                 // (null if skipped above due to missing prop)
++                 if (values[i] != null) {
+                     prop.set(bean, values[i]);
++                 } else {
++                     // What if it's required?
++                    if (prop.isRequired()) {
++                        ctxt.reportInputMismatch(prop, "Missing required property '%s' for external type id '%s'",
++                                prop.getName(), _properties[i].getTypePropertyName());
++                    }
++                 }
+             }
+         }
+         return bean;
+     }
+\ No newline at end of file

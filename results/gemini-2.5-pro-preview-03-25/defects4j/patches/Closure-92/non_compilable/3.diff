@@ -1,0 +1,193 @@
+diff --git a/tmp/453d3ecb-511b-4dba-a5b3-987afa67310c_buggy.java b/tmp/c82abc46-90ea-4597-8359-4d17a2969e4a_fixed.java
+index 851ffc2..aed2a60 100644
+--- a/tmp/453d3ecb-511b-4dba-a5b3-987afa67310c_buggy.java
++++ b/tmp/c82abc46-90ea-4597-8359-4d17a2969e4a_fixed.java
+@@ -1,70 +1,155 @@
+     /**
+      * Replace the provide statement.
+      *
+      * If we're providing a name with no definition, then create one.
+      * If we're providing a name with a duplicate definition, then make sure
+      * that definition becomes a declaration.
+      */
+     void replace() {
++      // goog.provide('goog') is special cased in ProcessClosurePrimitives.
++      // Either firstNode or candidateDefinition must be non-null.
++      // (It's possible that firstNode is null if the namespace is implicitly
++      // provided by a definition rather than a goog.provide).
++      Preconditions.checkState(firstNode != null || candidateDefinition != null,
++          "Neither firstNode nor candidateDefinition is non-null for namespace %s", namespace);
++
++
+       if (firstNode == null) {
+-        // Don't touch the base case ('goog').
++        // This namespace must be provided implicitly by a definition,
++        // and this definition is the first node we encounter.
++        // Example:
++        // M1: goog.provide('a');
++        // M2: var a = {}; goog.provide('a.b');
++        // Assume M2 is processed first. We process 'a.b'. Its parent 'a'
++        // has candidateDefinition='var a={};' and firstNode=null.
+         replacementNode = candidateDefinition;
++        // We assume candidateDefinition is already placed correctly or will be handled.
+         return;
+       }
+ 
+       // Handle the case where there is a duplicate definition for an explicitly
+-      // provided symbol.
++      // provided symbol ('explicitNode' will be the goog.provide call).
+       if (candidateDefinition != null && explicitNode != null) {
+-        explicitNode.detachFromParent();
++        explicitNode.detachFromParent(); // Remove the goog.provide call.
+         compiler.reportCodeChange();
+ 
+-        // Does this need a VAR keyword?
++        // Default to using the candidateDefinition as the replacement.
+         replacementNode = candidateDefinition;
+-        if (NodeUtil.isExpressionNode(candidateDefinition)) {
+-          candidateDefinition.putBooleanProp(Node.IS_NAMESPACE, true);
+-          Node assignNode = candidateDefinition.getFirstChild();
+-          Node nameNode = assignNode.getFirstChild();
+-          if (nameNode.getType() == Token.NAME) {
+-            // Need to convert this assign to a var declaration.
+-            Node valueNode = nameNode.getNext();
+-            assignNode.removeChild(nameNode);
+-            assignNode.removeChild(valueNode);
+-            nameNode.addChildToFront(valueNode);
++
++        // If the candidate is an assignment 'a = ...', try to convert to 'var a = ...'.
++        // This is fragile and doesn't handle all cases (e.g., obj.a = ...).
++        // It also assumes the definition is at the global scope.
++        // See testAssignBeforeProvide and ProcessClosurePrimitives#processProvide.
++        if (NodeUtil.isExprAssign(candidateDefinition)) {
++          Node assignNode = candidateDefinition.getFirstChild(); // ASSIGN
++          Node nameNode = assignNode.getFirstChild(); // LHS of assign
++          if (nameNode.isName()) { // Only convert if LHS is simple name 'a', not 'a.b'
++            Node valueNode = nameNode.getNext(); // RHS of assign
++
++            // Detach children from ASSIGN
++            assignNode.detachChildren();
++
++            // Build the new VAR node
++            nameNode.addChildToFront(valueNode); // NAME becomes NAME(value)
+             Node varNode = new Node(Token.VAR, nameNode);
+-            varNode.copyInformationFrom(candidateDefinition);
+-            candidateDefinition.getParent().replaceChild(
+-                candidateDefinition, varNode);
+-            nameNode.setJSDocInfo(assignNode.getJSDocInfo());
++            varNode.copyInformationFromForTree(candidateDefinition); // Copy source info
++
++            // Try to preserve JSDoc (check both EXPR_RESULT and ASSIGN)
++            JSDocInfo JSDoc = candidateDefinition.getJSDocInfo();
++            if (JSDoc == null) {
++               JSDoc = assignNode.getJSDocInfo();
++            }
++            if (JSDoc != null) {
++               nameNode.setJSDocInfo(JSDoc); // Attach JSDoc to the NAME node
++            }
++
++            // Replace the original EXPR_RESULT with the VAR node if possible.
++            Node parent = candidateDefinition.getParent();
++            if (parent != null) {
++               parent.replaceChild(candidateDefinition, varNode);
+                compiler.reportCodeChange();
++               replacementNode = varNode; // Use the new VAR node as the replacement
++            } else {
++               // candidateDefinition wasn't in the tree; this might be problematic.
++               // replacementNode will be the detached VAR node. Its placement
++               // depends on subsequent logic (e.g., module handling).
+                replacementNode = varNode;
+             }
+           }
++        }
++        // If conversion didn't happen, replacementNode remains candidateDefinition.
++        // We assume candidateDefinition is already correctly placed or will be handled.
++
+       } else {
+         // Handle the case where there's not a duplicate definition.
++        // Create a declaration 'var ns = {};' or 'ns.sub = {};'
+         replacementNode = createDeclarationNode();
++
++        // Determine where to insert the new declaration node.
+         if (firstModule == minimumModule) {
+-          firstNode.getParent().addChildBefore(replacementNode, firstNode);
++          // The first time we saw this namespace was in the earliest module.
++          // Insert the declaration before that first node.
++          Node insertionPoint = firstNode;
++          Node insertionPointParent = insertionPoint.getParent();
++          Preconditions.checkNotNull(insertionPointParent, "firstNode for %s must be in the AST.", namespace);
++          insertionPointParent.addChildBefore(replacementNode, insertionPoint);
++          compiler.reportCodeChange();
+         } else {
+-          // In this case, the name was implicitly provided by two independent
+-          // modules. We need to move this code up to a common module.
++          // This namespace was first seen in a later module, but needs to be
++          // declared in an earlier common ancestor module (minimumModule).
+           int indexOfDot = namespace.indexOf('.');
++          Node insertionScript = compiler.getNodeForCodeInsertion(minimumModule);
++          Preconditions.checkNotNull(insertionScript, "Cannot get insertion point SCRIPT for module %s", minimumModule);
++          Preconditions.checkState(insertionScript.isScript(), "Insertion point %s is not a SCRIPT node", insertionScript);
++
+           if (indexOfDot == -1) {
+-            // Any old place is fine.
+-            compiler.getNodeForCodeInsertion(minimumModule)
+-                .addChildToBack(replacementNode);
++            // Top-level namespace (e.g., 'var apps = {}').
++            // Add it to the end of the common module's script.
++            insertionScript.addChildToBack(replacementNode);
++            compiler.reportCodeChange();
+           } else {
+-            // Add it after the parent namespace.
+-            ProvidedName parentName =
+-                providedNames.get(namespace.substring(0, indexOfDot));
+-            Preconditions.checkNotNull(parentName);
+-            Preconditions.checkNotNull(parentName.replacementNode);
+-            parentName.replacementNode.getParent().addChildAfter(
+-                replacementNode, parentName.replacementNode);
++            // Nested namespace (e.g., 'apps.foo = {}').
++            // Add it *after* its parent namespace declaration in the common module.
++            String parentNamespace = namespace.substring(0, indexOfDot);
++            ProvidedName parentName = providedNames.get(parentNamespace);
++            Preconditions.checkNotNull(parentName, "No parent ProvidedName entry for '%s' found when processing '%s'", parentNamespace, namespace);
++
++            // Crucial Assumption: The parent namespace must have been processed *before* the child.
++            Node parentNode = parentName.replacementNode;
++            Preconditions.checkNotNull(parentNode,
++                "Parent namespace '%s' has not been replaced yet (check processing order).", parentNamespace);
++
++            Node parentNodeParent = parentNode.getParent();
++            // Check that the parent node is in the tree and attached to the expected script node.
++            Preconditions.checkNotNull(parentNodeParent,
++                "Parent namespace node '%s' is not attached to the AST.", parentNamespace);
++            Preconditions.checkState(parentNodeParent == insertionScript,
++                "Parent namespace node '%s' is not in the expected SCRIPT node for module %s. Found in %s.",
++                parentNamespace, minimumModule, parentNodeParent);
++
++            // Insert the child declaration right after the parent declaration.
++            parentNodeParent.addChildAfter(replacementNode, parentNode);
++            compiler.reportCodeChange();
+           }
+         }
+-        if (explicitNode != null) {
++
++        // If this namespace had an explicit goog.provide call associated with it
++        // (which wasn't the first node encountered for the namespace), remove it now.
++        if (explicitNode != null && explicitNode != firstNode) {
+           explicitNode.detachFromParent();
++          compiler.reportCodeChange();
+         }
++        // If the first node encountered was the explicit goog.provide call for this
++        // namespace, remove it as well (we've now added the proper declaration).
++        // Check node type to ensure it's the goog.provide call expression.
++        if (explicitNode == firstNode && firstNode.isExprResult()) {
++            Node callNode = firstNode.getFirstChild();
++            if (callNode != null && callNode.isCall() &&
++                callNode.getFirstChild() != null && // Check grandchild exists
++                callNode.getFirstChild().matchesQualifiedName("goog.provide")) {
++               firstNode.detachFromParent();
+                compiler.reportCodeChange();
+             }
+         }
++      }
++    }
+\ No newline at end of file

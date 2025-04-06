@@ -1,0 +1,152 @@
+diff --git a/tmp/412a38a5-3e7c-4d4c-a0a6-df4384f38100_buggy.java b/tmp/0faa0104-52d3-476b-a465-ab05c226c04f_fixed.java
+index 9353941..0a044ea 100644
+--- a/tmp/412a38a5-3e7c-4d4c-a0a6-df4384f38100_buggy.java
++++ b/tmp/0faa0104-52d3-476b-a465-ab05c226c04f_fixed.java
+@@ -1,30 +1,139 @@
+   /**
+    * Give an expression and a variable. It returns READ, if the first
+    * reference of that variable is a read. It returns KILL, if the first
+    * reference of that variable is an assignment. It returns MAY_LIVE otherwise.
++   * This analysis considers the JavaScript evaluation order.
+    */
+   private VariableLiveness isVariableReadBeforeKill(
+       Node n, String variable) {
++
++    // Base case: Found the variable NAME node. Check if it's a read.
+     if (NodeUtil.isName(n) && variable.equals(n.getString())) {
+-      if (NodeUtil.isLhs(n, n.getParent())) {
+-        // The expression to which the assignment is made is evaluated before
+-        // the RHS is evaluated (normal left to right evaluation) but the KILL
+-        // occurs after the RHS is evaluated.
+-        return VariableLiveness.KILL;
++      // If it's the LHS of an assignment(-op) or inc/dec, the specific node handler
++      // below will determine the exact read/kill order based on evaluation rules.
++      // Otherwise (it's used in any other context), it's a read.
++      Node parent = n.getParent();
++      boolean isLhs = (parent != null) &&
++                      (parent.isAssign() || NodeUtil.isAssignmentOp(parent) || parent.isInc() || parent.isDec()) &&
++                      (parent.getFirstChild() == n);
++
++      if (!isLhs) {
++         // This is a read operation.
++         return VariableLiveness.READ;
+       } else {
++         // This is a NAME node on the LHS of an assignment or update.
++         // Let the specific handler for the parent ASSIGN/ASSIGN_OP/INC/DEC
++         // determine the effective operation order (read/kill).
++         // Return MAYBE_LIVE so the traversal continues to that parent handler.
++         return VariableLiveness.MAYBE_LIVE;
++      }
++    }
++
++    // Handle assignments (=) specially for evaluation order.
++    if (n.isAssign()) {
++      Node lhs = n.getFirstChild();
++      Node rhs = n.getLastChild();
++
++      // 1. Check RHS first (evaluated before assignment).
++      VariableLiveness rhsLiveness = isVariableReadBeforeKill(rhs, variable);
++      if (rhsLiveness != VariableLiveness.MAYBE_LIVE) {
++        // Found the first read/kill on the RHS.
++        return rhsLiveness;
++      }
++
++      // 2. Check for reads within the LHS structure (e.g., a[x] = ..., evaluated before kill).
++      VariableLiveness lhsReadLiveness = isVariableReadBeforeKill(lhs, variable);
++      if (lhsReadLiveness == VariableLiveness.READ) {
++          // Found a read within the LHS structure itself.
++          return VariableLiveness.READ;
++      }
++
++      // 3. Check if the LHS node *is* the variable name being assigned to. This is the KILL site.
++      if (NodeUtil.isName(lhs) && variable.equals(lhs.getString())) {
++          // The KILL happens AFTER evaluating RHS and any reads within the LHS structure.
++          // If we reached here, no earlier read/kill was found.
++          return VariableLiveness.KILL;
++      }
++
++      // 4. If the variable wasn't read/killed in RHS, not read in LHS structure,
++      //    and the LHS isn't the variable name itself, maybe it was killed
++      //    within the LHS structure (e.g., a[x=1]=2 searching for x)?
++      //    Return the result from analyzing the LHS structure.
++      return lhsReadLiveness; // Returns KILL or MAYBE_LIVE
++    }
++
++    // Handle assignment operators (+=, -=, etc.). x += y roughly means x = x + y.
++    // Read of x happens first, then RHS, then kill of x.
++    if (NodeUtil.isAssignmentOp(n)) {
++        Node lhs = n.getFirstChild();
++        Node rhs = n.getLastChild();
++
++        // 1. Check for reads within the LHS structure itself (e.g., a[x] += ...)
++        //    This read happens before the implicit read of the LHS variable itself.
++        VariableLiveness lhsReadLiveness = isVariableReadBeforeKill(lhs, variable);
++        if (lhsReadLiveness == VariableLiveness.READ) {
+              return VariableLiveness.READ;
+         }
++        // Keep track of KILL/MAYBE_LIVE state from LHS structure analysis.
++
++        // 2. Check if the LHS node *is* the variable name. This implies an initial READ.
++        if (NodeUtil.isName(lhs) && variable.equals(lhs.getString())) {
++            // The read of 'x' in 'x op y' happens before the RHS evaluation and the final assignment.
++            return VariableLiveness.READ;
+         }
+ 
+-    // Expressions are evaluated left-right, depth first.
++        // 3. Check the RHS for reads/kills (evaluated after LHS variable is read).
++        VariableLiveness rhsLiveness = isVariableReadBeforeKill(rhs, variable);
++        if (rhsLiveness != VariableLiveness.MAYBE_LIVE) {
++            return rhsLiveness;
++        }
++
++        // 4. If we reached here: Variable not read in LHS structure (step 1),
++        //    LHS is not the variable name (step 2 implies implicit read already returned),
++        //    and not read/killed in RHS (step 3).
++        //    The only possibility left is a KILL within the LHS structure or MAYBE_LIVE.
++       return lhsReadLiveness; // Returns KILL or MAYBE_LIVE
++    }
++
++
++    // Handle ++ and -- (read occurs first for both prefix and postfix).
++    if (n.isInc() || n.isDec()) {
++       Node operand = n.getFirstChild();
++
++       // 1. Check for reads/kills inside the operand structure first (e.g., a[x]++).
++       //    These happen during operand evaluation, before the inc/dec read/write.
++       VariableLiveness operandLiveness = isVariableReadBeforeKill(operand, variable);
++       if (operandLiveness == VariableLiveness.READ) { // Found read inside structure first.
++           return VariableLiveness.READ;
++       }
++       // Keep track of KILL/MAYBE_LIVE state.
++
++       // 2. If the operand itself is the variable name (e.g. x++).
++       if (NodeUtil.isName(operand) && variable.equals(operand.getString())) {
++           // The read of the variable's value happens before the kill (write back).
++           return VariableLiveness.READ;
++       }
++
++       // 3. If not read inside the structure, and the operand is not the variable name,
++       //    return the result from the operand structure analysis (KILL or MAYBE_LIVE).
++       return operandLiveness;
++    }
++
++
++    // General case: Traverse children left-to-right according to standard evaluation order.
++    // This handles operators like &&, ||, comma, etc., respecting their evaluation flow.
+     for (Node child = n.getFirstChild();
+         child != null; child = child.getNext()) {
+-      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // Not a FUNCTION
++      // Skip FUNCTION nodes, as they represent a different scope/CFG boundary.
++      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) {
+         VariableLiveness state = isVariableReadBeforeKill(child, variable);
+         if (state != VariableLiveness.MAYBE_LIVE) {
++          // Found the first read/kill in this child, return immediately.
+           return state;
+         }
+       }
+     }
++
++    // Variable was not read or killed in this subtree according to evaluation order.
+     return VariableLiveness.MAYBE_LIVE;
+   }
+\ No newline at end of file

@@ -1,0 +1,131 @@
+diff --git a/tmp/65de1f8e-4de9-42db-8471-dd5d0e429191_buggy.java b/tmp/272d6d6b-22f5-4812-9e77-67a4a44cc471_fixed.java
+index f591bc6..82b271e 100644
+--- a/tmp/65de1f8e-4de9-42db-8471-dd5d0e429191_buggy.java
++++ b/tmp/272d6d6b-22f5-4812-9e77-67a4a44cc471_fixed.java
+@@ -1,74 +1,99 @@
+     protected Object decodeAvrmc(
+             String sentence, Channel channel, SocketAddress remoteAddress) {
+ 
++        // PATTERN_AVRMC = new PatternBuilder()
++        //         ...
++        //         .number("(d+.?d*),")             // 15: Odometer (km)
++        //         .number("([01]),")               // 16: GPS Fix Status
++        //         .number("([01]),")               // 17: Mode
++        //         .number("([01])")                // 18: IO Status
++        //         .optional(5, ",")                // Optional separator for network info
++        //         .number("(xxxx),")               // 19: LAC (Hex)
++        //         .number("(xxxx),")               // 20: CID (Hex)
++        //         .number("(d+),")                 // 21: MCC
++        //         .number("(d+)")                  // 22: MNC
++        //         .optional(6, ",")                // Optional separator for unused field
++        //         .number("(d*)")                  // 23: Unused
++        //         .text("*")
++        //         .number("(xx)")                  // 24: Checksum
++        //         .compile();
++
+         Parser parser = new Parser(PATTERN_AVRMC, sentence);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+         DeviceSession deviceSession =
+-            getDeviceSession(channel, remoteAddress, parser.next());
++            getDeviceSession(channel, remoteAddress, parser.next()); // 1: ID
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+-        String deviceModel = null;
+         Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
+-        if (device != null) {
+-            deviceModel = device.getModel();
+-        }
+ 
+         Position position = new Position(getProtocolName());
+-
+         position.setDeviceId(deviceSession.getDeviceId());
++
+         DateBuilder dateBuilder = new DateBuilder()
+-                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0)); // 2: Time
+ 
+-        String status = parser.next();
++        String status = parser.next(); // 3: Status
+         String upperCaseStatus = status.toUpperCase();
+         position.setValid(upperCaseStatus.equals("A") || upperCaseStatus.equals("R") || upperCaseStatus.equals("P"));
+         position.set(Position.KEY_STATUS, status);
+ 
+-        position.setLatitude(parser.nextCoordinate());
+-        position.setLongitude(parser.nextCoordinate());
+-        position.setSpeed(parser.nextDouble(0));
+-        position.setCourse(parser.nextDouble(0));
++        position.setLatitude(parser.nextCoordinate());  // 4, 5, 6
++        position.setLongitude(parser.nextCoordinate()); // 7, 8, 9
++        position.setSpeed(UnitsConverter.knotsFromKph(parser.nextDouble(0))); // 10: Speed (KPH -> Knots)
++        position.setCourse(parser.nextDouble(0));     // 11: Course
+ 
+-        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0)); // 12: Date
+         position.setTime(dateBuilder.getDate());
+ 
+-        String event = parser.next();
++        String event = parser.next(); // 13: Event
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+-        position.set(Position.KEY_EVENT, decodeEvent(event, position, deviceModel));
+-        position.set(Position.KEY_BATTERY, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001);
+-        position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000);
+-        position.set(Position.KEY_GPS, parser.nextInt());
+-        position.set(Position.PREFIX_ADC + 1, parser.nextDouble() * 0.001);
+-
+-        if ("AVL110".equals(deviceModel) || "AVL120".equals(deviceModel)) {
+-            position.set(Position.PREFIX_ADC + 2, parser.nextDouble() * 0.001);
++        // Pass model safely
++        position.set(Position.KEY_EVENT, decodeEvent(event, position, device != null ? device.getModel() : null));
++
++        // 14: Battery (handles "3.727" and "4076" formats -> Volts)
++        position.set(Position.KEY_VOLTAGE, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001);
++
++        // 15: Odometer (Pattern: d+.?d*, assuming km -> m conversion)
++        position.set(Position.KEY_ODOMETER, (long) (parser.nextDouble(0) * 1000)); // Store as Long meters
++
++        // 16: GPS Fix Status (Pattern: [01])
++        position.set(Position.KEY_GPS, parser.nextInt(0));
++
++        // 17: Mode (Pattern: [01]) - Consume but not stored, previously misinterpreted as ADC1
++        parser.skip(1);
++
++        // 18: IO Status (Pattern: [01]) - Store if available, previously misinterpreted as ADC2
++        Integer ioStatus = parser.nextInt();
++        if (ioStatus != null) {
++            position.set(Position.KEY_INPUT, ioStatus); // Use KEY_INPUT for general IO status
+         }
+ 
++        // Network Info (Optional Groups 19-22)
+         Integer lac = parser.nextHexInt();
+         Integer cid = parser.nextHexInt();
+         Integer mcc = parser.nextInt();
+         Integer mnc = parser.nextInt();
+-        if (lac != null && cid != null && mcc != null && mnc != null) {
++        // Add check for null and 0 MCC/MNC which indicates invalid/unavailable network info
++        if (mcc != null && mnc != null && mcc != 0 && mnc != 0 && lac != null && cid != null) {
+             position.setNetwork(new Network(CellTower.from(mcc, mnc, lac, cid)));
+         }
+ 
+-        parser.next(); // unused
++        parser.next(); // 23: unused field
+ 
+-        String checksum = parser.next();
++        String checksum = parser.next(); // 24: checksum
+ 
+         if (channel != null) {
+-
+             sendAcknowledge(status, event, checksum, channel, remoteAddress);
+ 
+             String devicePassword = AttributeUtil.getDevicePassword(
+                     getCacheManager(), deviceSession.getDeviceId(), getProtocolName(), DEFAULT_DEVICE_PASSWORD);
+             sendEventResponse(event, devicePassword, channel, remoteAddress);
+         }
+ 
+         return position;
+     }
+\ No newline at end of file

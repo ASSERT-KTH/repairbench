@@ -1,0 +1,215 @@
+diff --git a/tmp/3659488f-1169-4a03-891f-be892a839df4_buggy.java b/tmp/e57fdd8c-69c8-45a1-8ced-d70774cd5ad9_fixed.java
+index ae9ef3f..afb3955 100644
+--- a/tmp/3659488f-1169-4a03-891f-be892a839df4_buggy.java
++++ b/tmp/e57fdd8c-69c8-45a1-8ced-d70774cd5ad9_fixed.java
+@@ -1,158 +1,206 @@
+   /**
+    * Parses the externs and main inputs.
+    *
+    * @return A synthetic root node whose two children are the externs root
+    *     and the main root
+    */
+   Node parseInputs() {
+     boolean devMode = options.devMode != DevMode.OFF;
+ 
+     // If old roots exist (we are parsing a second time), detach each of the
+     // individual file parse trees.
+     if (externsRoot != null) {
+       externsRoot.detachChildren();
+     }
+     if (jsRoot != null) {
+       jsRoot.detachChildren();
+     }
+ 
+     // Parse main js sources.
+     jsRoot = IR.block();
+     jsRoot.setIsSyntheticBlock(true);
+ 
+     externsRoot = IR.block();
+     externsRoot.setIsSyntheticBlock(true);
+ 
+     externAndJsRoot = IR.block(externsRoot, jsRoot);
+     externAndJsRoot.setIsSyntheticBlock(true);
+ 
+     if (options.tracer.isOn()) {
+       tracker = new PerformanceTracker(jsRoot, options.tracer);
+       addChangeHandler(tracker.getCodeChangeHandler());
+     }
+ 
+     Tracer tracer = newTracer("parseInputs");
+ 
+     try {
+       // Parse externs sources.
+       for (CompilerInput input : externs) {
+         Node n = input.getAstRoot(this);
+         if (hasErrors()) {
+           return null;
+         }
+         externsRoot.addChildToBack(n);
+       }
+ 
+       // Modules inferred in ProcessCommonJS pass.
+       if (options.transformAMDToCJSModules || options.processCommonJSModules) {
+         processAMDAndCommonJSModules();
+       }
+ 
+       // Check if inputs need to be rebuilt from modules.
+       boolean staleInputs = false;
+ 
+       // Check if the sources need to be re-ordered.
+-      if (options.dependencyOptions.needsManagement() &&
+-          !options.skipAllPasses &&
+-          options.closurePass) {
++      // Input files with the @externs annotation are moved from the sources
++      // list to the externs list here.
++      if (options.dependencyOptions.needsManagement()) {
+         for (CompilerInput input : inputs) {
+           // Forward-declare all the provided types, so that they
+           // are not flagged even if they are dropped from the process.
++          // TODO(nicksantos): This pass should not be necessary.
+           for (String provide : input.getProvides()) {
+             getTypeRegistry().forwardDeclareType(provide);
+           }
+         }
+ 
+         try {
+           inputs =
+               (moduleGraph == null ? new JSModuleGraph(modules) : moduleGraph)
+               .manageDependencies(options.dependencyOptions, inputs);
+           staleInputs = true;
+         } catch (CircularDependencyException e) {
+           report(JSError.make(
+               JSModule.CIRCULAR_DEPENDENCY_ERROR, e.getMessage()));
+ 
+           // If in IDE mode, we ignore the error and keep going.
+           if (hasErrors()) {
+             return null;
+           }
+         } catch (MissingProvideException e) {
++          // TODO(nicksantos): Add a specific error for this.
+           report(JSError.make(
+               MISSING_ENTRY_ERROR, e.getMessage()));
+ 
+           // If in IDE mode, we ignore the error and keep going.
+           if (hasErrors()) {
+             return null;
+           }
+         }
++
++        // If we're doing dependency management, inputs have been re-ordered.
++        // If we're not doing dependency management, we may still have inputs
++        // that need to be marked as externs. Loop through the original inputs
++        // and deal with externs and modules.
++        //
++        // TODO(nicksantos): Clean this up. It's very confusing.
++        // Input handling should be done in one place.
++        for (CompilerInput input : inputs) {
++          Node n = input.getAstRoot(this);
++
++          // Inputs can have a null AST during initial parse.
++          if (n == null) {
++            continue;
++          }
++
++          if (n.getJSDocInfo() != null) {
++            JSDocInfo info = n.getJSDocInfo();
++            if (info.isExterns()) {
++              // If the input file is explicitly marked as an externs file, then
++              // assume the programmer made a mistake and throw it into
++              // the externs pile anyways.
++              externsRoot.addChildToBack(n);
++              input.setIsExtern(true);
++
++              if (input.getModule() != null) {
++                input.getModule().remove(input);
+               }
+ 
++              externs.add(input);
++              staleInputs = true;
++            } else if (info.isNoCompile()) {
++              if (input.getModule() != null) {
++                input.getModule().remove(input);
++              }
++              staleInputs = true;
++            }
++          }
++        }
++      } else {
++        // If we're not doing dependency management, we still need to swallow
++        // files with @externs and @nocompile annotations.
+         for (CompilerInput input : inputs) {
+           Node n = input.getAstRoot(this);
+ 
+           // Inputs can have a null AST during initial parse.
+           if (n == null) {
+             continue;
+           }
+ 
+           if (n.getJSDocInfo() != null) {
+             JSDocInfo info = n.getJSDocInfo();
+             if (info.isExterns()) {
+               // If the input file is explicitly marked as an externs file, then
+               // assume the programmer made a mistake and throw it into
+               // the externs pile anyways.
+               externsRoot.addChildToBack(n);
+               input.setIsExtern(true);
+ 
++              if (input.getModule() != null) {
+                 input.getModule().remove(input);
++              }
+ 
+               externs.add(input);
+               staleInputs = true;
+             } else if (info.isNoCompile()) {
++              if (input.getModule() != null) {
+                 input.getModule().remove(input);
++              }
+               staleInputs = true;
+             }
+           }
+         }
++      }
++
+ 
+       if (staleInputs) {
+         fillEmptyModules(modules);
+         rebuildInputsFromModules();
+       }
+ 
+       // Build the AST.
+       for (CompilerInput input : inputs) {
+         Node n = input.getAstRoot(this);
+         if (n == null) {
+           continue;
+         }
+ 
+         if (devMode) {
+           runSanityCheck();
+           if (hasErrors()) {
+             return null;
+           }
+         }
+ 
+         if (options.sourceMapOutputPath != null ||
+             options.nameReferenceReportPath != null) {
+ 
+           // Annotate the nodes in the tree with information from the
+           // input file. This information is used to construct the SourceMap.
+           SourceInformationAnnotator sia =
+               new SourceInformationAnnotator(
+                   input.getName(), options.devMode != DevMode.OFF);
+           NodeTraversal.traverse(this, n, sia);
+         }
+ 
+         jsRoot.addChildToBack(n);
+       }
+ 
+       if (hasErrors()) {
+         return null;
+       }
+       return externAndJsRoot;
+     } finally {
+       stopTracer(tracer, "parseInputs");
+     }
+   }
+\ No newline at end of file

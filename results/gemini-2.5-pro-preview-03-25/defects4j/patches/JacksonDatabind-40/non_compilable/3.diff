@@ -1,0 +1,360 @@
+diff --git a/tmp/3cd98fa3-63be-4e6a-8332-4c3e087232e3_buggy.java b/tmp/41b56716-6469-432c-b705-c2a0fc3f9cd8_fixed.java
+index e69de29..163680a 100644
+--- a/tmp/3cd98fa3-63be-4e6a-8332-4c3e087232e3_buggy.java
++++ b/tmp/41b56716-6469-432c-b705-c2a0fc3f9cd8_fixed.java
+@@ -0,0 +1,354 @@
++package com.fasterxml.jackson.databind.deser.std;
++
++import java.io.IOException;
++
++import com.fasterxml.jackson.core.*;
++
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.cfg.CoercionAction;
++import com.fasterxml.jackson.databind.cfg.CoercionInputShape;
++import com.fasterxml.jackson.databind.jsontype.TypeDeserializer;
++import com.fasterxml.jackson.databind.type.LogicalType;
++import com.fasterxml.jackson.databind.util.AccessPattern;
++import com.fasterxml.jackson.databind.util.ClassUtil;
++
++/**
++ * Base class for common deserializers. Contains shared functionality.
++ */
++public abstract class StdScalarDeserializer<T> extends StdDeserializer<T>
++{
++    private static final long serialVersionUID = 1L;
++
++    protected StdScalarDeserializer(Class<?> vc) { super(vc); }
++    protected StdScalarDeserializer(JavaType valueType) { super(valueType); }
++
++    protected StdScalarDeserializer(StdScalarDeserializer<?> src) { super(src); }
++
++    @Override
++    public LogicalType logicalType() {
++        // By defaultscalar types are... scalar. Fine.
++        return LogicalType.OtherScalar;
++    }
++
++    @Override
++    public Boolean supportsUpdate(DeserializationConfig config) {
++        return Boolean.FALSE;
++    }
++
++    @Override
++    public AccessPattern getNullAccessPattern() {
++        // As per [databind#2135], needs to be dynamic
++        return AccessPattern.ALWAYS_NULL;
++    }
++
++    @Override
++    public Object deserializeWithType(JsonParser p, DeserializationContext ctxt,
++            TypeDeserializer typeDeserializer) throws IOException {
++        return typeDeserializer.deserializeTypedFromScalar(p, ctxt);
++    }
++
++    /**
++     * Overridden to handle coercion problem: if we are getting String value,
++     * need to handle "" perhaps coercing to null, even if input is not textual.
++     * This leads to this somewhat convoluted processing.
++     *<p>
++     * Separate method since this is only needed for textual values and
++     * hence for {@code String}, {@code Enum} and {@code Number} valued types.
++     *
++     * @since 2.12
++     */
++    @SuppressWarnings("unchecked")
++    protected T _deserializeFromString(JsonParser p, DeserializationContext ctxt) throws IOException
++    {
++        // [databind#381] Need to ensure we check for null explicitly here:
++        // note that `p.getText()` should never return null, but just in case
++        String text = p.getValueAsString();
++        if (text != null) {
++            if (text.length() == 0 || text.trim().length() == 0) {
++                // 11-Jun-2020, tatu: In 2.12 need to delegate; behavior likely
++                //   to change for 3.0 (see [databind#2644])
++                return (T) _deserializeFromEmptyString(p, ctxt);
++            }
++            // 16-Aug-2019, tatu: Let's also consider "null" string, see [databind#2435]
++            // 25-Jul-2020, tatu: For 2.12 let's NOT coerce from "null" String using global defaults,
++            //    but only if coercion specifically enabled for this type
++            if (_hasTextualNull(text)) {
++                return (T) _deserializeFromTextualNull(p, ctxt, text);
++            }
++
++            // NOTE: `deserialize(JsonParser, DeserializationContext)` below
++            // is the method implemented by concrete scalar types; NOT the method
++            // in this class. And yes, `getValueAsString()` is probably redundant...
++            try {
++                return deserialize(p, ctxt);
++            } catch (IllegalArgumentException | JsonMappingException e) {
++                // And if it fails, maybe scalar wants to handle it?
++                return (T) ctxt.handleWeirdStringValue(_valueClass, text,
++                        "not a valid textual representation");
++            }
++        }
++
++        // But what if we get, say, number? It should be fine, actually... except... perhaps we
++        // should check for possibilities? For now, let's assume it's ok.
++        // But we have seen cases like [databind#1121]
++        // 16-Oct-2016, tatu: As per [databind#1121], we may also be given non-string,
++        //   non-null token. Need to see if we can make sense of it.
++
++        JsonToken t = p.currentToken();
++        if (t == JsonToken.VALUE_EMBEDDED_OBJECT) {
++            // 20-Oct-2016, tatu: Need to see if this is palatable. May need to indicate
++            //    that we can actually handle embedded Opaque value...
++            Object ob = p.getEmbeddedObject();
++            if (ob != null) {
++                if (_valueClass.isAssignableFrom(ob.getClass())) {
++                    return (T) ob;
++                }
++                return (T) ctxt.handleWeirdNativeValue(_valueClass, ob,
++                        "Cannot deserialize instance of %s out of %s token: given Embedded Object value is of type %s",
++                        ClassUtil.getClassDescription(_valueClass),
++                        t, ClassUtil.classNameOf(ob));
++            }
++            // if null, fall through
++        } else if (t.isScalarValue()) {
++            // Ok, see [databind#381]; need to handle null from VALUE_NULL but
++            // also possible that other scalar types might have been coerced...
++            // However: we probably should NOT allow such coercion, without annotation/feature,
++            // so:
++            return (T) ctxt.handleUnexpectedToken(getValueType(ctxt), p);
++        } else {
++            // 13-Dec-2015, tatu: Should not be possible but perhaps we just want to expedite?
++            //   Need to be careful with JsonToken.VALUE_NULL, however
++            if (t == JsonToken.VALUE_NULL) {
++                // 15-Jan-2019, tatu: Should call `getNullValue()` but not sure if we can?
++                //return getNullValue(ctxt);
++                // 03-Nov-2020, tatu: As per [databind#2916] cannot just return `getNullValue()`
++                //    as that bypasses coercion checks. Need to call this:
++                return _deserializeNull(p, ctxt);
++            }
++        }
++        // 14-Jul-2020, tatu: Should perhaps check for START_ARRAY too? But for now let's expect
++        //   callers deal with unwrapping etc.
++
++        // 19-May-2017, tatu: Let's see if we can report this more accurately, assuming
++        //   non-textual scalar is some sort of mismatch
++        return (T) ctxt.handleUnexpectedToken(getValueType(ctxt), p);
++    }
++
++    /**
++     * Helper method called for {@link JsonToken#VALUE_NULL}.
++     * Mostly needed to support {@link CoercionAction#Fail} for primitive types.
++     *
++     * @since 2.12.1
++     */
++    protected T _deserializeNull(JsonParser p, DeserializationContext ctxt) throws IOException
++    {
++        // 03-Nov-2020, tatu: As per [databind#2916] need to check coercion for VALUE_NULL too
++        final Class<?> targetType = handledType();
++        final CoercionAction act = ctxt.findCoercionAction(logicalType(), targetType,
++                CoercionInputShape.EmptyString);
++        if (ctxt.isEnabled(MapperFeature.ALLOW_COERCION_OF_SCALARS)) {
++            _checkCoercionFail(ctxt, act, targetType, null, "JSON null");
++        }
++        // Almost always returns `getNullValue(ctxt)` but may fail if config overrides:
++        return getNullValue(ctxt);
++    }
++
++    /**
++     * Helper method called when deserializing String value that is empty (or contains only
++     * whitespace). Needs to take into account coercion settings.
++     * May be overridden by sub-classes.
++     *
++     * @since 2.12
++     */
++    protected Object _deserializeFromEmptyString(JsonParser p, DeserializationContext ctxt) throws IOException
++    {
++        final Class<?> targetType = handledType();
++        // 11-Jun-2020, tatu: Should we allow configuration of this? Yes, with CoercionConfigs.
++        // If not specified, how should behave? Let's check legacy setting(s), keeping
++        // in mind that [databind#2644] is proposing removal for 3.0
++        final CoercionAction act = ctxt.findCoercionAction(logicalType(), targetType,
++                CoercionInputShape.EmptyString);
++
++        // This helper will check for `CoercionAction.Fail` first and handle appropriately
++        // (throw exception if necessary; or return action)
++        final CoercionAction act2 = _checkCoercionFail(ctxt, act, targetType, "",
++                "empty String (\"\")");
++
++        if (act2 == null) { // null means `TryConvert`, basically: rely on legacy settings
++            // If indicated to be ok, needs to return `null` or "empty" value...
++            // 06-Oct-2020, tatu: Should only honor legacy setting for non-primitive types
++            if (!targetType.isPrimitive()) {
++                if (ctxt.isEnabled(DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT)) {
++                    return getNullValue(ctxt);
++                }
++            }
++            // If not ok, ought to fail, usually by indicating unexpected token:
++            _reportMissingContent(ctxt, "empty String (\"\")");
++            return null; // never reached
++        }
++        // Otherwise specific action:
++        switch (act2) {
++        case AsNull:
++            return getNullValue(ctxt);
++        case AsEmpty:
++            // 29-Sep-2020, tatu: Should use `getEmptyValue()` which may report an error
++            //    if such value not supported
++            return getEmptyValue(ctxt);
++        // case Fail handled by _checkCoercionFail above
++        // case TryConvert handled above
++        default: // Should not get here
++        }
++        // but if we do get here? Should probably fail.
++        _reportMissingContent(ctxt, "empty String (\"\")");
++        return null; // never reached
++    }
++
++    /**
++     * Helper method called when deserializing String value that is "null" text.
++     * Needs to take into account coercion settings.
++     * May be overridden by sub-classes.
++     *
++     * @since 2.12
++     */
++    protected Object _deserializeFromTextualNull(JsonParser p, DeserializationContext ctxt,
++            String nullText) throws IOException
++    {
++        // 25-Jul-2020, tatu: For 2.12 only check type-specific coercion; NOT global checks
++        //    (unless FAIL_ON_NULL_FOR_PRIMITIVES fails)
++        final Class<?> targetType = handledType();
++        final CoercionAction act = ctxt.findCoercionFromBlankString(logicalType(), targetType,
++                CoercionAction.Fail); // defaults to fail without config
++
++        if (act == CoercionAction.Fail) {
++            // 10-Aug-2020, tatu: For primitive target, use `null` as value for fail check;
++            //    for non-primitive (Object) target `null` is ok always (unless feature enabled?)
++            //    ... which makes it bit complicated. But for now seems like we can do this:
++            if (targetType.isPrimitive()) {
++                _checkCoercionFail(ctxt, act, targetType, null,
++                        "String \"null\"");
++            }
++        } else { // TryConvert, AsEmpty, AsNull...
++            if (act == CoercionAction.AsEmpty) {
++                // 29-Sep-2020, tatu: Should use `getEmptyValue()` which may report an error
++                //    if such value not supported
++                return getEmptyValue(ctxt);
++            }
++        }
++        // Otherwise, AsNull or TryConvert (which effectively means AsNull):
++        return getNullValue(ctxt);
++    }
++
++    /**
++     * Helper method called to determine if logical type is considered integral number.
++     *<p>
++     * Note: {@code float}, {@code double} and {@link java.math.BigDecimal} not considered
++     * integral.
++     *
++     * @since 2.12
++     */
++    protected boolean _isTrueScalarType(LogicalType explicit) {
++        if (explicit != null) {
++            switch (explicit) {
++            case Boolean:
++            case Integer:
++            case Float: // includes Double, BigDecimal
++            case DateTime: // maybe?
++                return true;
++            default:
++            }
++        }
++        return false;
++    }
++
++    /**
++     * @since 2.12
++     */
++    protected CoercionAction _checkCoercionFail(DeserializationContext ctxt,
++            CoercionAction configuredAction, Class<?> targetType, Object inputValue,
++            String inputDesc) throws IOException
++    {
++        // First: if explicitly set to Fail, verify configuration allows that
++        if (configuredAction == CoercionAction.Fail) {
++            // Optional fail, if coercion FEATURES enabled
++            if (ctxt.isEnabled(MapperFeature.ALLOW_COERCION_OF_SCALARS)) {
++                // 10-Aug-2020, tatu: As per [databind#2801], may need to check this case specifically,
++                //    for primitives. But ONLY if action is "Fail"
++                // 06-Oct-2020, tatu: And also... this depends on whether `null` input is problematic
++                //    and that is only true for primitives
++                if (targetType.isPrimitive()) {
++                    // If primitive, null not allowed (unless overridden):
++                    if (inputValue == null) {
++                        // Typically primitive defaults are ok... except when feature enabled
++                        if (!ctxt.isEnabled(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)) {
++                            // no fail means we should allow default value; which happens via `getNullValue()`
++                            // ... so need to indicate `AsNull`?
++                            return CoercionAction.AsNull;
++                        }
++                    }
++                    // But also need to consider case of empty String "" (if inputDesc has it)
++                    else if ("".equals(inputValue)) {
++                        if (!ctxt.isEnabled(DeserializationFeature.FAIL_ON_EMPTY_STRING_FOR_PRIMITIVES)) {
++                            return CoercionAction.AsNull;
++                        }
++                    }
++                }
++                // And in general non-primitive types are ok with null? Seems reasonable
++                // ... although perhaps there should be FAIL_ON_NULL_FOR_OBJECT_TYPES?
++            }
++
++            ctxt.reportBadCoercion(this, targetType, inputValue,
++                    "Cannot coerce %s to Null value as %s (%s disabled)",
++                    inputDesc, _coercedTypeDesc(), "enable ConversionFeatures.ACCEPT_CASE_INSENSITIVE_PROPERTIES");
++        }
++        return configuredAction;
++    }
++
++    /**
++     * Helper method used to report one of potentially many problems with content.
++     *
++     * @param ctxt Context for accessing configuration, getting factory
++     * @param msg Base message to use; may contain formatting arguments
++     * @param msgArgs Optional arguments, if message takes any.
++     *
++     * @since 2.12
++     */
++    protected final void _reportMissingContent(DeserializationContext ctxt,
++            String msg, Object... msgArgs) throws JsonMappingException
++    {
++        if (msgArgs.length > 0) {
++            msg = String.format(msg, msgArgs);
++        }
++        ctxt.reportInputMismatch(this, msg);
++    }
++
++    /**
++     * Method to use for accessing description of type that is being coerced to/from; usually
++     * based on {@code handledType()} but should typically be customized to produce more useful
++     * descriptions for users to indicate actual type being handled, especially within context
++     * of coercion. Defaults to {@code "simple type into Collection"}.
++     *
++     * @return Description of type, used in exception messages
++     *
++     * @since 2.12
++     */
++    protected String _coercedTypeDesc() {
++        // Try to determine actual type handling, if possible; otherwise indicates "simple value"
++        // But not sure this works that well. Sub-types should probably override.
++        JavaType type = getValueType(null);
++        boolean structured;
++        String typeDesc;
++
++        if ((type != null) && !type.isPrimitive()) {
++            structured = type.isContainerType() || type.isReferenceType();
++            typeDesc = ClassUtil.getTypeDescription(type);
++        } else {
++            Class<?> cls = handledType();
++            structured = cls.isArray() || ClassUtil.isCollectionMapOrRecord(cls);
++            typeDesc = ClassUtil.getClassDescription(cls);
++        }
++        if (structured) {
++            return "element of "+typeDesc;
++        }
++        return typeDesc+" value";
++    }
++}
+\ No newline at end of file

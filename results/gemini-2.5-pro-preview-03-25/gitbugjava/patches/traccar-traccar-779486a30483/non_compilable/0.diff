@@ -1,0 +1,150 @@
+diff --git a/tmp/e884646a-c374-4425-bf39-539094802d9b_buggy.java b/tmp/00748a6c-37af-4d8c-9b18-24f55d8429d7_fixed.java
+index f591bc6..b8aa901 100644
+--- a/tmp/e884646a-c374-4425-bf39-539094802d9b_buggy.java
++++ b/tmp/00748a6c-37af-4d8c-9b18-24f55d8429d7_fixed.java
+@@ -1,74 +1,121 @@
+     protected Object decodeAvrmc(
+             String sentence, Channel channel, SocketAddress remoteAddress) {
+ 
++        // Regex pattern PATTERN_AVRMC needs to be robust enough to capture all fields,
++        // including optional ones at the end.
+         Parser parser = new Parser(PATTERN_AVRMC, sentence);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+         DeviceSession deviceSession =
+-            getDeviceSession(channel, remoteAddress, parser.next());
++                getDeviceSession(channel, remoteAddress, parser.next()); // Field 1: Device ID
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         String deviceModel = null;
+         Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
+         if (device != null) {
+             deviceModel = device.getModel();
+         }
+ 
+         Position position = new Position(getProtocolName());
+-
+         position.setDeviceId(deviceSession.getDeviceId());
++
+         DateBuilder dateBuilder = new DateBuilder()
+-                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0)); // Fields 2, 3, 4: Time
+ 
+-        String status = parser.next();
++        String status = parser.next(); // Field 5: Status
+         String upperCaseStatus = status.toUpperCase();
++        // Status 'A', 'R' (remote), 'P' (panic/park) indicate valid GPS fix according to some docs
+         position.setValid(upperCaseStatus.equals("A") || upperCaseStatus.equals("R") || upperCaseStatus.equals("P"));
+         position.set(Position.KEY_STATUS, status);
+ 
+-        position.setLatitude(parser.nextCoordinate());
+-        position.setLongitude(parser.nextCoordinate());
+-        position.setSpeed(parser.nextDouble(0));
+-        position.setCourse(parser.nextDouble(0));
++        position.setLatitude(parser.nextCoordinate()); // Fields 6, 7: Latitude
++        position.setLongitude(parser.nextCoordinate()); // Fields 8, 9: Longitude
++        position.setSpeed(parser.nextDouble(0)); // Field 10: Speed
++        position.setCourse(parser.nextDouble(0)); // Field 11: Course
+ 
+-        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0)); // Fields 12, 13, 14: Date
+         position.setTime(dateBuilder.getDate());
+ 
+-        String event = parser.next();
++        String event = parser.next(); // Field 15: Event code
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, decodeEvent(event, position, deviceModel));
++
++        // Field 16: Battery (can be "3.727" Volts or "3804" mV)
++        // Original logic handles both by removing '.' and treating as mV
++        try {
+             position.set(Position.KEY_BATTERY, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001);
+-        position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000);
+-        position.set(Position.KEY_GPS, parser.nextInt());
+-        position.set(Position.PREFIX_ADC + 1, parser.nextDouble() * 0.001);
++        } catch (NumberFormatException | NullPointerException e) {
++            // Ignore battery parsing errors
++        }
++
++        position.set(Position.KEY_ODOMETER, parser.nextDouble(0) * 1000); // Field 17: Odometer (assumed km -> m)
++        position.set(Position.KEY_GPS, parser.nextInt(0)); // Field 18: GPS Fix Status / Satellites?
++
++        // Optional ADC fields - use hasNext to be safe before reading
++        if (parser.hasNext()) {
++            position.set(Position.PREFIX_ADC + 1, parser.nextDouble(0) * 0.001); // Field 19: ADC1 (assumed mV -> V)
++        }
++        // Check model *and* hasNext before parsing ADC2
++        if (("AVL110".equals(deviceModel) || "AVL120".equals(deviceModel)) && parser.hasNext()) {
++            position.set(Position.PREFIX_ADC + 2, parser.nextDouble(0) * 0.001); // Field 20: ADC2 (assumed mV -> V)
++        }
++
++        // Network info (variable number of fields possible)
++        Integer lac = null;
++        Integer cid = null;
++        Integer mcc = null;
++        Integer mnc = null;
+ 
+-        if ("AVL110".equals(deviceModel) || "AVL120".equals(deviceModel)) {
+-            position.set(Position.PREFIX_ADC + 2, parser.nextDouble() * 0.001);
++        // Check if 4 fields remain for full network info (LAC, CID, MCC, MNC)
++        if (parser.hasNext(4)) {
++             // Assume order: LAC(hex), CID(hex), MCC(dec), MNC(dec)
++             lac = parser.nextHexInt(0); // Use default 0 on parse error
++             cid = parser.nextHexInt(0);
++             mcc = parser.nextInt(0);
++             mnc = parser.nextInt(0);
++        } else if (parser.hasNext(2)) { // Check if 2 fields remain (likely LAC, CID)
++             // Assume order: LAC(hex), CID(hex)
++             lac = parser.nextHexInt(0);
++             cid = parser.nextHexInt(0);
++             // mcc and mnc remain null
+         }
++        // If fewer than 2 fields remain, all network variables remain null or were defaulted to 0.
+ 
+-        Integer lac = parser.nextHexInt();
+-        Integer cid = parser.nextHexInt();
+-        Integer mcc = parser.nextInt();
+-        Integer mnc = parser.nextInt();
+-        if (lac != null && cid != null && mcc != null && mnc != null) {
++        // Set network data if valid components were parsed.
++        // Check > 0 for MCC/MNC because 0 is usually invalid. LAC/CID can be 0.
++        if (mcc != null && mnc != null && lac != null && cid != null && mcc > 0 && mnc > 0) {
+             position.setNetwork(new Network(CellTower.from(mcc, mnc, lac, cid)));
++        } else if (lac != null && cid != null) {
++            // Store partial network info (LAC/CID) if available and not just zeros
++            if (lac != 0 || cid != 0) {
++                 position.set(Position.KEY_LAC, lac);
++                 position.set(Position.KEY_CID, cid);
+             }
++        }
++
++        // Removed: parser.next(); // unused - This was likely incorrect due to variable fields.
+ 
+-        parser.next(); // unused
++        String checksum = null;
++        if (parser.hasNext()) {
++             // The last field available should be the checksum (without '*')
++             checksum = parser.next();
++        }
+ 
+-        String checksum = parser.next();
+ 
+         if (channel != null) {
+-
++            // Ensure mandatory fields for response were parsed correctly
++            if (status != null && event != null && checksum != null) {
+                 sendAcknowledge(status, event, checksum, channel, remoteAddress);
+ 
+                 String devicePassword = AttributeUtil.getDevicePassword(
+                         getCacheManager(), deviceSession.getDeviceId(), getProtocolName(), DEFAULT_DEVICE_PASSWORD);
+                 sendEventResponse(event, devicePassword, channel, remoteAddress);
+             }
++        }
+ 
+         return position;
+     }
+\ No newline at end of file

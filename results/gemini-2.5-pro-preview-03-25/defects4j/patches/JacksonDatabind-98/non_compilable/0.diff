@@ -1,0 +1,140 @@
+diff --git a/tmp/bff2d0a9-5bb1-4528-b41b-31d43319e820_buggy.java b/tmp/bf95f005-0c04-4b31-8ff0-f86363ad9b48_fixed.java
+index afcc27c..697dcdb 100644
+--- a/tmp/bff2d0a9-5bb1-4528-b41b-31d43319e820_buggy.java
++++ b/tmp/bf95f005-0c04-4b31-8ff0-f86363ad9b48_fixed.java
+@@ -1,61 +1,130 @@
+     /**
+      * Variant called when creation of the POJO involves buffering of creator properties
+      * as well as property-based creator.
+      */
+     public Object complete(JsonParser p, DeserializationContext ctxt,
+             PropertyValueBuffer buffer, PropertyBasedCreator creator)
+         throws IOException
+     {
+         // first things first: deserialize all data buffered:
+         final int len = _properties.length;
+         Object[] values = new Object[len];
+         for (int i = 0; i < len; ++i) {
+             String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
+             if (typeId == null) {
+                 // let's allow missing both type and property (may already have been set, too)
+                 if (_tokens[i] == null) {
+                     continue;
+                 }
+                 // but not just one
+                 // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
+                 if (!extProp.hasDefaultType()) {
++                    // 11-Sep-2019, tatu: For [databind#2434], need to consider null type id:
++                    //    is this ok? Needs further work but for now must be accepted.
++                    // Let's see... We may need to default to `null` in buffer, but value may be needed for Creator
+                     ctxt.reportInputMismatch(_beanType,
+-                            "Missing external type id property '%s'",
++                            "Missing external type id property '%s' (and no 'defaultImpl' specified)",
+                             extProp.getTypePropertyName());
+                  } else {
+                     typeId = extProp.getDefaultTypeId();
++                    if (typeId == null) {
++                        ctxt.reportInputMismatch(_beanType,
++                                "Invalid default type id for property '%s': `null` returned by TypeIdResolver",
++                                extProp.getTypePropertyName());
++                    }
+                  }
+             } else if (_tokens[i] == null) {
++                // Conversely, got type id, but not property value. This is an error.
+                 SettableBeanProperty prop = extProp.getProperty();
++                // 13-Nov-2015, tatu: Let's try to report actual type name, if available
++                if (prop.isRequired() || ctxt.isEnabled(DeserializationFeature.FAIL_ON_MISSING_EXTERNAL_TYPE_ID_PROPERTY)) {
+                     ctxt.reportInputMismatch(_beanType,
+                             "Missing property '%s' for external type id '%s'",
+                             prop.getName(), _properties[i].getTypePropertyName());
++                } else {
++                    // We could leave entry as null; or, use "missing" value
++                    // Need to consider what Creator property might expect. Let's leave as null for now.
++                    values[i] = null;
++                    // but do make sure associated type property is passed if need be:
++                    if (prop.getCreatorIndex() >= 0) { // should be true actually...
++                        SettableBeanProperty typeProp = extProp.getTypeProperty();
++                        if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
++                            // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
++                            //    apply deserializer... fun fun.
++                            // 19-Jun-2018, tatu: Rather than TokenBuffer, simpler to use `ObjectMapper.valueToTree`
++                            //    equivalent combination:
++                            Object typeValue;
++                            if (typeProp.getType().hasRawClass(String.class)) {
++                                typeValue = typeId;
++                            } else {
++                                // Use context's node factory and object mapper (via context) to convert
++                                JsonNode node = ctxt.getNodeFactory().textNode(typeId);
++                                typeValue = ctxt.readTreeAsValue(node, typeProp.getType());
+                             }
++                            buffer.assignParameter(typeProp, typeValue);
++                        }
++                    }
++                    continue;
++                }
++            }
++
++            // Minor complication: type id itself may be needed as Creator param:
++            // If typeId is null, it's handled above, so it should not be null here
+             values[i] = _deserialize(p, ctxt, i, typeId);
+-
+             final SettableBeanProperty prop = extProp.getProperty();
+             // also: if it's creator prop, fill in
+             if (prop.getCreatorIndex() >= 0) {
+                 buffer.assignParameter(prop, values[i]);
+ 
+                 // [databind#999] And maybe there's creator property for type id too?
+                 SettableBeanProperty typeProp = extProp.getTypeProperty();
+                 // for now, should only be needed for creator properties, too
+                 if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
+                     // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
+                     //    apply deserializer... fun fun.
+-                    buffer.assignParameter(typeProp, typeId);
++                    // 19-Jun-2018, tatu: Rather than TokenBuffer, simpler to use `ObjectMapper.valueToTree`
++                    //    equivalent combination:
++                    Object typeValue;
++                    // NOTE: We should perhaps not hard code String.class comparison? But for now, works.
++                    if (typeProp.getType().hasRawClass(String.class)) {
++                        typeValue = typeId;
++                    } else {
++                        // Use context's node factory and object mapper (via context) to convert
++                        JsonNode node = ctxt.getNodeFactory().textNode(typeId);
++                        typeValue = ctxt.readTreeAsValue(node, typeProp.getType());
+                     }
++                    buffer.assignParameter(typeProp, typeValue);
+                 }
+             }
++        }
++
++        // Optimization: maybe we have all creator properties? If so, short-cut
+         Object bean = creator.build(ctxt, buffer);
++
+         // third: assign non-creator properties
+         for (int i = 0; i < len; ++i) {
+             SettableBeanProperty prop = _properties[i].getProperty();
+             if (prop.getCreatorIndex() < 0) {
+-                prop.set(bean, values[i]);
++                // 11-Sep-2019, tatu: [databind#2434] Need to consider `values[i]` possibly
++                //    being null if type id was missing for non-required property
++                Object value = values[i];
++                if (value != null) {
++                    prop.set(bean, value);
++                 } else {
++                    // 11-Sep-2019, tatu: Related to [databind#2434], it seems we should not
++                    //   attempt buffer property if we are missing type id AND value tokens... right?
++                    //   Need test case but seems plausible.
++                    if ((_typeIds[i] == null) && (_tokens[i] == null)) { // both missing is fine
++                        ;
++                    } else { // otherwise should be ok to set `null`
++                         // 19-Jan-2020, tatu: Actually, `prop.set(bean, null)` might fail, if setter has
++                         //    `@JsonSetter(nulls=JsonInclude.Include.FAIL)`.
++                         //    ... but maybe this is acceptable. Let's assume so for now.
++                        prop.set(bean, value);
++                    }
++                 }
+             }
+         }
+         return bean;
+     }
+\ No newline at end of file

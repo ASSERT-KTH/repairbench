@@ -1,0 +1,194 @@
+diff --git a/tmp/8eee6b11-efe4-491e-8321-0a6a277d52c9_buggy.java b/tmp/26134415-d003-43d9-8d0c-95e938c54cca_fixed.java
+index acdbb1a..d5314fc 100644
+--- a/tmp/8eee6b11-efe4-491e-8321-0a6a277d52c9_buggy.java
++++ b/tmp/26134415-d003-43d9-8d0c-95e938c54cca_fixed.java
+@@ -1,106 +1,181 @@
+     public ZipArchiveEntry getNextZipEntry() throws IOException {
+         boolean firstEntry = true;
+         if (closed || hitCentralDirectory) {
+             return null;
+         }
+         if (current != null) {
+             closeEntry();
+             firstEntry = false;
+         }
+ 
+         try {
+             if (firstEntry) {
+                 // split archives have a special signature before the
+                 // first local file header - look for it and fail with
+                 // the appropriate error message if this is a split
+                 // archive.
+                 readFirstLocalFileHeader(LFH_BUF);
+             } else {
+                 readFully(LFH_BUF);
+             }
+         } catch (final EOFException e) {
+             return null;
+         }
+ 
+         final ZipLong sig = new ZipLong(LFH_BUF);
++
+         if (sig.equals(ZipLong.CFH_SIG) || sig.equals(ZipLong.AED_SIG)) {
+             hitCentralDirectory = true;
+             skipRemainderOfArchive();
++            return null; // Return null as we've hit the central directory
+         }
++
++        // If we are seeing the LFH signature then process the entry
+         if (!sig.equals(ZipLong.LFH_SIG)) {
+-            return null;
++            // If we are here then we have already processed the first entry (if firstEntry was true).
++            // If first entry was not processed then an error would have been thrown by readFirstLocalFileHeader.
++            // Either the LFH signature is not present, or is incorrect.
++            // Throw an exception, rather than return null, if the signature is incorrect.
++            // Null indicates that the end of the stream has been reached.
++            // See https://issues.apache.org/jira/browse/COMPRESS-161
++            //
++            // Could be Zip64 data descriptor signature. If so, read as data descriptor.
++            // See https://issues.apache.org/jira/browse/COMPRESS-386
++            if (sig.equals(ZipLong.DD_SIG)) {
++                 // Data descriptor signature - Should only happen in streaming zip archives
++                 // Not expecting data descriptor signature here. Log debug message and return null?
++                 // Or should we throw an exception? It is unexpected after all! Let's throw for now.
++                 throw new ZipException(String.format("Unexpected record signature: 0x%x", sig.getValue()));
+              }
+ 
++            // If we get here then the signature is neither LFH, CFH, AED or DD. This is illegal.
++             throw new ZipException(String.format("Unexpected record signature: 0x%x", sig.getValue()));
++        }
++
++
+         int off = WORD;
+         current = new CurrentEntry();
+ 
+         final int versionMadeBy = ZipShort.getValue(LFH_BUF, off);
+         off += SHORT;
+         current.entry.setPlatform((versionMadeBy >> ZipFile.BYTE_SHIFT) & ZipFile.NIBLET_MASK);
+ 
+         final GeneralPurposeBit gpFlag = GeneralPurposeBit.parse(LFH_BUF, off);
+         final boolean hasUTF8Flag = gpFlag.usesUTF8ForNames();
+         final ZipEncoding entryEncoding = hasUTF8Flag ? ZipEncodingHelper.UTF8_ZIP_ENCODING : zipEncoding;
+         current.hasDataDescriptor = gpFlag.usesDataDescriptor();
+         current.entry.setGeneralPurposeBit(gpFlag);
+ 
+         off += SHORT;
+ 
+         current.entry.setMethod(ZipShort.getValue(LFH_BUF, off));
+         off += SHORT;
+ 
+         final long time = ZipUtil.dosToJavaTime(ZipLong.getValue(LFH_BUF, off));
+         current.entry.setTime(time);
+         off += WORD;
+ 
+         ZipLong size = null, cSize = null;
+         if (!current.hasDataDescriptor) {
+             current.entry.setCrc(ZipLong.getValue(LFH_BUF, off));
+             off += WORD;
+ 
+             cSize = new ZipLong(LFH_BUF, off);
+             off += WORD;
+ 
+             size = new ZipLong(LFH_BUF, off);
+             off += WORD;
+         } else {
++            // Crc, CSize, Size will be read from the data descriptor
+             off += 3 * WORD;
+         }
+ 
+         final int fileNameLen = ZipShort.getValue(LFH_BUF, off);
+-
+         off += SHORT;
+ 
+         final int extraLen = ZipShort.getValue(LFH_BUF, off);
+         off += SHORT;
+ 
++
++        if (fileNameLen < 0){
++            throw new IOException("Found invalid filename length " + fileNameLen + " in LFH");
++        }
+         final byte[] fileName = new byte[fileNameLen];
+         readFully(fileName);
++        // UTF-8 encoding is handled by Hutool, we just need to set the name
+         current.entry.setName(entryEncoding.decode(fileName), fileName);
+ 
++        if (extraLen < 0){
++            throw new IOException("Found invalid extra-field length " + extraLen + " in LFH");
++        }
+         final byte[] extraData = new byte[extraLen];
+         readFully(extraData);
++        try {
+             current.entry.setExtra(extraData);
++        } catch (RuntimeException ex) {
++            final ZipException ze = new ZipException("Invalid extra data in entry " + current.entry.getName());
++            ze.initCause(ex);
++            throw ze;
++        }
++
+ 
+         if (!hasUTF8Flag && useUnicodeExtraFields) {
+             ZipUtil.setNameAndCommentFromExtraFields(current.entry, fileName, null);
+         }
+ 
+         processZip64Extra(size, cSize);
+ 
+-        if (current.entry.getCompressedSize() != ArchiveEntry.SIZE_UNKNOWN) {
++        // If the size is unknown and we're using encryption then
++        // the size may be stored in the extra data segment. Decryption requires the size.
++        // See: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT section 6.1.8
++        // If the size is still unknown have another go at recalculating the size.
++        if (current.entry.getSize() == ArchiveEntry.SIZE_UNKNOWN) {
++            processMaybeZip64ExtraAfterEncryption();
++        }
++
++
++        // Apply encryption transformations as necessary. Note that these do not change the
++        // underlying input stream, but rather wrap it. Note that decrypt() can change the size of the stream.
++        // See: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT section 6.1.8
++        current.in = applyZipCryptoTransform(current.entry);
++
++        // Some methods expect the stream size for the entry. Bzip2 is one.
++        // See https://issues.apache.org/jira/browse/COMPRESS-460
++        final InputStream bis = current.entry.getCompressedSize() != ArchiveEntry.SIZE_UNKNOWN ?
++            new BoundedInputStream(current.in, current.entry.getCompressedSize()) : current.in;
++
++
+         if (current.entry.getMethod() == ZipMethod.UNSHRINKING.getCode()) {
+-                current.in = new UnshrinkingInputStream(new BoundedInputStream(in, current.entry.getCompressedSize()));
++            current.in = new UnshrinkingInputStream(bis);
+         } else if (current.entry.getMethod() == ZipMethod.IMPLODING.getCode()) {
++            try {
+                 current.in = new ExplodingInputStream(
+                         current.entry.getGeneralPurposeBit().getSlidingDictionarySize(),
+                         current.entry.getGeneralPurposeBit().getNumberOfShannonFanoTrees(),
+-                        new BoundedInputStream(in, current.entry.getCompressedSize()));
++                        bis);
++            } catch (final IllegalArgumentException ex) {
++                throw new IOException("bad IMPLODE data", ex);
++            }
+         } else if (current.entry.getMethod() == ZipMethod.BZIP2.getCode()) {
+-                current.in = new BZip2CompressorInputStream(new BoundedInputStream(in, current.entry.getCompressedSize()));
+-            }
++            current.in = new BZip2CompressorInputStream(bis);
++        } else if (current.entry.getMethod() == ZipMethod.LZMA.getCode()) {
++            current.in = buildLZMAInputStream(current.entry, bis);
++        } else if (current.entry.getMethod() == ZipMethod.ENHANCED_DEFLATED.getCode()) {
++            current.in = new Deflate64CompressorInputStream(bis);
++        } else if (current.entry.getMethod() == ZipMethod.XZ.getCode()) {
++            current.in = buildXZInputStream(current.entry, bis);
++        } else if (current.entry.getMethod() == ZipMethod.ZSTANDARD.getCode()) {
++            current.in = buildZStandardInputStream(current.entry, bis);
+         }
++        // InflaterInputStream requires that the stream size is known for DEFLATED entries
++        // that use data descriptors. For other cases the stream size is only used for reporting
++        // the progress of decompression - so the potentially inaccurate value from the LFH is OK.
++        // Need to check for specific Bitmask? Need to add method to ZipArchiveEntry?
++        // Assume that the compressed size from the LFH is correct
++        // Needs testing! ZipeEntry.getCopmressedSize is not the correct value here!
++        // compressed size from LFH or Zip64 extra field might be zero!
++        // If compression method == UNKNOWN (= -1 ?) then an error must be thrown - how do we do this?
+ 
+         entriesRead++;
+         return current.entry;
+     }
+\ No newline at end of file

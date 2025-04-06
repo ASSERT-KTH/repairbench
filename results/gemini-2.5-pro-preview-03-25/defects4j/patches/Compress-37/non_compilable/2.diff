@@ -1,0 +1,181 @@
+diff --git a/tmp/782130f2-9718-4945-9666-7a5473a195fb_buggy.java b/tmp/c02d8fee-1498-4b8a-bea0-19b3c58f1d93_fixed.java
+index 4b7e1e4..73b535f 100644
+--- a/tmp/782130f2-9718-4945-9666-7a5473a195fb_buggy.java
++++ b/tmp/c02d8fee-1498-4b8a-bea0-19b3c58f1d93_fixed.java
+@@ -1,52 +1,137 @@
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.commons.compress.utils.IOUtils;
++
++// Assume globalPaxHeaders is accessible, e.g., as a field in the containing class.
++// private final Map<String, String> globalPaxHeaders;
++
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+-        final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+-        // Format is "length keyword=value\n";
+-        while(true){ // get length
++        final Map<String, String> headers = new HashMap<>(globalPaxHeaders); // Initialize with global headers
++        // Format is "length keyword=value\n"; Length is decimal number of octets in the record including trailing newline.
++
++        while (true) {
+             int ch;
+             int len = 0;
+-            int read = 0;
++            int readBytes = 0; // Bytes read for the current potential record header line
++
++            // 1. Read length field (digits followed by space)
++            // Skip any leading non-digit characters (like newlines from blank lines)
++            int firstByte = -1;
+             while ((ch = i.read()) != -1) {
+-                read++;
++                if (firstByte == -1) {
++                    firstByte = ch; // Record the first byte we encounter for this record attempt
++                }
++                if (ch >= '0' && ch <= '9') {
++                    // Found the first digit of the length field
++                    readBytes++;
++                    len = ch - '0';
++                    break; // Proceed to read the rest of the length digits
++                }
++                // If it's not a digit, reset firstByte and continue scanning.
++                // This effectively skips non-digit lines/characters.
++                firstByte = -1;
++            }
++
++            if (ch == -1) { // EOF reached while looking for the first digit
++                // If firstByte was also -1, we reached EOF cleanly (empty stream or only non-digits).
++                // If firstByte != -1, EOF was hit immediately after a non-digit. Still considered clean EOF for headers.
++                break; // End of PAX headers
++            }
++
++            // Read the remaining digits of the length field.
++            while ((ch = i.read()) != -1) {
++                readBytes++;
+                 if (ch == ' ') {
+-                    // Get keyword
+-                    final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+-                    while((ch = i.read()) != -1) {
+-                        read++;
+-                        if (ch == '='){ // end of keyword
+-                            final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
++                    // Found the required space separator.
++                    break; // End of length field
++                }
++                if (ch < '0' || ch > '9') {
++                    // Found a non-digit character before the space. Malformed record.
++                    throw new IOException("Malformed PAX header: invalid character '" + (char)ch
++                                           + "' found reading length digits.");
++                }
++                // Accumulate length, checking for potential integer overflow.
++                // Use long for intermediate calculation to detect overflow.
++                long nextLen = ((long) len * 10) + (ch - '0');
++                if (nextLen > Integer.MAX_VALUE) {
++                     throw new IOException("Malformed PAX header: length field too large, exceeds " + Integer.MAX_VALUE);
++                }
++                len = (int) nextLen;
++            }
++
++            if (ch != ' ') {
++                // EOF reached while reading length digits. Malformed or truncated record.
++                throw new IOException("Malformed PAX header: EOF reached or space not found after length field.");
++            }
++
++            // 2. Read the "keyword=value\n" part based on the parsed length 'len'.
++            // 'readBytes' currently holds the number of bytes read for the length field + the space.
++            // The remaining bytes for "keyword=value\n" is 'kvLen'.
++            final int kvLen = len - readBytes;
++
++            // Check if the calculated length 'len' is plausible.
++            // It must be at least large enough to cover the length field, space, and a minimal "k=\n" record part.
++            // Minimal kvLen is 3 for "k=\n".
++            if (kvLen < 3) {
++                 // This could happen if len is incorrectly small in the input data.
++                 throw new IOException("Malformed PAX header: length " + len + " is too small for keyword=value\\n format (kvLen=" + kvLen + "). Needs >= 3.");
++            }
++
++            // Read the exact number of bytes for the keyword=value\n part.
++            final byte[] kvBytes = new byte[kvLen];
++            final int got = IOUtils.readFully(i, kvBytes);
++            if (got != kvLen) {
++                // This indicates the stream ended prematurely or the length 'len' was incorrect relative to stream content.
++                throw new IOException("Failed to read PAX header record. Expected " + kvLen
++                                      + " bytes for keyword/value part based on length field, but only got " + got);
++            }
++
++            // 3. Parse the "keyword=value\n" content read into kvBytes.
++            // The last byte must be a newline according to the standard.
++            if (kvBytes[kvLen - 1] != '\n') {
++                 throw new IOException("Malformed PAX header record: does not end with newline.");
++            }
++
++            // Find the '=' separator. It must exist and cannot be the first char (implying empty keyword).
++            int equalsPos = -1;
++            for (int j = 0; j < kvLen - 1; j++) { // Search up to the byte before the trailing newline.
++                if (kvBytes[j] == '=') {
++                    equalsPos = j;
++                    break;
++                }
++            }
++
++            // Check if '=' was found and is not the first character (position 0).
++            // equalsPos=0 implies empty keyword, which we treat as malformed.
++            // equalsPos=-1 implies no '=' found.
++            if (equalsPos < 1) {
++                 throw new IOException("Malformed PAX header record: missing or misplaced '=' separator (position=" + equalsPos + "). Keyword cannot be empty.");
++            }
++
++            // Extract the keyword (UTF-8 encoded).
++            final String keyword = new String(kvBytes, 0, equalsPos, StandardCharsets.UTF_8);
++
++            // Calculate the length of the value part. Value is between '=' and '\n'.
++            // valueLen = Total kvLen - length_of_keyword - length_of_='=' - length_of_'\n'
++            final int valueLen = kvLen - equalsPos - 2;
++
++            // If valueLen is 0, it means the format was "keyword=\n".
++            // According to the spec, this means delete the header entry.
++            if (valueLen == 0) {
+                 headers.remove(keyword);
+             } else {
+-                                final byte[] rest = new byte[restLen];
+-                                final int got = IOUtils.readFully(i, rest);
+-                                if (got != restLen) {
+-                                    throw new IOException("Failed to read "
+-                                                          + "Paxheader. Expected "
+-                                                          + restLen
+-                                                          + " bytes, read "
+-                                                          + got);
+-                                }
+-                                // Drop trailing NL
+-                                final String value = new String(rest, 0,
+-                                                          restLen - 1, CharsetNames.UTF_8);
++                // Extract the value (UTF-8 encoded).
++                final String value = new String(kvBytes, equalsPos + 1, valueLen, StandardCharsets.UTF_8);
+                 headers.put(keyword, value);
+             }
+-                            break;
+-                        }
+-                        coll.write((byte) ch);
+-                    }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
+-            }
++            // Continue the loop to read the next PAX header record.
+         }
++
+         return headers;
+     }
+\ No newline at end of file

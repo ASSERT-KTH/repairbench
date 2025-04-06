@@ -1,0 +1,124 @@
+diff --git a/tmp/08f7b4ef-c29e-43d8-ab54-26019d1f9797_buggy.java b/tmp/9c1e0bf7-a08c-457f-8c87-ce5a8b70b33b_fixed.java
+index f506479..fb55c67 100644
+--- a/tmp/08f7b4ef-c29e-43d8-ab54-26019d1f9797_buggy.java
++++ b/tmp/9c1e0bf7-a08c-457f-8c87-ce5a8b70b33b_fixed.java
+@@ -1,64 +1,95 @@
+         void consume(final RepeatingArgGroup groupArg, final Deque<NameValuePair> arguments)
+         {
+-            final Map<DslArg, List<String>> valuesByArg = new HashMap<>();
+-            final SimpleArgumentProcessor processor = new SimpleArgumentProcessor(valuesByArg, "Did not supply a value for %s in group " + groupArg.getName());
++            // This map will store the values collected *only* for this specific instance of the group.
++            final Map<DslArg, List<String>> valuesForThisInstance = new HashMap<>();
++            // Use a dedicated processor for this instance to avoid interference with other args/groups.
++            // It shares the same validation logic but uses a separate map for values.
++            final SimpleArgumentProcessor instanceProcessor = new SimpleArgumentProcessor(
++                valuesForThisInstance,
++                "Did not supply a value for %s in group " + groupArg.getName()
++            );
+ 
+-            processor.consume(groupArg.getIdentity(), arguments);
++            // 1. Consume the identity argument. This is the argument that triggered the call to this method
++            // (e.g., "group: Joe"). It will be removed from the 'arguments' deque.
++            // instanceProcessor will handle potential default value splitting if the identity arg allowed it.
++            instanceProcessor.consume(groupArg.getIdentity(), arguments);
+ 
+-            final Map<String, SimpleDslArg> argsByName = new HashMap<>();
+-            argsByName.put(groupArg.getIdentity().getName(), groupArg.getIdentity());
++            // 2. Build map of *other* args allowed within this group instance for quick lookup.
++            final Map<String, SimpleDslArg> otherArgsByName = new HashMap<>();
+             for (SimpleDslArg dslArg : groupArg.getOtherArgs())
+             {
+-                if (argsByName.put(dslArg.getName().toLowerCase(), dslArg) != null)
++                if (otherArgsByName.put(dslArg.getName().toLowerCase(), dslArg) != null)
+                 {
++                    // Should have been caught during DslParamsParser construction, but added defensively.
+                     throw new IllegalArgumentException("Duplicate parameter '" + dslArg.getName() + "' in group " + groupArg.getName());
+                 }
+             }
+ 
++            // 3. Consume subsequent arguments belonging specifically to *this* group instance.
+             while (!arguments.isEmpty())
+             {
+                 final NameValuePair argument = arguments.peekFirst();
+                 if (argument == NameValuePair.NULL)
+                 {
+-                    arguments.pollFirst();
++                    arguments.pollFirst(); // Skip null placeholders found within the group's arguments
+                     continue;
+                 }
+ 
++                // Arguments within a group (after the identity) must be named.
+                 if (argument.name == null)
+                 {
+-                    throw new IllegalArgumentException("Unexpected ambiguous argument " + argument.originalValue);
++                    // An unnamed argument signals the end of arguments for this specific group instance.
++                    break;
+                 }
+ 
+-                final DslArg arg = argsByName.get(argument.name.toLowerCase());
+-                if (arg == null)
++                // Check if the argument belongs to the *other* arguments defined for this group.
++                final SimpleDslArg otherArg = otherArgsByName.get(argument.name.toLowerCase());
++                if (otherArg == null)
+                 {
++                    // This argument is not one of the 'other' arguments for this group.
++                    // It might be the identity of the *next* instance of this group, or a different parameter altogether.
++                    // Stop consuming arguments for the current instance.
+                     break;
+                 }
+ 
+-                final List<String> argValues = valuesByArg.computeIfAbsent(arg, k -> new ArrayList<>());
+-                if (!argValues.isEmpty() && !arg.isAllowMultipleValues())
+-                {
+-                    break;
++                // This argument belongs to the current group instance. Consume it using the instance processor.
++                // The instanceProcessor.consume method handles:
++                // - Checking if multiple values are allowed (otherArg.isAllowMultipleValues()).
++                // - Splitting comma-separated values if multiple values are allowed.
++                // - Adding the value(s) to the 'valuesForThisInstance' map.
++                // - Removing the argument from the 'arguments' deque.
++                // - Performing basic validation (like checking required value presence, though handled by arg type).
++                instanceProcessor.consume(otherArg, arguments);
+             }
+ 
+-                checkValidValue(arg, argument.value);
+-                argValues.add(argument.value);
+-                arguments.pollFirst();
++            // 4. Collect the final values for *this* group instance from the instance processor.
++            final Map<String, List<String>> collectedValuesByName = new HashMap<>();
++
++            // Collect value(s) for the identity argument for this instance.
++            // It should have exactly one value because its presence triggered this method call.
++            SimpleDslParam identityParam = instanceProcessor.collect(groupArg.getIdentity());
++            if (identityParam.hasValue())
++            {
++                 collectedValuesByName.put(identityParam.getName().toLowerCase(), identityParam.getValuesAsList());
+             }
++            // else: This implies an internal logic error if identity is required, as consume should have failed or collected value.
+ 
+-            // TODO: this whole thing here is a bit hacky!
+-            final Map<String, List<String>> valuesByName = new HashMap<>();
+-            for (final SimpleDslArg simpleDslArg : argsByName.values())
++            // Collect values for the other arguments for this instance.
++            for (final SimpleDslArg simpleDslArg : groupArg.getOtherArgs())
+             {
+-                final SimpleDslParam param = processor.collect(simpleDslArg);
++                final SimpleDslParam param = instanceProcessor.collect(simpleDslArg);
+                 if (param.hasValue())
+                 {
+-                    valuesByName.put(param.getName().toLowerCase(), param.getValuesAsList());
++                    collectedValuesByName.put(param.getName().toLowerCase(), param.getValuesAsList());
+                 }
+             }
+ 
++            // 5. Store the collected values, associating them with this instance of the repeating group.
++            // Define the structure (the list of DslArgs) for this repeating group.
+             final DslArg[] dslArgs = new DslArg[groupArg.getOtherArgs().length + 1];
+             dslArgs[0] = groupArg.getIdentity();
+             System.arraycopy(groupArg.getOtherArgs(), 0, dslArgs, 1, groupArg.getOtherArgs().length);
+-            groupsByArg.computeIfAbsent(groupArg, k -> new ArrayList<>()).add(new RepeatingParamValues(dslArgs, valuesByName));
++
++            // Add a new RepeatingParamValues object (representing this instance) to the list for this group definition.
++            groupsByArg.computeIfAbsent(groupArg, k -> new ArrayList<>()).add(new RepeatingParamValues(dslArgs, collectedValuesByName));
+         }
+\ No newline at end of file

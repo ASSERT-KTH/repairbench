@@ -1,0 +1,132 @@
+diff --git a/tmp/00a52baf-afe3-42df-978b-6f0d7e8cc465_buggy.java b/tmp/ef0d4721-e95d-46c7-a8f9-b3e560abc908_fixed.java
+index 2ce28b5..d26ccd2 100644
+--- a/tmp/00a52baf-afe3-42df-978b-6f0d7e8cc465_buggy.java
++++ b/tmp/ef0d4721-e95d-46c7-a8f9-b3e560abc908_fixed.java
+@@ -1,72 +1,116 @@
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++import org.apache.commons.compress.archivers.ArchiveException;
++import org.apache.commons.compress.archivers.ArchiveInputStream;
++import org.apache.commons.compress.archivers.ar.ArArchiveInputStream;
++import org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream;
++import org.apache.commons.compress.archivers.dump.DumpArchiveInputStream;
++import org.apache.commons.compress.archivers.jar.JarArchiveInputStream;
++import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
++import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
++
++// Note: This is the context required for the function to compile.
++// The fix is only within the createArchiveInputStream method itself.
++public class ArchiveStreamFactory {
++
+     /**
+      * Create an archive input stream from an input stream, autodetecting
+      * the archive type from the first few bytes of the stream. The InputStream
+      * must support marks, like BufferedInputStream.
+      *
+      * @param in the input stream
+      * @return the archive input stream
+-     * @throws ArchiveException if the archiver name is not known
++     * @throws ArchiveException if the archiver name is not known or reading the signature fails
+      * @throws IllegalArgumentException if the stream is null or does not support mark
+      */
+     public ArchiveInputStream createArchiveInputStream(final InputStream in)
+             throws ArchiveException {
+         if (in == null) {
+             throw new IllegalArgumentException("Stream must not be null.");
+         }
+ 
+         if (!in.markSupported()) {
+             throw new IllegalArgumentException("Mark is not supported.");
+         }
+ 
+         final byte[] signature = new byte[12];
+         in.mark(signature.length);
++        int signatureLength = -1; // Initialize with a value that cannot be valid
+         try {
+-            int signatureLength = in.read(signature);
++            signatureLength = in.read(signature);
+             in.reset();
++
+             if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+                 return new ZipArchiveInputStream(in);
+             } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+                 return new JarArchiveInputStream(in);
+             } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+                 return new ArArchiveInputStream(in);
+             } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+                 return new CpioArchiveInputStream(in);
+             }
+ 
+             // Dump needs a bigger buffer to check the signature;
+             final byte[] dumpsig = new byte[32];
+             in.mark(dumpsig.length);
++            // Re-assign signatureLength, previous value is not used anymore
+             signatureLength = in.read(dumpsig);
+             in.reset();
+             if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+                 return new DumpArchiveInputStream(in);
+             }
+ 
+             // Tar needs an even bigger buffer to check the signature; read the first block
+             final byte[] tarheader = new byte[512];
+             in.mark(tarheader.length);
++            // Re-assign signatureLength, previous value is not used anymore
+             signatureLength = in.read(tarheader);
+             in.reset();
++
++            // First check based on signature only
+             if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+                  return new TarArchiveInputStream(in);
+             }
+-            // COMPRESS-117 - improve auto-recognition
++
++            // COMPRESS-117/-191: If signature match failed, try stronger check by parsing header
++            // This needs the full 512 byte block.
+             if (signatureLength >= 512) {
++                TarArchiveInputStream tais = null;
+                 try {
+-                    TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+-                    // COMPRESS-191 - verify the header checksum
+-                    tais.getNextEntry();
++                    // We create a temporary stream to read the header block
++                    // to verify the checksum calculation.
++                    tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
++                    // COMPRESS-191 - verify the header checksum by trying to read the first entry
++                    if (tais.getNextEntry() != null) {
++                        // Checksum calculation successful, and found an entry, this is likely a TAR archive.
++                        // Return the stream for the original input, not the temporary stream
+                         return new TarArchiveInputStream(in);
++                    }
++                    // else: getNextEntry() returned null. This might mean an empty archive.
++                    // However, TarArchiveInputStream.matches should have identified it
++                    // if it had a valid header for an empty archive. If we are here,
++                    // it is likely not a TAR archive -> do not return a TAR stream.
+                 } catch (Exception e) { // NOPMD
+-                    // can generate IllegalArgumentException as well
+-                    // as IOException
+-                    // autodetection, simply not a TAR
+-                    // ignored
++                    // IllegalArgumentException or IOException: Header is not valid (e.g., checksum error)
++                    // This indicates it is not a TAR archive.
++                    // Ignore the exception, and proceed to the final exception throw.
++                } finally {
++                    // Close the temporary stream used for header validation
++                    if (tais != null) {
++                        try {
++                            tais.close();
++                        } catch (IOException ignored) { // NOPMD
++                            // Closing ByteArrayInputStream should not throw, ignore anyway
++                        }
++                    }
+                 }
+             }
+         } catch (IOException e) {
+             throw new ArchiveException("Could not use reset and mark operations.", e);
+         }
+ 
+         throw new ArchiveException("No Archiver found for the stream signature");
+     }
++}
+\ No newline at end of file

@@ -1,0 +1,170 @@
+diff --git a/tmp/a9a2d40c-771e-40e0-9a68-acf4470ae5ac_buggy.java b/tmp/95e0bb41-57e5-4afe-9860-5a6ec395fe17_fixed.java
+index 9240541..8fe322a 100644
+--- a/tmp/a9a2d40c-771e-40e0-9a68-acf4470ae5ac_buggy.java
++++ b/tmp/95e0bb41-57e5-4afe-9860-5a6ec395fe17_fixed.java
+@@ -1,121 +1,157 @@
+     private Position decodePosition(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         int status = buf.readUnsignedShort();
+ 
+         position.setValid(BitUtil.check(status, 15));
+ 
+         position.set(Position.KEY_STATUS, status);
+         position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+         int event = buf.readUnsignedShort();
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, event);
+ 
+         String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
+         DateBuilder dateBuilder = new DateBuilder()
+                 .setYear(Integer.parseInt(time.substring(0, 2)))
+                 .setMonth(Integer.parseInt(time.substring(2, 4)))
+                 .setDay(Integer.parseInt(time.substring(4, 6)))
+                 .setHour(Integer.parseInt(time.substring(6, 8)))
+                 .setMinute(Integer.parseInt(time.substring(8, 10)))
+                 .setSecond(Integer.parseInt(time.substring(10, 12)));
+         position.setTime(dateBuilder.getDate());
+ 
+         position.setLongitude(buf.readInt() * 0.00001);
+         position.setLatitude(buf.readInt() * 0.00001);
+ 
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+         position.setCourse(buf.readUnsignedShort());
+         position.setAltitude(buf.readUnsignedShort());
+ 
+-        position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
++        // Removed incorrect odometer reading here:
++        // position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
+ 
+         Network network = new Network();
+ 
+         while (buf.readableBytes() > 4) {
+             int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
+-            int endIndex = buf.readerIndex() + length;
++            int length = buf.readUnsignedShort(); // Total length including subtype and length fields
++            if (length < 4) {
++                // Avoid issues with potentially corrupt length field leading to infinite loops or errors
++                break; 
++            }
++            int dataLength = length - 4; // Actual length of the data part
++            int endIndex = buf.readerIndex() + dataLength;
++            if (dataLength < 0 || endIndex > buf.writerIndex()) {
++                 // Avoid IndexOutOfBoundsException if length is corrupt
++                break;
++            }
++
+             switch (subtype) {
+                 case 0x0001:
+                     int coolantTemperature = buf.readUnsignedByte() - 40;
+                     if (coolantTemperature <= 215) {
+                         position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                     }
+                     int rpm = buf.readUnsignedShort();
+                     if (rpm <= 65535) {
+                         position.set(Position.KEY_RPM, rpm);
+                     }
+                     position.set("averageSpeed", buf.readUnsignedByte());
+                     buf.readUnsignedShort(); // interval fuel consumption
+                     position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
+                     position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+                     buf.readUnsignedInt(); // trip id
+                     if (buf.readerIndex() < endIndex) {
+                         position.set("adBlueLevel", buf.readUnsignedByte() * 0.4);
+                     }
+                     break;
+                 case 0x0005:
+                     position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                     position.set(Position.KEY_HDOP, buf.readUnsignedByte());
+                     buf.readUnsignedInt(); // run time
+                     break;
+                 case 0x0009:
+                     position.set(
+-                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
++                            Position.KEY_VIN, buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString());
++                    break;
++                case 0x0010: // Handle odometer data
++                    String odometerString = buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString();
++                    try {
++                        // Value seems to be in kilometers as a string (e.g., "13212.000000")
++                        // Traccar expects odometer in meters.
++                        double odometerKm = Double.parseDouble(odometerString);
++                        position.set(Position.KEY_ODOMETER, odometerKm * 1000.0);
++                    } catch (NumberFormatException e) {
++                        // Log or handle parsing error appropriately
++                         Log.warning("Failed to parse odometer string: " + odometerString, e);
++                    }
+                     break;
+                 case 0x0011:
+                     position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
+                     break;
+                 case 0x0014:
+                     position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
+                     position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+                     position.set("airTemp", buf.readUnsignedByte() - 40);
+                     position.set("airFlow", buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
+                     break;
+                 case 0x0020:
+                     String[] cells = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                            dataLength, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String cell : cells) {
+                         String[] values = cell.split("@");
++                        if (values.length == 4) {
++                            try {
+                                 network.addCellTower(CellTower.from(
+                                         Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                         Integer.parseInt(values[2], 16), Long.parseLong(values[3], 16)));
++                            } catch (NumberFormatException e) {
++                                Log.warning("Failed to parse cell tower info: " + cell, e);
++                            }
++                        }
+                     }
+                     break;
+                 case 0x0021:
+                     String[] points = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                            dataLength, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String point : points) {
+                         String[] values = point.split("@");
++                         if (values.length == 2) {
++                            try {
+                                 network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
++                            } catch (NumberFormatException e) {
++                                Log.warning("Failed to parse WiFi access point info: " + point, e);
++                            }
++                        }
+                     }
+                     break;
+                 default:
+-                    buf.skipBytes(length);
++                    buf.skipBytes(dataLength);
+                     break;
+             }
++            // Ensure readerIndex is advanced correctly even if parsing logic inside case had issues
+             buf.readerIndex(endIndex);
+         }
+ 
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+         sendResponse(channel, MSG_POSITION_RSP, index, null);
+ 
+         return position;
+     }
+\ No newline at end of file

@@ -1,0 +1,286 @@
+diff --git a/tmp/ba8ef1f7-b696-4851-9a3d-2300da1ff1fe_buggy.java b/tmp/1a4e4f5e-0787-450f-b59b-e99efc5f1306_fixed.java
+index ef65dd9..fa6b55f 100644
+--- a/tmp/ba8ef1f7-b696-4851-9a3d-2300da1ff1fe_buggy.java
++++ b/tmp/1a4e4f5e-0787-450f-b59b-e99efc5f1306_fixed.java
+@@ -1,92 +1,233 @@
++import com.google.common.collect.Lists;
++import com.google.javascript.jscomp.AbstractCompiler;
++import com.google.javascript.jscomp.InlineCostEstimator;
++import com.google.javascript.jscomp.NodeTraversal;
++import com.google.javascript.jscomp.NodeUtil;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.Token;
++import java.util.List;
++
++/**
++ * Contains the fixed version of tryFoldStringJoin.
++ * Note: Actual file would not have the DummyPeepholeFoldConstants class wrapper.
++ * Assumes necessary imports and class context (like being part of PeepholeFoldConstants).
++ */
++final class FixedPeepholeFoldConstants { // Wrapper class for context
++
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
+-    if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
++    // Ensure the call is of the form array.join(separator)
++    // 'left' is the GETPROP node (array.join)
++    // 'right' is the separator argument node
++    // 'n' is the CALL node
++    if (!left.isGetProp() || !NodeUtil.isImmutableValue(right)) {
++      // Separator must be immutable (or at least safely convertible to string) for safe folding.
++      // isImmutableValue covers common cases like string/number literals.
+       return;
+     }
+ 
+     Node arrayNode = left.getFirstChild();
+-    Node functionName = arrayNode.getNext();
++    Node functionNameNode = left.getLastChild(); // Property name ("join")
+ 
+-    if ((arrayNode.getType() != Token.ARRAYLIT) ||
+-        !functionName.getString().equals("join")) {
++    // Check that it's an array literal and the function is "join"
++    if (!arrayNode.isArrayLit() || !functionNameNode.isString() ||
++        !functionNameNode.getString().equals("join")) {
+       return;
+     }
+ 
+-    String joinString = NodeUtil.getStringValue(right);
+-    List<Node> arrayFoldedChildren = Lists.newLinkedList();
++    // Check for side effects in the original call structure, excluding the array elements
++    // which are checked individually later. Side effects in accessing the array,
++    // the 'join' property, or the separator are rare for literals but important.
++     if (NodeUtil.mayHaveSideEffects(left, t.getCompiler()) ||
++         NodeUtil.mayHaveSideEffects(right, t.getCompiler())) {
++         return;
++     }
++
++
++    String joinString = NodeUtil.getArrayElementStringValue(right); // Use safe string conversion
++    if (joinString == null) {
++      // This shouldn't happen if NodeUtil.isImmutableValue(right) is true,
++      // but check just in case getArrayElementStringValue fails.
++      return;
++    }
++
++    List<Node> arrayFoldedChildren = Lists.newArrayList();
+     StringBuilder sb = new StringBuilder();
+-    int foldedSize = 0;
+     Node elem = arrayNode.getFirstChild();
+-    // Merges adjacent String nodes.
++    int originalChildCount = arrayNode.getChildCount();
++    boolean sideEffectInFoldedElements = false; // Track if any element we fold away had side effects
++
++    // Merge adjacent foldable (immutable, side-effect free) elements.
+     while (elem != null) {
+-      if (NodeUtil.isImmutableValue(elem)) {
++      Node nextElem = elem.getNext(); // Store next element in case 'elem' is detached/moved
++
++      // Use getArrayElementStringValue for robust conversion matching join's behavior.
++      String elemStringVal = NodeUtil.getArrayElementStringValue(elem);
++      boolean elementHasSideEffects = NodeUtil.mayHaveSideEffects(elem, t.getCompiler());
++
++      // Check if elem can be represented as a string value for joining AND has no side effects
++      if (elemStringVal != null && !elementHasSideEffects) {
+         if (sb.length() > 0) {
+           sb.append(joinString);
+         }
+-        sb.append(NodeUtil.getStringValue(elem));
+-      } else {
++        sb.append(elemStringVal);
++        // Mark that some element contributing to sb *might* have had side effects later
++        // sideEffectInFoldedElements = sideEffectInFoldedElements || elementHasSideEffects; // Already checked elementHasSideEffects is false
++      } else { // Element is not foldable (not immutable, not easily stringifiable, or has side effects)
++        sideEffectInFoldedElements = sideEffectInFoldedElements || elementHasSideEffects; // Track side effects in non-folded elements too if needed? No, only matters if we REMOVE the element by folding.
++        // Add the pending string segment if any
+         if (sb.length() > 0) {
+-          // + 2 for the quotes.
+-          foldedSize += sb.length() + 2;
+-          arrayFoldedChildren.add(Node.newString(sb.toString()));
+-          sb = new StringBuilder();
++          // Use original node 'n' for source info context? Or perhaps 'elem'? Using 'n' seems reasonable.
++          arrayFoldedChildren.add(Node.newString(sb.toString()).copyInformationFrom(n));
++          sb = new StringBuilder(); // Reset sb
+         }
+-        foldedSize += InlineCostEstimator.getCost(elem);
++        // Add the non-foldable/side-effectful element itself
++        // Detach elem from the original list before adding to the new list
++        // elem.detach(); // This modification during iteration is tricky. Better to handle detachment at the end.
+         arrayFoldedChildren.add(elem);
+       }
+-      elem = elem.getNext();
++      elem = nextElem;
+     }
+ 
++    // Add any remaining string segment
+     if (sb.length() > 0) {
+-      // + 2 for the quotes.
+-      foldedSize += sb.length() + 2;
+-      arrayFoldedChildren.add(Node.newString(sb.toString()));
++      arrayFoldedChildren.add(Node.newString(sb.toString()).copyInformationFrom(n));
+     }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
+ 
++    // Calculate size of the original expression
+     int originalSize = InlineCostEstimator.getCost(n);
++    Node containingNodeToReplace = n; // The CALL node 'n' is what we might replace or modify
++
++
++    // Handle the results based on the number of elements in the folded array
+     switch (arrayFoldedChildren.size()) {
+-      case 0:
+-        Node emptyStringNode = Node.newString("");
+-        parent.replaceChild(n, emptyStringNode);
++      case 0: // Original array was empty.
++        if (originalChildCount == 0) {
++            // No elements, so no side effects from them.
++            Node emptyStringNode = Node.newString("").copyInformationFrom(containingNodeToReplace);
++            // Cost of "" is 2. Assume it's always smaller than original [].join(...).
++            if (2 < originalSize) {
++                 parent.replaceChild(containingNodeToReplace, emptyStringNode);
++                 t.getCompiler().reportCodeChange();
++            }
++        }
++        // If original was not empty, but folded list is empty (e.g. [undefined].join('')),
++        // the result should be "". This case falls under case 1 below.
+         break;
+ 
+       case 1:
+-        Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
++        Node foldedNode = arrayFoldedChildren.get(0);
++        // If the single resulting element is a string literal...
++        if (foldedNode.isString()) {
++           // We can replace the entire call with the string literal, ONLY IF
++           // no element that got folded *into* this string had side-effects.
++           // sideEffectInFoldedElements tracks if any *kept* elements had side effects.
++           // We need a flag specific to elements *removed* during folding.
++           // Let's simplify: if ANY element in the original array had side effects,
++           // only proceed if the final result is this single string AND all original children were folded.
++           boolean originalHadSideEffects = false;
++           for (Node originalChild = arrayNode.getFirstChild(); originalChild != null; originalChild = originalChild.getNext()) {
++               if (NodeUtil.mayHaveSideEffects(originalChild, t.getCompiler())) {
++                   originalHadSideEffects = true;
++                   break;
++               }
++           }
++
++           if (originalHadSideEffects) {
++               // If original had side effects, cannot replace the call with a simple string,
++               // as side effects would be lost.
+                return;
+            }
+-        arrayNode.detachChildren();
+-        if (foldedStringNode.getType() != Token.STRING) {
+-          // If the Node is not a string literal, ensure that
+-          // it is coerced to a string.
+-          Node replacement = new Node(Token.ADD,
+-              Node.newString(""), foldedStringNode);
+-          foldedStringNode = replacement;
+-        }
+-        parent.replaceChild(n, foldedStringNode);
++
++           // Now safe to consider replacing with the string node.
++           int foldedCost = InlineCostEstimator.getCost(foldedNode);
++           // Check if the replacement is smaller than the original call node
++           if (foldedCost < originalSize) {
++             // foldedNode is newly created, no need to detach.
++             parent.replaceChild(containingNodeToReplace, foldedNode);
++             t.getCompiler().reportCodeChange();
++           }
++        } else {
++          // Single element is non-foldable (e.g., [foo].join(',')). Call cannot be removed.
++          // Check if the array structure was modified at all. If not ([foo]->[foo]), do nothing.
++          if (originalChildCount == 1 && arrayFoldedChildren.get(0) == arrayNode.getFirstChild()) {
++               // Check if reference is same AND structurally equivalent (belt-and-suspenders)
++               if (arrayNode.getFirstChild().isEquivalentTo(arrayFoldedChildren.get(0))) {
++                 return; // No change
++               }
++          }
++          // If structure changed (e.g. ['a', foo, 'b'].join('') folds to ["ab", foo], size 2 -> default),
++          // or if size is 1 non-string but somehow different from original (unlikely),
++          // fall through to default logic to rebuild array if beneficial.
++          // If we reached here with size 1 non-string, it MUST be the original single non-foldable element.
++          return; // No optimization possible for [foo].join(',') -> foo
++        }
+         break;
+ 
+-      default:
+-        // No folding could actually be performed.
+-        if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+-          return;
++      default: // Size > 1
++        // Check if any effective folding occurred compared to the original array.
++        boolean changed = (arrayFoldedChildren.size() != originalChildCount);
++        if (!changed) {
++           Node currentOriginal = arrayNode.getFirstChild();
++           boolean contentChanged = false;
++           for (int i = 0; i < arrayFoldedChildren.size(); i++) {
++               Node currentFolded = arrayFoldedChildren.get(i);
++               // Check structural equivalence; reference check isn't enough for new nodes
++               if (!currentOriginal.isEquivalentTo(currentFolded)) {
++                   contentChanged = true;
++                   break;
+                }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += InlineCostEstimator.getCost(right);
+-        if (foldedSize > originalSize) {
+-          return;
++               currentOriginal = currentOriginal.getNext();
++           }
++           if (!contentChanged) {
++               return; // No change needed
++           }
++           changed = true; // Content changed even if size didn't
++        }
++
++        // If we are changing the array structure, calculate the cost of the new structure.
++        // Estimate cost of the new expression: [folded1, folded2, ...].join(separator)
++        int foldedSize = 0;
++        // Cost of the new array literal
++        foldedSize += 2; // Brackets []
++        boolean first = true;
++        for (Node node : arrayFoldedChildren) {
++            if (!first) {
++                foldedSize++; // Comma
+             }
++            // Use getCost for all children (new strings or original nodes)
++            foldedSize += InlineCostEstimator.getCost(node);
++            first = false;
++        }
++
++        // Add cost of separator and join call itself
++        foldedSize += InlineCostEstimator.getCost(right); // Separator cost
++        // Cost of ".join" property access + call parentheses "()"
++        foldedSize += ".join".length() + 2;
++
++        // Only replace if the folded version is smaller (or equal? Use >= to prevent churn)
++        if (foldedSize >= originalSize) {
++          return; // Not smaller
++        }
++
++        // Apply the changes: replace elements in the original array node.
++        // This modifies the array node in place; the CALL node 'n' remains.
+         arrayNode.detachChildren();
+         for (Node node : arrayFoldedChildren) {
++           // Nodes in arrayFoldedChildren are either new Node.newString() or original non-foldable nodes.
++           // Original nodes are detached by detachChildren(). New nodes have no parent.
++           // Ensure node is detached if it somehow still has a parent (shouldn't happen).
++           if (node.getParent() != null) {
++                node.detach();
++           }
+           arrayNode.addChildToBack(node);
+         }
+-        break;
+-    }
++        // Report modification of the CALL node 'n' as its behavior changed due to modified child array.
+         t.getCompiler().reportCodeChange();
++        break;
+     }
++  }
++} // End dummy class wrapper
+\ No newline at end of file

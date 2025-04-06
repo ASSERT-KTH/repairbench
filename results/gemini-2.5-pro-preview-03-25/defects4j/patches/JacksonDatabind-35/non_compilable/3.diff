@@ -1,0 +1,116 @@
+diff --git a/tmp/db4668b5-a104-4921-ad55-61e1283afa25_buggy.java b/tmp/a7f9a160-2e5a-4bfd-9b2a-c4261337c927_fixed.java
+index 7d8d756..4f481b7 100644
+--- a/tmp/db4668b5-a104-4921-ad55-61e1283afa25_buggy.java
++++ b/tmp/a7f9a160-2e5a-4bfd-9b2a-c4261337c927_fixed.java
+@@ -1,48 +1,92 @@
+     /**
+      * Method that handles type information wrapper, locates actual
+      * subtype deserializer to use, and calls it to do actual
+-     * deserialization.
++     * deserialization. Assumes parser is positioned at the FIELD_NAME
++     * that contains type id.
+      */
+     @SuppressWarnings("resource")
+     private final Object _deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+     {
++        // NOTE: assuming caller got us to the FIELD_NAME with type id
+         // 02-Aug-2013, tatu: May need to use native type ids
+         if (p.canReadTypeId()) {
+             Object typeId = p.getTypeId();
+             if (typeId != null) {
+                 return _deserializeWithNativeTypeId(p, ctxt, typeId);
+             }
+         }
+-        // first, sanity checks
+-        if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+-            throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+-                    "need JSON Object to contain As.WRAPPER_OBJECT type information for class "+baseTypeName());
+-        }
+-            // should always get field name, but just in case...
+-            if (p.nextToken() != JsonToken.FIELD_NAME) {
++
++        // Current token should be FIELD_NAME (based on caller contract)
++        if (p.currentToken() != JsonToken.FIELD_NAME) {
++             // This should not happen based on caller guarantees, but let's add a check just in case
+              throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                     "need JSON String that contains type id (for subtype of "+baseTypeName()+")");
+         }
+-        final String typeId = p.getText();
++
++        final String typeId = p.currentName();
+         JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeId);
++        // And then advance to the value token:
+         p.nextToken();
+ 
++        Object value;
++
+         // Minor complication: we may need to merge type id in?
+-        if (_typeIdVisible && p.getCurrentToken() == JsonToken.START_OBJECT) {
+-            // but what if there's nowhere to add it in? Error? Or skip? For now, skip.
+-            TokenBuffer tb = new TokenBuffer(null, false);
++        if (_typeIdVisible) {
++            // If type id is visible, value must be START_OBJECT for buffering to work
++            if (p.currentToken() != JsonToken.START_OBJECT) {
++                throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
++                        String.format("Object value expected for property '%s' (visible type id)", typeId));
++            }
++            // Need to recreate the parser to merge type id with actual data
++            // 29-Sep-2015, tatu: This seems potentially problematic; but basically
++            //   it means we can't yet use `JsonParserSequence` as we need to possibly
++            //   access the original parser...
++            // Easiest way is to use TokenBuffer; serialize this token, then
++            // copy the rest.
++            TokenBuffer tb = new TokenBuffer(p, ctxt);
+             tb.writeStartObject(); // recreate START_OBJECT
+             tb.writeFieldName(_typePropertyName);
+             tb.writeString(typeId);
+-            p = JsonParserSequence.createFlattened(tb.asParser(p), p);
+-            p.nextToken();
++
++            // Keep track of original parser to check END_OBJECT later
++            JsonParser originalParser = p;
++            // Copy structure like "id" : "computer-1", "location" : "Bangkok" }
++            // Needs to be done AFTER we have read the START_OBJECT for value, so:
++            tb.copyCurrentStructure(p); // Consumes p, leaves it AFTER value's }
++
++            p = tb.asParser(); // Switch parser to token buffer
++            // Need to move to the first token of the merged structure
++            p.nextToken(); // START_OBJECT
++
++            // Now deserialize from the buffer
++            value = deser.deserialize(p, ctxt);
++
++            // Check that the wrapper object is closed using the original parser state
++            // (which should be positioned after the value object's END_OBJECT)
++            JsonToken closing = originalParser.nextToken();
++            if (closing != JsonToken.END_OBJECT) {
++                 // Use original parser for context, but expected token is END_OBJECT
++                 throw ctxt.wrongTokenException(originalParser, JsonToken.END_OBJECT,
++                          "expected closing END_OBJECT after type information and deserialized value (got "+closing+")");
++            }
++            // originalParser is now at the wrapper's END_OBJECT.
++        } else { // type id not visible
++            // Value token should still be START_OBJECT
++             if (p.currentToken() != JsonToken.START_OBJECT) {
++                 throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
++                          String.format("Object value expected for property '%s'", typeId));
+              }
++            // Deserialize directly from the original parser 'p'
++            value = deser.deserialize(p, ctxt); // Should consume value object, leave p AT value's }
+ 
+-        Object value = deser.deserialize(p, ctxt);
+             // And then need the closing END_OBJECT
+-        if (p.nextToken() != JsonToken.END_OBJECT) {
+-            throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+-                    "expected closing END_OBJECT after type information and deserialized value");
++            // Need to advance parser past value's END_OBJECT to find wrapper's END_OBJECT
++            JsonToken closing = p.nextToken();
++            if (closing != JsonToken.END_OBJECT) {
++                throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT, // p is now at the incorrect token
++                        "expected closing END_OBJECT after type information and deserialized value (got "+closing+")");
++            }
++            // Parser 'p' is now positioned at the wrapper's END_OBJECT
+         }
+         return value;
+     }
+\ No newline at end of file

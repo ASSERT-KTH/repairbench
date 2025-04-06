@@ -1,0 +1,101 @@
+diff --git a/tmp/8e96ad00-41a1-4d7a-8f95-045b73684e2f_buggy.java b/tmp/b321f09d-d42c-4b94-97f0-3e0f220e888f_fixed.java
+index 5481b94..45f3b1f 100644
+--- a/tmp/8e96ad00-41a1-4d7a-8f95-045b73684e2f_buggy.java
++++ b/tmp/b321f09d-d42c-4b94-97f0-3e0f220e888f_fixed.java
+@@ -1,49 +1,76 @@
+     public Object handle(Invocation invocation) throws Throwable {
++        // 1. Handle explicit stubbing mode (e.g., doAnswer(), stubVoid())
+         if (invocationContainerImpl.hasAnswersForStubbing()) {
+-            // stubbing voids with stubVoid() or doAnswer() style
+-            InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress
+-                            .getArgumentMatcherStorage(), invocation);
++            InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(), invocation);
+             invocationContainerImpl.setMethodForStubbing(invocationMatcher);
+             return null;
+         }
++
++        // 2. Check if verification is active
+         VerificationMode verificationMode = mockingProgress.pullVerificationMode();
++        InvocationMatcher invocationMatcher = null; // Prepare InvocationMatcher
+ 
+-        InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(),
+-                        invocation);
+-
+-        mockingProgress.validateState();
+-
+-        //if verificationMode is not null then someone is doing verify()        
++        // 3. If verification is active...
+         if (verificationMode != null) {
+-            //We need to check if verification was started on the correct mock 
+-            // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            if (verificationMode instanceof MockAwareVerificationMode && ((MockAwareVerificationMode) verificationMode).getMock() == invocation.getMock()) {
++            // Handle mock-aware verification modes (most common case)
++            if (verificationMode instanceof MockAwareVerificationMode) {
++                MockAwareVerificationMode mockAwareMode = (MockAwareVerificationMode) verificationMode;
++                // Check if verification is for THIS mock
++                if (mockAwareMode.getMock() == invocation.getMock()) {
++                    // Yes: Verify this invocation
++                    invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(), invocation);
++                    mockingProgress.validateState(); // Validate after pulling mode and binding matchers
++                    VerificationDataImpl data = new VerificationDataImpl(invocationContainerImpl, invocationMatcher);
++                    verificationMode.verify(data);
++                    return null; // Verification finished, no return value expected
++                } else {
++                    // No: Verification active, but for a DIFFERENT mock.
++                    // This happens e.g. with verify(mock1).doSomething(mock2.doSomethingElse());
++                    // The invocation on mock2 occurs while mock1 is being verified.
++                    // Put the verification mode back for mock1.
++                    mockingProgress.verificationStarted(verificationMode);
++                    // Let invocation on mock2 proceed normally below.
++                    verificationMode = null; // Clear verification mode for THIS invocation handling
++                }
++            // Handle non-mock-aware verification modes (less common)
++            } else {
++                 // Assume it's for the current invocation (original behavior)
++                 invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(), invocation);
++                 mockingProgress.validateState();
+                  VerificationDataImpl data = new VerificationDataImpl(invocationContainerImpl, invocationMatcher);
+                  verificationMode.verify(data);
+                  return null;
+-                // this means there is an invocation on a different mock. Re-adding verification mode 
+-                // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+             }
+         }
+ 
++        // 4. Standard invocation handling (code reaches here if verificationMode was null initially,
++        //    or if it was for a different mock and has been put back)
++        mockingProgress.validateState(); // Validate state before reporting ongoing stubbing or executing method
++
++        // Bind matchers if they weren't already bound during verification checks
++        if (invocationMatcher == null) {
++             invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(), invocation);
++        }
++
++        // Prepare for potential 'when(mock.method()).thenReturn()' style stubbing
+         invocationContainerImpl.setInvocationForPotentialStubbing(invocationMatcher);
+         OngoingStubbingImpl<T> ongoingStubbing = new OngoingStubbingImpl<T>(invocationContainerImpl);
+         mockingProgress.reportOngoingStubbing(ongoingStubbing);
+ 
++        // Execute the invocation: find a stubbed answer or use the default answer
+         StubbedInvocationMatcher stubbedInvocation = invocationContainerImpl.findAnswerFor(invocation);
+ 
+         if (stubbedInvocation != null) {
++            // Found a stubbed answer
+             stubbedInvocation.captureArgumentsFrom(invocation);
+             return stubbedInvocation.answer(invocation);
+         } else {
++            // No stub found, use the default answer
+             Object ret = mockSettings.getDefaultAnswer().answer(invocation);
+ 
+-            // redo setting invocation for potential stubbing in case of partial
+-            // mocks / spies.
+-            // Without it, the real method inside 'when' might have delegated
+-            // to other self method and overwrite the intended stubbed method
+-            // with a different one. The reset is required to avoid runtime exception that validates return type with stubbed method signature.
++            // Clean up potential stubbing state, essential for spies/partials
++            // to avoid self-calls overwriting the intended stubbing
+             invocationContainerImpl.resetInvocationForPotentialStubbing(invocationMatcher);
+             return ret;
+         }
+     }
+\ No newline at end of file

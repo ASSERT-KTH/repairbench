@@ -1,0 +1,204 @@
+diff --git a/tmp/bc62241a-3875-4238-afd5-9a062ba0c6ed_buggy.java b/tmp/fb570209-4ef5-450e-b243-b53f1242a405_fixed.java
+index b4d4f38..7cf9839 100644
+--- a/tmp/bc62241a-3875-4238-afd5-9a062ba0c6ed_buggy.java
++++ b/tmp/fb570209-4ef5-450e-b243-b53f1242a405_fixed.java
+@@ -1,123 +1,166 @@
+     /** Accept a step, triggering events and step handlers.
+      * @param interpolator step interpolator
+      * @param y state vector at step end time, must be reset if an event
+      * asks for resetting or if an events stops integration during the step
+      * @param yDot placeholder array where to put the time derivative of the state vector
+      * @param tEnd final integration time
+      * @return time at end of step
+      * @exception MaxCountExceededException if the interpolator throws one because
+      * the number of functions evaluations is exceeded
+      * @exception NoBracketingException if the location of an event cannot be bracketed
+      * @exception DimensionMismatchException if arrays dimensions do not match equations settings
+      * @since 2.2
+      */
+     protected double acceptStep(final AbstractStepInterpolator interpolator,
+                                 final double[] y, final double[] yDot, final double tEnd)
+         throws MaxCountExceededException, DimensionMismatchException, NoBracketingException {
+ 
+             double previousT = interpolator.getGlobalPreviousTime();
+-            final double currentT = interpolator.getGlobalCurrentTime();
++            double currentT = interpolator.getGlobalCurrentTime();
+ 
+             // initialize the events states if needed
+             if (! statesInitialized) {
+                 for (EventState state : eventsStates) {
+                     state.reinitializeBegin(interpolator);
+                 }
+                 statesInitialized = true;
+             }
+ 
+             // search for next events that may occur during the step
+             final int orderingSign = interpolator.isForward() ? +1 : -1;
+             SortedSet<EventState> occuringEvents = new TreeSet<EventState>(new Comparator<EventState>() {
+ 
+                 /** {@inheritDoc} */
++                @Override
+                 public int compare(EventState es0, EventState es1) {
++                    // comparing event occurrence time
+                     return orderingSign * Double.compare(es0.getEventTime(), es1.getEventTime());
+                 }
+ 
+             });
+ 
++            // Check all events to see if they occur during the step
+             for (final EventState state : eventsStates) {
+                 if (state.evaluateStep(interpolator)) {
+                     // the event occurs during the current step
+                     occuringEvents.add(state);
+                 }
+             }
+ 
++            // Process events occurring during the step
+             while (!occuringEvents.isEmpty()) {
+ 
+                 // handle the chronologically first event
+-                final Iterator<EventState> iterator = occuringEvents.iterator();
++                Iterator<EventState> iterator = occuringEvents.iterator();
+                 final EventState currentEvent = iterator.next();
+-                iterator.remove();
++                iterator.remove(); // Remove the current event from the set for processing
+ 
+                 // restrict the interpolator to the first part of the step, up to the event
+                 final double eventT = currentEvent.getEventTime();
+                 interpolator.setSoftPreviousTime(previousT);
+                 interpolator.setSoftCurrentTime(eventT);
+ 
+                 // get state at event time
+                 interpolator.setInterpolatedTime(eventT);
++                // CLONE the state BEFORE triggering events/handlers,
++                // as they may modify the state passed to them
+                 final double[] eventY = interpolator.getInterpolatedState().clone();
+ 
+-                // advance all event states to current time
+-                currentEvent.stepAccepted(eventT, eventY);
++                // Advance all event states to the event time.
++                // This is necessary to ensure that the g-function values are evaluated
++                // at the precise event time, required before checking stop() or reset().
++                // It's also crucial for consistent state updates across all handlers.
++                // Use the state obtained AFTER the previous step processing and BEFORE any reset/stop.
++                for (EventState state : eventsStates) {
++                    // Update the state's internal checkpoints G-values, time etc.
++                    state.stepAccepted(eventT, eventY); // Uses the state 'eventY' at time eventT
++                }
++
++                // Check if the current event requests stopping
+                 isLastStep = currentEvent.stop();
+ 
+-                // handle the first part of the step, up to the event
++                // Call step handlers for the portion of the step up to the event
++                // Pass the isLastStep flag reflecting the decision from the current event.
+                 for (final StepHandler handler : stepHandlers) {
+                     handler.handleStep(interpolator, isLastStep);
+                 }
+ 
+                 if (isLastStep) {
+-                    // the event asked to stop integration
++                    // The event requested to stop integration.
++                    // Update the main state vector y to the state at event time.
+                     System.arraycopy(eventY, 0, y, 0, y.length);
+-                    for (final EventState remaining : occuringEvents) {
+-                        remaining.stepAccepted(eventT, eventY);
+-                    }
++                    // The function returns eventT, signaling the integration loop to stop.
+                     return eventT;
+                 }
+ 
+-                boolean needReset = currentEvent.reset(eventT, eventY);
++
++                // Check if the current event requests resetting state.
++                // Note: The reset() method might modify the eventY array directly.
++                boolean needReset = currentEvent.reset(eventT, eventY); // eventY may be modified by reset()
+                 if (needReset) {
+-                    // some event handler has triggered changes that
+-                    // invalidate the derivatives, we need to recompute them
++                    // The event handler has triggered a state change requiring derivatives recomputation.
++                    // Update the main state vector y with the post-reset state.
+                     System.arraycopy(eventY, 0, y, 0, y.length);
++                    // Recompute derivatives with the new state.
+                     computeDerivatives(eventT, y, yDot);
+-                    resetOccurred = true;
+-                    for (final EventState remaining : occuringEvents) {
+-                        remaining.stepAccepted(eventT, eventY);
+-                    }
++                    resetOccurred = true; // Signal the integrator to restart the step from eventT.
++                    // The function returns eventT, signaling the integration loop to handle the reset.
+                     return eventT;
+                 }
+ 
+-                // prepare handling of the remaining part of the step
+-                previousT = eventT;
+-                interpolator.setSoftPreviousTime(eventT);
+-                interpolator.setSoftCurrentTime(currentT);
++                // Event did not stop or reset the state.
++                // The integration continues from the event time.
++                previousT = eventT; // The next segment starts from the event time.
++                interpolator.setSoftPreviousTime(eventT); // Adjust interpolator boundaries for the next segment.
++                interpolator.setSoftCurrentTime(currentT); // The step end time remains the same.
+ 
+-                // check if the same event occurs again in the remaining part of the step
+-                if (currentEvent.evaluateStep(interpolator)) {
+-                    // the event occurs during the current step
+-                    occuringEvents.add(currentEvent);
++                // Re-evaluate ALL events for the remaining interval [eventT, currentT].
++                // This is crucial because:
++                // 1. An event handler might have changed the state indirectly, affecting other events.
++                // 2. An event might be recurring and trigger again in the remaining interval.
++                // 3. Numerical precision might require re-evaluation.
++                // Clear the previous findings.
++                occuringEvents.clear();
++                // Check all registered events again.
++                for (final EventState state : eventsStates) {
++                    // state.stepAccepted(eventT, eventY) was already called, updating internal state (g0, t0).
++                    // Now check if it triggers in the new interval [eventT, currentT]
++                    if (state.evaluateStep(interpolator)) { // This uses the updated g0, t0 and interpolator interval [eventT, currentT]
++                        occuringEvents.add(state);
+                     }
+-
+                 }
++                // The loop continues with the (potentially empty) set of events for the remaining interval.
++            } // End of event processing loop
++
++            // No more events detected in the interval [previousT, currentT].
++            // previousT is the time of the start of the step, or the time of the last event handled.
+ 
+-            // last part of the step, after the last event
++            // Process the final segment of the step: [previousT, currentT].
+             interpolator.setInterpolatedTime(currentT);
+-            final double[] currentY = interpolator.getInterpolatedState();
++            final double[] currentY = interpolator.getInterpolatedState(); // State at the end of the step.
++
++            // Update the internal state of all event detectors to the end of the step time.
+             for (final EventState state : eventsStates) {
+-                state.stepAccepted(currentT, currentY);
+-                isLastStep = isLastStep || state.stop();
++                state.stepAccepted(currentT, currentY); // Use state at currentT
++                // Do NOT check stop() here. Stop is only determined at the exact event time.
+             }
+-            isLastStep = isLastStep || Precision.equals(currentT, tEnd, 1);
++            // Check if the end of the integration range has been reached.
++            isLastStep = Precision.equals(currentT, tEnd, 1);
+ 
+-            // handle the remaining part of the step, after all events if any
++
++            // Call step handlers for the final segment of the step.
++            // Ensure the interpolator is restricted to the final interval [previousT, currentT].
++            interpolator.setSoftPreviousTime(previousT);
++            interpolator.setSoftCurrentTime(currentT);
+             for (StepHandler handler : stepHandlers) {
+                 handler.handleStep(interpolator, isLastStep);
+             }
+ 
++            // Update the main state vector y with the final state at currentT.
++            // This is essential for the case where the step completes without events stopping/resetting.
++            System.arraycopy(currentY, 0, y, 0, y.length);
++
++            // Return the time at the end of the completed step.
+             return currentT;
+ 
+     }
+\ No newline at end of file

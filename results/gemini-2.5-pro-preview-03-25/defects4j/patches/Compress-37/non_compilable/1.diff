@@ -1,0 +1,210 @@
+diff --git a/tmp/076dc7f1-2fe7-41b4-9fc6-e9b8af4bb1f2_buggy.java b/tmp/cfe6aa96-ef19-4087-a61a-8601174b8416_fixed.java
+index 4b7e1e4..60a06ae 100644
+--- a/tmp/076dc7f1-2fe7-41b4-9fc6-e9b8af4bb1f2_buggy.java
++++ b/tmp/cfe6aa96-ef19-4087-a61a-8601174b8416_fixed.java
+@@ -1,52 +1,167 @@
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.HashMap;
++import java.util.Map;
++
++import org.apache.commons.compress.utils.CharsetNames;
++import org.apache.commons.compress.utils.IOUtils;
++
++// Assume this method is part of a class where globalPaxHeaders, CharsetNames, and IOUtils are accessible.
++// The original Map globalPaxHeaders should not be modified; the method works on a copy.
++class PaxParserUtil { // Example class structure
++    private Map<String, String> globalPaxHeaders = Map.of(); // Assume initialized appropriately
++
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+-        final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
++        // Use a mutable map initialized with global headers for this specific block
++        final Map<String, String> headers = new HashMap<>(globalPaxHeaders);
+         // Format is "length keyword=value\n";
+-        while(true){ // get length
++        while(true){
+             int ch;
+             int len = 0;
+             int read = 0;
++            boolean sawDigit = false;
++
++            // 1. Read record length:
++            // Stop at space, newline, or EOF. Skip lines not starting with a digit.
+             while((ch = i.read()) != -1) {
+                 read++;
+-                if (ch == ' '){
+-                    // Get keyword
+-                    final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+-                    while((ch = i.read()) != -1) {
+-                        read++;
+-                        if (ch == '='){ // end of keyword
+-                            final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
++                if (ch == ' ') { // End of length field
++                    if (!sawDigit) { // Space found before any digits -> invalid format
++                        len = -1; // Mark as invalid
++                    }
++                    break; // Proceed to read keyword=value
++                }
++                if (ch == '\n') { // Newline encountered before space -> invalid format
++                    len = -1; // Mark as invalid line
++                    break; // Skip processing this line
++                }
++                if (ch < '0' || ch > '9') {
++                    // Invalid character found in length field. Skip the rest of this line until newline.
++                    while ((ch = i.read()) != -1 && ch != '\n') {
++                        // consume remaining characters of the invalid line
++                    }
++                    len = -1; // Mark as invalid line
++                    break; // Skip processing this line
++                }
++
++                sawDigit = true;
++                int digit = ch - '0';
++                // Check for potential integer overflow before multiplication
++                if (len > (Integer.MAX_VALUE - digit) / 10) {
++                     // Overflow would occur. Treat as invalid line. Skip rest of line.
++                    while ((ch = i.read()) != -1 && ch != '\n') {
++                         // consume remaining characters of the invalid line
++                    }
++                    len = -1; // Mark as invalid line
++                    break; // Skip processing this line
++                }
++                // Accumulate length
++                len = len * 10 + digit;
++            }
++
++            // Check state after reading length field
++            if (ch == -1) { // EOF encountered while reading length or skipping invalid line.
++                // If sawDigit is true but no space was found, the record is truncated, but we must stop anyway.
++                break; // Exit main loop on EOF
++            }
++            if (len == -1) { // Invalid line detected (non-digit start, NL before SP, bad char, overflow, empty len field).
++                // The line was already skipped to NL or EOF hit. Continue to the next line attempt.
++                continue;
++            }
++
++            // Add a sanity limit for the total record length to prevent OutOfMemoryErrors
++            // Tar specification does not impose a strict limit, but implementations often do (e.g., related to block size).
++            // 64k should be more than enough for typical PAX headers.
++            final int MAX_PAX_RECORD_LENGTH = 65536;
++            if (len > MAX_PAX_RECORD_LENGTH) {
++                 // Skip the rest of this excessively long line until newline.
++                 while ((ch = i.read()) != -1 && ch != '\n') {
++                     // consume
++                 }
++                 if (ch == -1) break; // EOF while skipping
++                 continue; // Try next line
++            }
++
++            // 2. Calculate and validate remaining length
++            // 'len' is the total record length (including length field, space, keyword, '=', value, '\n')
++            // 'read' is the number of bytes consumed for the length field + space.
++            final int kvLen = len - read; // Length of the "keyword=value\n" part
++
++            // Smallest possible valid record is "5 a=\n" (len=5, read=2, kvLen=3).
++            // It requires at least: one char keyword, '=', '\n'. Thus kvLen must be at least 3.
++            if (kvLen < 3) {
++                // Declared length 'len' is impossibly small or inconsistent with bytes read so far.
++                // Consume the remaining 'kvLen' bytes if non-negative to maintain stream position.
++                if (kvLen >= 0) {
++                    // Read the remaining bytes into a dummy buffer to ensure they are consumed.
++                    byte[] dummy = new byte[kvLen];
++                    int got = IOUtils.readFully(i, dummy);
++                    if (got != kvLen) {
++                         // Stream ended prematurely, which is unexpected given the declared length.
++                         throw new IOException("Premature end of stream reading invalid PAX header record");
++                    }
++                } else {
++                    // len < read, which means the declared length is fundamentally inconsistent.
++                    // We cannot reliably consume kvLen bytes. Skip until the next newline for robustness.
++                     while ((ch = i.read()) != -1 && ch != '\n') {
++                         // consume potentially bogus data following the space
++                     }
++                     if (ch == -1) break; // EOF while skipping
++                }
++                continue; // Try next line
++            }
++
++            // 3. Read the keyword=value\n part
++            final byte[] kvBytes = new byte[kvLen];
++            final int got = IOUtils.readFully(i, kvBytes);
++            if (got != kvLen) {
++                // Stream ended unexpectedly while reading the expected data.
++                throw new IOException("Failed to read Paxheader. Expected " + kvLen
++                                      + " bytes (" + len + " total), read " + got);
++            }
++
++            // 4. Validate and parse the keyword=value\n bytes
++            // Record must end with a newline character.
++            if (kvBytes[kvLen - 1] != '\n') {
++                 // If it doesn't end with NL, the length field was likely incorrect.
++                 throw new IOException("Paxheader record does not end with newline: len=" + len);
++            }
++
++            // Find the '=' separator. Keyword must be non-empty, so '=' must be at index >= 1.
++            int eqPos = -1;
++            // Search for '=' from index 1 up to the second to last byte (before '\n').
++            for (int j = 1; j < kvLen - 1; j++) {
++                if (kvBytes[j] == '=') {
++                    eqPos = j;
++                    break;
++                }
++            }
++
++            // Check if a valid '=' position was found.
++            if (eqPos == -1) {
++                // Invalid format: No '=' found, or keyword is empty ("=value\n").
++                // Record was fully read based on 'len', so just continue to next line.
++                continue; // Try next line
++            }
++
++            // Extract keyword and value strings using UTF-8 encoding.
++            final String keyword = new String(kvBytes, 0, eqPos, CharsetNames.UTF_8);
++            // Calculate the length of the value string.
++            final int valueLen = kvLen - eqPos - 2; // Subtract 1 for '=' and 1 for '\n'
++
++            if (valueLen < 0) {
++                // This should only happen if the record is like "keyword=\n", resulting in valueLen = -1.
++                // According to the spec, an empty value field ("keyword=\n") means delete the keyword.
+                  headers.remove(keyword);
+             } else {
+-                                final byte[] rest = new byte[restLen];
+-                                final int got = IOUtils.readFully(i, rest);
+-                                if (got != restLen) {
+-                                    throw new IOException("Failed to read "
+-                                                          + "Paxheader. Expected "
+-                                                          + restLen
+-                                                          + " bytes, read "
+-                                                          + got);
+-                                }
+-                                // Drop trailing NL
+-                                final String value = new String(rest, 0,
+-                                                          restLen - 1, CharsetNames.UTF_8);
++                final String value = new String(kvBytes, eqPos + 1, valueLen, CharsetNames.UTF_8);
+                 headers.put(keyword, value);
+             }
+-                            break;
+-                        }
+-                        coll.write((byte) ch);
+-                    }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
+-            }
+-        }
++            // Successfully processed a header, continue the loop for the next line
++        } // End while(true)
++
+         return headers;
+     }
++}
+\ No newline at end of file

@@ -1,0 +1,217 @@
+diff --git a/tmp/3365980b-d30f-4c7f-b2f5-08555090ce02_buggy.java b/tmp/ed5d2e8b-4c59-4278-9a73-b3a7d160db30_fixed.java
+index 3652aad..c00ca6f 100644
+--- a/tmp/3365980b-d30f-4c7f-b2f5-08555090ce02_buggy.java
++++ b/tmp/ed5d2e8b-4c59-4278-9a73-b3a7d160db30_fixed.java
+@@ -1,86 +1,152 @@
+     /**
+      * Defines a typed variable. The defining node will be annotated with the
+      * variable's type of {@link JSTypeNative#UNKNOWN_TYPE} if its type is
+      * inferred.
+      *
+-     * Slots may be any variable or any qualified name in the global scope.
++     * Slots may be any variable or any qualified name.
+      *
+-     * @param n the defining NAME or GETPROP node.
+-     * @param parent the {@code n}'s parent.
+-     * @param type the variable's type. It may be {@code null} if
++     * @param n The defining NAME or GETPROP node.
++     * @param parent The {@code n}'s parent.
++     * @param type The variable's type. It may be {@code null} if
+      *     {@code inferred} is {@code true}.
++     * @param inferred Whether the type is inferred.
+      */
+     void defineSlot(Node n, Node parent, JSType type, boolean inferred) {
+       Preconditions.checkArgument(inferred || type != null);
+ 
+-      // Only allow declarations of NAMEs and qualfied names.
+-      boolean shouldDeclareOnGlobalThis = false;
++      // Validate node types.
+       if (n.getType() == Token.NAME) {
+         Preconditions.checkArgument(
+-            parent.getType() == Token.FUNCTION ||
+-            parent.getType() == Token.VAR ||
+-            parent.getType() == Token.LP ||
+-            parent.getType() == Token.CATCH);
+-        shouldDeclareOnGlobalThis = scope.isGlobal() &&
+-            (parent.getType() == Token.VAR ||
+-             parent.getType() == Token.FUNCTION);
++            parent.getType() == Token.FUNCTION
++                || parent.getType() == Token.VAR
++                || parent.getType() == Token.LP
++                || parent.getType() == Token.CATCH);
+       } else {
+         Preconditions.checkArgument(
+-            n.getType() == Token.GETPROP &&
+-            (parent.getType() == Token.ASSIGN ||
+-             parent.getType() == Token.EXPR_RESULT));
++            n.getType() == Token.GETPROP
++                && (parent.getType() == Token.ASSIGN
++                    || parent.getType() == Token.EXPR_RESULT));
+       }
++
+       String variableName = n.getQualifiedName();
++      // getQualifiedName() can return null for anonymous functions expressions
++      // assigned to properties.
++      if (variableName == null) {
++        return;
++      }
+       Preconditions.checkArgument(!variableName.isEmpty());
+ 
+-      // If n is a property, then we should really declare it in the
+-      // scope where the root object appears. This helps out people
+-      // who declare "global" names in an anonymous namespace.
+-      Scope scopeToDeclareIn = scope;
+-
+-        // don't try to declare in the global scope if there's
+-        // already a symbol there with this name.
+-
+-      // declared in closest scope?
+-      if (scopeToDeclareIn.isDeclared(variableName, false)) {
+-        Var oldVar = scopeToDeclareIn.getVar(variableName);
+-        validator.expectUndeclaredVariable(
+-            sourceName, n, parent, oldVar, variableName, type);
+-      } else {
+-        if (!inferred) {
+-          setDeferredType(n, type);
++      // Determine the scope where the variable should be declared.
++      Scope scopeToDeclareIn = scope; // Default to current scope
++      if (n.getType() == Token.GETPROP) {
++        Node rootNode = n.getFirstChild();
++        // If the root of the qualified name is a simple name, find its scope.
++        if (rootNode.getType() == Token.NAME) {
++          String rootVarName = rootNode.getString();
++          Var rootVar = scope.getVar(rootVarName); // Find root variable in scope chain
++          if (rootVar != null && rootVar.getScope() != null) {
++            // Declare in the scope where the root name is defined.
++            scopeToDeclareIn = rootVar.getScope();
++          }
++          // If root var is not found or has no scope (e.g., synthetic), 'ns' in 'ns.foo'
++          // might be undeclared. TypeCheck should warn. We'll declare 'ns.foo'
++          // in the current scope (default).
+         }
++        // If root is not a NAME (e.g., `getObj().foo`, `this.foo`), declare in current scope.
++      }
++
+       CompilerInput input = compiler.getInput(sourceName);
+-        scopeToDeclareIn.declare(variableName, n, type, input, inferred);
+-
+-        if (shouldDeclareOnGlobalThis) {
+-          ObjectType globalThis =
+-              typeRegistry.getNativeObjectType(JSTypeNative.GLOBAL_THIS);
+-          boolean isExtern = input.isExtern();
+-          if (inferred) {
+-            globalThis.defineInferredProperty(variableName,
+-                type == null ?
+-                    getNativeType(JSTypeNative.NO_TYPE) :
+-                    type,
+-                isExtern);
++      JSType typeToDeclare = type;
++      if (inferred && typeToDeclare == null) {
++        typeToDeclare = getNativeType(JSTypeNative.UNKNOWN_TYPE);
++      }
++
++      // Check if the variable already exists in the target scope's declaration list.
++      Var existingVar = scopeToDeclareIn.getVar(variableName);
++      boolean varExistsInTargetScope =
++          existingVar != null && existingVar.getScope() == scopeToDeclareIn;
++
++      if (varExistsInTargetScope) {
++        // Variable already exists in the target scope. Handle update/redeclaration.
++
++        if (n.getType() == Token.NAME) {
++          // NAME redeclaration (e.g., var x; var x; or var x; /** @type {string} */ var x;)
++          // The validator ensures that this is either a harmless redeclaration
++          // (e.g. var x; var x = 3) or issues a warning.
++          validator.expectUndeclaredVariable(
++              sourceName, n, parent, existingVar, variableName, typeToDeclare);
++
++          // If valid (e.g. var redeclaration), update type if new type isn't inferred,
++          // unless existing type was already declared.
++          boolean updateType = false;
++          if (!inferred) {
++             updateType = true; // Always update with a declared type
++          } else if (existingVar.isTypeInferred()) {
++             updateType = true; // Update if both are inferred
++          }
++
++          if (updateType) {
++             existingVar.setType(typeToDeclare);
++             if (input != null) { // Input might be null for synthetic nodes
++                 existingVar.setInput(input);
++             }
++             // Note: We don't update the declaration node for redeclarations.
++             if (scopeToDeclareIn.isGlobal()) {
++                updateGlobalVarDefinition(variableName, typeToDeclare, inferred, input);
++                if (typeToDeclare instanceof FunctionType) {
++                    declarePrototype(n, variableName, (FunctionType) typeToDeclare, scopeToDeclareIn, input);
++                }
++             }
++          }
++          // Ensure node type matches final var type
++          setDeferredType(n, existingVar.getType());
++
++        } else { // n.getType() == Token.GETPROP
++          // Property assignment (e.g., ns.foo = ...)
++          JSType oldType = existingVar.getType();
++          boolean updateType = false;
++          if (!inferred) {
++            // Always update if new type is declared.
++            updateType = true;
++          } else if (existingVar.isTypeInferred() || oldType == null) {
++            // Update if new type is inferred and old type was null or inferred.
++            updateType = true;
++          }
++
++          if (updateType) {
++            existingVar.setType(typeToDeclare);
++            // Don't update the var's defining node/scope, just the type and input.
++             if (input != null) { // Input might be null for synthetic nodes
++                 existingVar.setInput(input);
++             }
++            if (scopeToDeclareIn.isGlobal()) {
++              updateGlobalVarDefinition(variableName, typeToDeclare, inferred, input);
++              if (typeToDeclare instanceof FunctionType) {
++                declarePrototype(n, variableName, (FunctionType) typeToDeclare, scopeToDeclareIn, input);
++              }
++            }
++          }
++          // Set node type for consistency, using the final type on the var.
++          setDeferredType(n, existingVar.getType());
++        }
++
+       } else {
+-            globalThis.defineDeclaredProperty(variableName, type, isExtern);
+-          }
+-        }
++        // Variable does not exist in the target scope's declaration list (or exists only in ancestor).
++        // Declare it new in scopeToDeclareIn.
++        setDeferredType(n, typeToDeclare); // Set type for the node first
++        scopeToDeclareIn.declare(variableName, n, typeToDeclare, input, inferred);
++        Var newVar = scopeToDeclareIn.getVar(variableName); // Get the newly declared var
+ 
+-        // If we're in the global scope, also declare var.prototype
+-        // in the scope chain.
+-        if (scopeToDeclareIn.isGlobal() && type instanceof FunctionType) {
+-          FunctionType fnType = (FunctionType) type;
+-          if (fnType.isConstructor() || fnType.isInterface()) {
+-            FunctionType superClassCtor = fnType.getSuperClassConstructor();
+-            scopeToDeclareIn.declare(variableName + ".prototype", n,
+-                fnType.getPrototype(), compiler.getInput(sourceName),
+-                /* declared iff there's an explicit supertype */
+-                superClassCtor == null ||
+-                superClassCtor.getInstanceType().equals(
+-                    getNativeType(OBJECT_TYPE)));
++        if (scopeToDeclareIn.isGlobal()) {
++           // Ensure the var is associated with the input defining it
++           // This is important for externs tracking.
++           if (newVar != null && input != null) {
++             newVar.setInput(input);
++           }
++           updateGlobalVarDefinition(variableName, typeToDeclare, inferred, input);
++           if (typeToDeclare instanceof FunctionType) {
++             declarePrototype(n, variableName, (FunctionType) typeToDeclare, scopeToDeclareIn, input);
+            }
+         }
+       }
+     }
+\ No newline at end of file

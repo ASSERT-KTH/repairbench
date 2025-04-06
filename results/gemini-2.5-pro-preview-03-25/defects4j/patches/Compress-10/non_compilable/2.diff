@@ -1,0 +1,132 @@
+diff --git a/tmp/4e96b9f0-8773-4cf1-a0a4-38cac4e191dc_buggy.java b/tmp/ae65f81a-97c5-4cc1-b8ca-b103853ce1aa_fixed.java
+index 85e6a42..a58375a 100644
+--- a/tmp/4e96b9f0-8773-4cf1-a0a4-38cac4e191dc_buggy.java
++++ b/tmp/ae65f81a-97c5-4cc1-b8ca-b103853ce1aa_fixed.java
+@@ -1,50 +1,110 @@
++import java.io.IOException;
++import java.util.Map;
++import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
++import org.apache.commons.compress.archivers.zip.ZipShort;
++import org.apache.commons.compress.archivers.zip.ZipUtil;
++// Assuming the context of the ZipFile class where necessary fields and constants like
++// entries, nameMap, archive, OffsetEntry, NameAndComment, LFH_OFFSET_FOR_FILENAME_LENGTH, SHORT
++// are defined.
++
+     /**
+-     * Walks through all recorded entries and adds the data available
+-     * from the local file header.
++     * Walks through all recorded entries and resolves differences between
++     * LFH and central directory data.
+      *
+-     * <p>Also records the offsets for the data to read from the
+-     * entries.</p>
++     * <p>Specifically, it calculates the data offset based on the LFH
++     * structure and potentially updates entry names and comments if
++     * Unicode extra fields are present in the central directory but the
++     * general purpose UTF-8 flag was not set.</p>
++     *
++     * @param entriesWithoutUTF8Flag Map of entries that lacked the UTF-8
++     *                               flag in the central directory but had
++     *                               potential Unicode names/comments in
++     *                               CD extra fields.
++     * @throws IOException if an I/O error occurs reading the archive.
+      */
+     private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                             entriesWithoutUTF8Flag)
+         throws IOException {
+         // changing the name of a ZipArchiveEntry is going to change
+         // the hashcode - see COMPRESS-164
+-        // Map needs to be reconstructed in order to keep central
+-        // directory order
+-        for (ZipArchiveEntry ze : entries.keySet()) {
++        // The ZipFile constructor handles map reconstruction if names change.
++        for (ZipArchiveEntry ze : entries.keySet()) { // Iterating over keys, value lookup is fine.
+             OffsetEntry offsetEntry = entries.get(ze);
+-            long offset = offsetEntry.headerOffset;
++            // offsetEntry should not be null if ze comes from entries.keySet()
++            if (offsetEntry == null) {
++                // This indicates an internal inconsistency.
++                // While unlikely, handle defensively or throw.
++                // For now, matching original behavior's lack of check here.
++                 continue;
++            }
++
++            long offset = offsetEntry.headerOffset; // Start of LFH
++            // Position calculation needs constants defined in ZipFile/ZipConstants
++            // static final int LFH_OFFSET_FOR_FILENAME_LENGTH = 26;
++            // static final int SHORT = 2;
++
++            // Seek to the position of filename length field in LFH
+             archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+-            byte[] b = new byte[SHORT];
+-            archive.readFully(b);
+-            int fileNameLen = ZipShort.getValue(b);
+-            archive.readFully(b);
+-            int extraFieldLen = ZipShort.getValue(b);
++            byte[] shortBuf = new byte[SHORT]; // Use a buffer for short reads
++
++            // Read filename length (n) from LFH
++            archive.readFully(shortBuf);
++            int fileNameLen = ZipShort.getValue(shortBuf);
++
++            // Read extra field length (m) from LFH
++            archive.readFully(shortBuf);
++            int extraFieldLen = ZipShort.getValue(shortBuf);
++
++            // Skip the filename field in the LFH
+             int lenToSkip = fileNameLen;
+             while (lenToSkip > 0) {
+                 int skipped = archive.skipBytes(lenToSkip);
+                 if (skipped <= 0) {
+-                    throw new RuntimeException("failed to skip file name in"
+-                                               + " local file header");
++                    // Use IOException for I/O related failures
++                    throw new IOException("Failed to skip file name in local file header"
++                                          + " for entry " + ze.getName());
+                 }
+                 lenToSkip -= skipped;
+             }
++
++            // Read the local extra field data.
++            // We need the LFH extra field *length* (extraFieldLen) to calculate
++            // the data offset correctly.
++            // We read the *data* itself but DO NOT store it back into the
++            // ZipArchiveEntry (ze.setExtra()), because the Central Directory
++            // extra data is often more complete (e.g., Unicode path fields)
++            // and should be preserved on the main entry object for name correction.
+             byte[] localExtraData = new byte[extraFieldLen];
+             archive.readFully(localExtraData);
+-            ze.setExtra(localExtraData);
++            // ze.setExtra(localExtraData); // DO NOT DO THIS - It overwrites CDH extra data needed for name correction
++
++            // Calculate the offset where the actual compressed data starts.
++            // This depends on the LFH structure: offset + fixed_header_part + filename_len + extra_field_len
+             offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                 + SHORT + SHORT + fileNameLen + extraFieldLen;
+ 
++            // Handle entries where the UTF-8 flag was missing in the general
++            // purpose flags but Unicode path/comment extra fields were found
++            // in the *Central Directory*.
+             if (entriesWithoutUTF8Flag.containsKey(ze)) {
+                 String orig = ze.getName();
+                 NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
++                // Update name/comment using the extra fields *already stored in ze*
++                // (which are the CD extra fields). This is crucial for cases like WinZip
++                // archives where Unicode info is only in CD extra fields.
+                 ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                          nc.comment);
++                // If the name was updated (e.g., from raw bytes to proper Unicode),
++                // we need to update the nameMap for lookups by name.
++                // The main `entries` map might also need rebuilding due to
++                // hashcode changes, which is handled by the ZipFile constructor.
+                 if (!orig.equals(ze.getName())) {
+                     nameMap.remove(orig);
+                     nameMap.put(ze.getName(), ze);
+                 }
+             }
++            // Any other LFH data needed? Potentially LFH specific extra fields
++            // could be stored in OffsetEntry if required later, e.g.
++            // offsetEntry.localExtraData = localExtraData;
+         }
+     }
+\ No newline at end of file

@@ -1,0 +1,179 @@
+diff --git a/tmp/cb9226fa-e3a8-4808-bc33-21960e9d06dc_buggy.java b/tmp/ff09387f-474a-4ccb-9010-610067972b2e_fixed.java
+index 6dd359b..a9316d9 100644
+--- a/tmp/cb9226fa-e3a8-4808-bc33-21960e9d06dc_buggy.java
++++ b/tmp/ff09387f-474a-4ccb-9010-610067972b2e_fixed.java
+@@ -1,125 +1,167 @@
+     public void collect(JSModule module, Scope scope, Node n) {
+       Node parent = n.getParent();
+ 
+-      String name;
++      String name = null; // Initialize name to null
+       boolean isSet = false;
+       Name.Type type = Name.Type.OTHER;
+       boolean isPropAssign = false;
+ 
+       switch (n.getType()) {
+         case Token.GETTER_DEF:
+         case Token.SETTER_DEF:
+         case Token.STRING_KEY:
+           // This may be a key in an object literal declaration.
+-          name = null;
++          // name = null; // Already null
+           if (parent != null && parent.isObjectLit()) {
+             name = getNameForObjLitKey(n);
+           }
+           if (name == null) {
+             return;
+           }
+           isSet = true;
+           switch (n.getType()) {
+             case Token.STRING_KEY:
++              // If the child is a computed property name, it doesn't have a static name.
++              if (!n.getFirstChild().isComputedProp()) {
+                 type = getValueType(n.getFirstChild());
++              } else {
++                return; // Cannot determine name statically
++              }
+               break;
+             case Token.GETTER_DEF:
+               type = Name.Type.GET;
+               break;
+             case Token.SETTER_DEF:
+               type = Name.Type.SET;
+               break;
+             default:
+               throw new IllegalStateException("unexpected:" + n);
+           }
+           break;
+         case Token.NAME:
+           // This may be a variable get or set.
++
++          // <<< FIX START >>>
++          // Don't process the NAME node if it's a declaration for a catch variable
++          // or a function parameter. These are local declarations defined by the scope creator.
++          if (parent != null && parent.isParamList()) {
++             Node grandparent = parent.getParent();
++             if (grandparent != null && (grandparent.isFunction() || grandparent.isCatch())) {
++                return; // Ignore parameter/catch variable NAME declarations
++             }
++          }
++          // <<< FIX END >>>
++
+           if (parent != null) {
+             switch (parent.getType()) {
+               case Token.VAR:
+                 isSet = true;
+                 Node rvalue = n.getFirstChild();
+                 type = rvalue == null ? Name.Type.OTHER : getValueType(rvalue);
+                 break;
+               case Token.ASSIGN:
+                 if (parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = getValueType(n.getNext());
+                 }
+                 break;
+               case Token.GETPROP:
++                // If 'n' is the object part of a GETPROP (e.g., 'e' in e.name),
++                // let the GETPROP case handle the full 'e.name'.
++                // If 'n' is the property name part, it's not a variable reference.
++                // So, we ignore NAME nodes under GETPROP in this pass's NAME case.
+                 return;
+               case Token.FUNCTION:
+                 Node gramps = parent.getParent();
++                // Ignore function expression names (they are local to the function)
+                 if (gramps == null || NodeUtil.isFunctionExpression(parent)) {
+                   return;
+                 }
++                // Otherwise, it's a function declaration name (potentially global)
+                 isSet = true;
+                 type = Name.Type.FUNCTION;
+                 break;
+               case Token.INC:
+               case Token.DEC:
+                 isSet = true;
+                 type = Name.Type.OTHER;
+                 break;
+               default:
+                 if (NodeUtil.isAssignmentOp(parent) &&
+                     parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = Name.Type.OTHER;
+                 }
++                // Note: If parent.isParamList() was not handled by the fix above
++                // (e.g., different AST structure), it would fall here.
++                // A simple `get` of a parameter name is not a global reference.
++                // The check `isGlobalNameReference` *should* handle this correctly
++                // if scope analysis is right, but the explicit return above is safer.
+             }
+           }
++          // If we reached here, it's a potential reference or global declaration.
+           name = n.getString();
+-          break;
++          break; // Proceed to global check
+         case Token.GETPROP:
+           // This may be a namespaced name get or set.
+           if (parent != null) {
+             switch (parent.getType()) {
+               case Token.ASSIGN:
+                 if (parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = getValueType(n.getNext());
+                   isPropAssign = true;
+                 }
+                 break;
+               case Token.INC:
+               case Token.DEC:
+                 isSet = true;
+                 type = Name.Type.OTHER;
+                 break;
+-              case Token.GETPROP:
+-                return;
++              // Removed case Token.GETPROP: return; (was in original buggy code, seemed wrong here)
+               default:
+                 if (NodeUtil.isAssignmentOp(parent) &&
+                     parent.getFirstChild() == n) {
+                   isSet = true;
+                   type = Name.Type.OTHER;
+                 }
+             }
+           }
++          // If none of the above 'set' cases match, isSet remains false (it's a 'get').
+           name = n.getQualifiedName();
+           if (name == null) {
+             return;
+           }
+-          break;
++          // Qualified names starting with 'this' are not global names.
++          if (name.startsWith("this.")) {
++             return;
++          }
++          break; // Proceed to global check
+         default:
++          return; // Ignore other node types
++      }
++
++      // We must have a name at this point to proceed.
++      // The STRING_KEY, NAME, and GETPROP cases that don't return early should set name.
++      if (name == null) {
++        // This might happen for GETTER_DEF/SETTER_DEF if parent isn't OBJECTLIT,
++        // or computed string keys. Return safely.
+         return;
+       }
+ 
+       // We are only interested in global names.
+       if (!isGlobalNameReference(name, scope)) {
+         return;
+       }
+ 
++      // If we reach here, 'name' is potentially a global name reference or assignment.
+       if (isSet) {
+         if (isGlobalScope(scope)) {
+           handleSetFromGlobal(module, scope, n, parent, name, isPropAssign, type);
+         } else {
+           handleSetFromLocal(module, scope, n, parent, name);
+         }
+       } else {
+         handleGet(module, scope, n, parent, name);
+       }
+     }
+\ No newline at end of file

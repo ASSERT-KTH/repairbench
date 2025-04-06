@@ -1,0 +1,198 @@
+diff --git a/tmp/d109cd7f-894b-4a1b-9d02-66ce1b54acd3_buggy.java b/tmp/ced17014-6ce9-4bba-89f2-efff34a0fa87_fixed.java
+index 7c7fdc2..e57e0d7 100644
+--- a/tmp/d109cd7f-894b-4a1b-9d02-66ce1b54acd3_buggy.java
++++ b/tmp/ced17014-6ce9-4bba-89f2-efff34a0fa87_fixed.java
+@@ -1,81 +1,157 @@
++import org.jsoup.helper.DataUtil; // Assuming access to static helpers like detectCharsetFromBom, etc.
++import org.jsoup.helper.Validate;
++import org.jsoup.internal.ConstrainableInputStream;
++import org.jsoup.nodes.*;
++import org.jsoup.parser.Parser;
++import org.jsoup.select.Elements;
++
++import java.io.*;
++import java.nio.ByteBuffer;
++import java.nio.charset.Charset;
++import java.nio.charset.IllegalCharsetNameException;
++import java.nio.charset.UnsupportedCharsetException;
++
++// Assume context provides:
++// - static final fields: bufferSize, firstReadBufferSize, defaultCharset (e.g., "UTF-8")
++// - static helper methods: DataUtil.readToByteBuffer, DataUtil.detectCharsetFromBom, DataUtil.getCharsetFromContentType, DataUtil.validateCharset
++// - internal class: DataUtil.BomCharset
++
++/**
++ * Parses the input stream into a Document.
++ * @param input input stream to parse. You should buffer this.
++ * @param charsetName character set of input stream. Set to {@code null} to determine automatically.
++ * @param baseUri base URI of document, to resolve relative links against.
++ * @param parser alternate parser to use.
++ * @return parsed document
++ * @throws IOException on IO error
++ */
+ static Document parseInputStream(InputStream input, String charsetName, String baseUri, Parser parser) throws IOException  {
+     if (input == null) // empty body
+         return new Document(baseUri);
+-        input = ConstrainableInputStream.wrap(input, bufferSize, 0);
++    // Wrap input stream for constraints, useful for reading limited bytes for detection
++    // Max size 0 means no limit, just wrap for bufferSize mark/reset support.
++    input = ConstrainableInputStream.wrap(input, DataUtil.bufferSize, 0);
+ 
+     Document doc = null;
+     boolean fullyRead = false;
+ 
+-        // read the start of the stream and look for a BOM or meta charset
+-        input.mark(bufferSize);
+-        ByteBuffer firstBytes = readToByteBuffer(input, firstReadBufferSize - 1); // -1 because we read one more to see if completed. First read is < buffer size, so can't be invalid.
+-        fullyRead = input.read() == -1;
+-        input.reset();
++    // Mark the input stream to allow resetting after reading the initial bytes for BOM/meta detection
++    input.mark(DataUtil.bufferSize);
++    // Read initial bytes. readToByteBuffer consumes data, resulting buffer has position=0, limit=read.
++    ByteBuffer firstBytes = DataUtil.readToByteBuffer(input, DataUtil.firstReadBufferSize - 1); // -1 because readToByteBuffer reads one extra byte to check for end of stream.
++    fullyRead = input.read() == -1; // Check if we read the whole stream
++    input.reset(); // Reset stream to the mark for potential full re-read
+ 
+-        // look for BOM - overrides any other header or input
+-        BomCharset bomCharset = detectCharsetFromBom(firstBytes);
+-        if (bomCharset != null)
+-            charsetName = bomCharset.charset;
++    // 1. Check for BOM - overrides any other declaration
++    DataUtil.BomCharset bomCharset = DataUtil.detectCharsetFromBom(firstBytes); // Reads from firstBytes, advances position
++    if (bomCharset != null) {
++        charsetName = bomCharset.charset; // Use charset from BOM
++    }
++    // Rewind buffer so subsequent decodes start from the beginning.
++    firstBytes.rewind();
+ 
+-        if (charsetName == null) { // determine from meta. safe first parse as UTF-8
+-            String docData = Charset.forName(defaultCharset).decode(firstBytes).toString();
+-            doc = parser.parseInput(docData, baseUri);
++    if (charsetName == null) { // 2. If no BOM, try reading meta tags from initial bytes parsed as defaultCharset
++        try {
++            // Decode assumes defaultCharset is valid (e.g., UTF-8)
++            String docData = Charset.forName(DataUtil.defaultCharset).decode(firstBytes).toString();
++            doc = parser.parseInput(docData, baseUri); // Parse initial fragment
+ 
+-            // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
++            // Find meta charset elements: <meta http-equiv=content-type>, <meta charset>
+             Elements metaElements = doc.select("meta[http-equiv=content-type], meta[charset]");
+-            String foundCharset = null; // if not found, will keep utf-8 as best attempt
++            String foundCharset = null;
+             for (Element meta : metaElements) {
+                 if (meta.hasAttr("http-equiv"))
+-                    foundCharset = getCharsetFromContentType(meta.attr("content"));
++                    foundCharset = DataUtil.getCharsetFromContentType(meta.attr("content"));
+                 if (foundCharset == null && meta.hasAttr("charset"))
+                     foundCharset = meta.attr("charset");
+                 if (foundCharset != null)
+                     break;
+             }
+ 
+-            // look for <?xml encoding='ISO-8859-1'?>
++            // 3. Check for XML declaration <?xml encoding='...'?>
+             if (foundCharset == null && doc.childNodeSize() > 0) {
+                 Node first = doc.childNode(0);
+                 XmlDeclaration decl = null;
+-                if (first instanceof XmlDeclaration)
++                if (first instanceof XmlDeclaration) {
+                     decl = (XmlDeclaration) first;
+-                else if (first instanceof Comment) {
++                } else if (first instanceof Comment) {
+                     Comment comment = (Comment) first;
+                     if (comment.isXmlDeclaration())
+                         decl = comment.asXmlDeclaration();
+                 }
+                 if (decl != null) {
++                    // Prevents unlikely but possible mismatch between XML decl and HTML contents
+                     if (decl.name().equalsIgnoreCase("xml"))
+                         foundCharset = decl.attr("encoding");
+                 }
+             }
+-            foundCharset = validateCharset(foundCharset);
+-            if (foundCharset != null && !foundCharset.equalsIgnoreCase(defaultCharset)) { // need to re-decode. (case insensitive check here to match how validate works)
+-                foundCharset = foundCharset.trim().replaceAll("[\"']", "");
++
++            // Validate and potentially update charsetName
++            foundCharset = DataUtil.validateCharset(foundCharset);
++            if (foundCharset != null && !foundCharset.equalsIgnoreCase(DataUtil.defaultCharset)) {
++                // Found a non-default charset in meta/xml, need to re-parse the whole stream
++                foundCharset = foundCharset.trim().replaceAll("[\"']", ""); // Normalize
+                 charsetName = foundCharset;
+-                doc = null;
++                doc = null; // Discard partial parse
+             } else if (!fullyRead) {
+-                doc = null;
++                // If stream wasn't fully read, and we didn't find a new charset (or it's the default),
++                // we must parse the rest of the stream using the default charset.
++                doc = null; // Discard partial parse
+             }
+-        } else { // specified by content type header (or by user on file load)
++            // If fullyRead and no different charset found (or found==default), the initial parse ('doc') is the final document.
++        } catch (UnsupportedCharsetException | IllegalCharsetNameException e) {
++            // Should not happen with defaultCharset, but throw if it does. Could fallback? No, fail fast.
++            throw new IOException("Unsupported or invalid default charset: " + DataUtil.defaultCharset, e);
++        }
++    } else {
++        // Charset was specified by BOM or content type header (or user argument)
+         Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
++        // We need to parse the whole stream with this charset.
++        doc = null;
+     }
++
++    // Re-parse if needed (doc == null indicates detection required re-parse or stream wasn't fully read initially)
+     if (doc == null) {
+         if (charsetName == null)
+-                charsetName = defaultCharset;
+-            BufferedReader reader = new BufferedReader(new InputStreamReader(input, charsetName), bufferSize);
+-            if (bomCharset != null && bomCharset.offset) // creating the buffered reader ignores the input pos, so must skip here
+-                reader.skip(1);
++            charsetName = DataUtil.defaultCharset; // Default to UTF-8 if nothing found/specified
++
++        // Create reader with the determined charset. InputStreamReader handles BOMs.
++        BufferedReader reader = new BufferedReader(new InputStreamReader(input, charsetName), DataUtil.bufferSize);
++
+         try {
+-                doc = parser.parseInput(reader, baseUri);
++            doc = parser.parseInput(reader, baseUri); // Parse the full stream
+         } catch (UncheckedIOException e) {
+-                // io exception when parsing (not seen before because reading the stream as we go)
+-                throw e.ioException();
++            // E.g. if underlying stream is closed prematurely during parse.
++            throw e.ioException(); // Propagate IO exceptions during parsing
+         }
+-            Charset charset = Charset.forName(charsetName);
+-            doc.outputSettings().charset(charset);
+-                // some charsets can read but not encode; switch to an encodable charset and update the meta el
++
++        // Set document output charset based on determined charset
++        Charset parsedCharset;
++        try {
++             parsedCharset = Charset.forName(charsetName);
++        } catch (IllegalCharsetNameException | UnsupportedCharsetException e) {
++            // Charset may be valid for decoding (used by InputStreamReader) but not encodable or invalid for Charset.forName? Unlikely.
++            // If validation passed, this should be safe. If not, fallback.
++            parsedCharset = Charset.forName(DataUtil.defaultCharset);
+         }
++        doc.outputSettings().charset(parsedCharset);
++
++        // Fallback for problematic charsets for output encoding. Check specific known problematic ones like ISO-2022-CN.
++        // The standard .canEncode() check is insufficient for stateful encodings.
++        // Using equalsIgnoreCase for robustness as charset names can vary in case.
++        if (charsetName.equalsIgnoreCase("ISO-2022-CN")) {
++            doc.outputSettings().charset(Charset.forName(DataUtil.defaultCharset)); // Fallback to default (UTF-8)
++            doc.updateMetaCharsetElement(true); // Update meta tag in DOM to match output charset
++        }
++    }
++    // Ensure the input stream is closed
+     input.close();
++
++    // Ensure the Document's charset reflects the final output setting
++    // (which might be different from the detected input charset if fallback occurred)
++    if (doc != null) { // doc is null only if input stream was null initially
++         doc.charset(doc.outputSettings().charset());
++    }
++
+     return doc;
+ }
+\ No newline at end of file

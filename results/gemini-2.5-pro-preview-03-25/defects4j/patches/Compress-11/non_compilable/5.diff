@@ -1,0 +1,162 @@
+diff --git a/tmp/f3e7dcf8-139f-4b16-b25a-027e2947c459_buggy.java b/tmp/5a5327c0-8478-4442-8e2c-079f45c31fad_fixed.java
+index 6b160ef..6b70295 100644
+--- a/tmp/f3e7dcf8-139f-4b16-b25a-027e2947c459_buggy.java
++++ b/tmp/5a5327c0-8478-4442-8e2c-079f45c31fad_fixed.java
+@@ -1,68 +1,133 @@
++import org.apache.commons.compress.archivers.ArchiveException;
++import org.apache.commons.compress.archivers.ArchiveInputStream;
++import org.apache.commons.compress.archivers.ar.ArArchiveInputStream;
++import org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream;
++import org.apache.commons.compress.archivers.dump.DumpArchiveInputStream;
++import org.apache.commons.compress.archivers.jar.JarArchiveInputStream;
++import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
++import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
++
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++// NOTE: This is a placeholder class to make the provided function compile.
++// The actual context would involve the real ArchiveStreamFactory class.
++class ArchiveStreamFactory {
++
++    // Added DEFAULT_RCDSIZE constant based on its use in TarArchiveInputStream
++    // Assuming its value is 512, which is standard for TAR block size.
++    private static final int TAR_DEFAULT_RCDSIZE = 512;
++
+     /**
+      * Create an archive input stream from an input stream, autodetecting
+      * the archive type from the first few bytes of the stream. The InputStream
+      * must support marks, like BufferedInputStream.
+      *
+      * @param in the input stream
+      * @return the archive input stream
+-     * @throws ArchiveException if the archiver name is not known
++     * @throws ArchiveException if the archiver name is not known or the stream is too short
+      * @throws IllegalArgumentException if the stream is null or does not support mark
+      */
+     public ArchiveInputStream createArchiveInputStream(final InputStream in)
+             throws ArchiveException {
+         if (in == null) {
+             throw new IllegalArgumentException("Stream must not be null.");
+         }
+ 
+         if (!in.markSupported()) {
+             throw new IllegalArgumentException("Mark is not supported.");
+         }
+ 
+         final byte[] signature = new byte[12];
+         in.mark(signature.length);
++        int signatureLength = -1;
+         try {
+-            int signatureLength = in.read(signature);
++            // Read signature bytes; signatureLength will be actual bytes read or -1
++            signatureLength = in.read(signature);
+             in.reset();
++        } catch (IOException e) {
++            throw new ArchiveException("Could not use reset and mark operations.", e);
++        }
++
+         if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+             return new ZipArchiveInputStream(in);
+-            } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
++        }
++        if (JarArchiveInputStream.matches(signature, signatureLength)) {
+             return new JarArchiveInputStream(in);
+-            } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
++        }
++        if (ArArchiveInputStream.matches(signature, signatureLength)) {
+             return new ArArchiveInputStream(in);
+-            } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
++        }
++        if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+             return new CpioArchiveInputStream(in);
+         }
+ 
+-            // Dump needs a bigger buffer to check the signature;
+-            final byte[] dumpsig = new byte[32];
+-            in.mark(dumpsig.length);
+-            signatureLength = in.read(dumpsig);
++        // Dump needs a bigger buffer
++        final byte[] dumpSignature = new byte[32];
++        in.mark(dumpSignature.length);
++        try {
++            // Read dump signature bytes
++            // Note: We reuse signatureLength variable, it's safe as we reset 'in' before reading dumpSignature
++            signatureLength = in.read(dumpSignature);
+             in.reset();
+-            if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
++        } catch (IOException e) {
++            throw new ArchiveException("Could not use reset and mark operations.", e);
++        }
++        if (DumpArchiveInputStream.matches(dumpSignature, signatureLength)) {
+             return new DumpArchiveInputStream(in);
+         }
+ 
+-            // Tar needs an even bigger buffer to check the signature; read the first block
+-            final byte[] tarheader = new byte[512];
+-            in.mark(tarheader.length);
+-            signatureLength = in.read(tarheader);
++        // Tar needs 512 bytes; read the first block
++        final byte[] tarHeader = new byte[TAR_DEFAULT_RCDSIZE]; // Use constant for clarity
++        in.mark(tarHeader.length);
++        try {
++            // Read tar header bytes
++            // Note: We reuse signatureLength variable again.
++            signatureLength = in.read(tarHeader);
+             in.reset();
+-            if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
++        } catch (IOException e) {
++            throw new ArchiveException("Could not use reset and mark operations.", e);
++        }
++
++        if (TarArchiveInputStream.matches(tarHeader, signatureLength)) {
+             return new TarArchiveInputStream(in);
+         }
+-            // COMPRESS-117 - improve auto-recognition
++
++        // COMPRESS-117 / COMPRESS-207 / COMPRESS-171 TAR fallback check:
++        // If the header check failed, try parsing the read block.
++        // Requires at least a full block (512 bytes) to have been read.
++        if (signatureLength >= TAR_DEFAULT_RCDSIZE) {
++            TarArchiveInputStream tais = null;
+             try {
+-                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+-                tais.getNextEntry();
++                // Use a temporary stream based on the buffer read, DO NOT consume the original 'in'
++                tais = new TarArchiveInputStream(new ByteArrayInputStream(tarHeader, 0, signatureLength));
++                // Try to read the first entry - if it succeeds, it's very likely TAR.
++                // This addresses COMPRESS-171 where non-TAR data could pass this check
++                // if getNextEntry just returned null instead of throwing an exception.
++                if (tais.getNextTarEntry() != null) {
++                    // Success! The fallback check identifies it as TAR.
++                    // Return a new Tar stream based on the original input stream.
+                     return new TarArchiveInputStream(in);
++                }
++                // If getNextTarEntry() returned null, the stream is likely not TAR or is empty/corrupt.
+             } catch (Exception e) { // NOPMD
+-                // can generate IllegalArgumentException as well as IOException
+-                // autodetection, simply not a TAR
+-                // ignored
++                // IOException, IllegalArgumentException from getNextEntry or constructor
++                // indicate that the buffer doesn't represent a valid TAR header.
++                // Fall through to the final exception.
++            } finally {
++                // Ensure the temporary stream is closed.
++                if (tais != null) {
++                    try {
++                        tais.close();
++                    } catch (IOException ignored) {
++                        // Closing a ByteArrayInputStream based stream is trivial, ignore.
+                     }
+-        } catch (IOException e) {
+-            throw new ArchiveException("Could not use reset and mark operations.", e);
+                 }
++            }
++        } // end TAR fallback check
+ 
++        // If no archive format matched after all checks
+         throw new ArchiveException("No Archiver found for the stream signature");
+     }
++}
+\ No newline at end of file

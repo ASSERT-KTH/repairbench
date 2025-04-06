@@ -1,0 +1,160 @@
+diff --git a/tmp/3639e688-6c3d-4c32-9387-456e1dbf1613_buggy.java b/tmp/36c6c495-afaa-4bef-a16b-cbe732b11c7a_fixed.java
+index 7f61a8c..39c05ec 100644
+--- a/tmp/3639e688-6c3d-4c32-9387-456e1dbf1613_buggy.java
++++ b/tmp/36c6c495-afaa-4bef-a16b-cbe732b11c7a_fixed.java
+@@ -1,73 +1,128 @@
+   @Override
+   public void visit(NodeTraversal t, Node n, Node parent) {
+     // VOID nodes appear when there are extra semicolons at the BLOCK level.
+     // I've been unable to think of any cases where this indicates a bug,
+     // and apparently some people like keeping these semicolons around,
+     // so we'll allow it.
+-    if (n.isEmpty() ||
+-        n.isComma()) {
++    if (n.isEmpty()) {
+       return;
+     }
+ 
++    // Don't warn about COMMA nodes themselves. We check their children.
++    // The result of a comma node has its use checked when we visit the parent
++    // node.
++    if (n.isComma()) {
++      return;
++    }
++
++
+     if (parent == null) {
+       return;
+     }
+ 
++    // Handle special cases for COMMA children
++    if (parent.isComma()) {
++      Node gramps = parent.getParent();
++      // Always consider the first part of a "var C = A, B;" to be used.
++      // TODO(johnlenz): Is this true? What is the definition of "used"?
++      //                 Perhaps this is just suppressing a warning.
++      if (gramps.isVar() && parent == gramps.getFirstChild()) {
++         if (n == parent.getFirstChild()) {
++             return;
++         }
++      }
++
++      // eval(foo, bar) is special case. Don't warn about the foo.
++      if (gramps.isCall() && parent == gramps.getFirstChild() && n == parent.getFirstChild()) {
++        Node fun = gramps.getFirstChild();
++        if (fun.isName() && "eval".equals(fun.getString())) {
++          return;
++        }
++      }
++
++      // The result of the last expression in a comma operator is used.
++      // The results of the previous expressions are discarded.
++      if (n == parent.getLastChild()) {
++          // Don't check the last child; its result is used by the COMMA op.
++          // Whether the COMMA op result is used is checked elsewhere.
++         return;
++      }
++      // Fall through to the main check for non-last children of COMMA.
++    }
++    // NOTE: The original code had an "else if" here that skipped the check
++    // if the parent was not EXPR_RESULT or BLOCK (e.g., parent was IF).
++    // This was incorrect, as it prevented checks like "if(x) y == z;".
++    // Removing that condition allows the main check below to run more broadly.
++
++
+     // Do not try to remove a block or an expr result. We already handle
+     // these cases when we visit the child, and the peephole passes will
+     // fix up the tree in more clever ways when these are removed.
+-    if (parent.getType() == Token.COMMA) {
+-      Node gramps = parent.getParent();
+-      if (gramps.isCall() && parent == gramps.getFirstChild()) {
+-        if (n == parent.getFirstChild() && parent.getChildCount() == 2 && n.getNext().isName() && "eval".equals(n.getNext().getString())) {
++    if (parent.isExprResult() || parent.isBlock()) {
++      // Allow Normally, EXPR_RESULT and BLOCK nodes are handled by our
++      // child traversal. The exception is labels labels pointing Blocks or
++      // EXPR_RESULT nodes. Keep these labels.
++      // TODO(johnlenz): Handle these cases in the peephole passes. Either
++      // by removing the labels or the nodes.
++      if (parent.isBlock()
++          && parent.getParent() != null
++          && parent.getParent().isLabel()) {
+          return;
+       }
++    } else if (parent.isFor() && parent.getChildCount() == 4 && n != parent.getFirstChild().getNext()) {
++        // Only check the condition of a FOR loop. The init and increment
++        // parts are checked by mayHaveSideEffects.
++        return;
++    } else if (!NodeUtil.isStatementParent(parent)){
++        // Otherwise, if the parent is not a statement node, then the side
++        // effects aren't used. This is likely some construct like:
++        // if (foo) { bar(); }
++        // In this case, the results of foo are used, but the results of bar()
++        // are not.
++        return;
+     }
+ 
+-    // This no-op statement was there so that JSDoc information could
+-    // be attached to the name. This check should not complain about it.
+-      if (n == parent.getLastChild()) {
+-        for (Node an : parent.getAncestors()) {
+-          int ancestorType = an.getType();
+-          if (ancestorType == Token.COMMA)
+-            continue;
+-          if (ancestorType != Token.EXPR_RESULT && ancestorType != Token.BLOCK)
+-            return;
+-          else
+-            break;
+-        }
+-      }
+-    } else if (parent.getType() != Token.EXPR_RESULT && parent.getType() != Token.BLOCK) {
+-      if (parent.getType() == Token.FOR && parent.getChildCount() == 4 && (n == parent.getFirstChild() ||
+-           n == parent.getFirstChild().getNext().getNext())) {
+-      } else {
+-      return;
+-      }
+-    }
+ 
+     boolean isResultUsed = NodeUtil.isExpressionResultUsed(n);
+     boolean isSimpleOp = NodeUtil.isSimpleOperatorType(n.getType());
+     if (!isResultUsed &&
+         (isSimpleOp || !NodeUtil.mayHaveSideEffects(n, t.getCompiler()))) {
+       if (n.isQualifiedName() && n.getJSDocInfo() != null) {
++        // This no-op statement was there so that JSDoc information could
++        // be attached to the name. This check should not complain about it.
+         return;
+       } else if (n.isExprResult()) {
++        // Before we evaluate the child, we need to make sure
++        // that the child is not a constructor call. This happens
++        // when the compiler does work like this:
++        //   var x = new Foo(); Foo.apply(x);
++        // ->
++        //   var x = new Foo(); x.apply();  // Not possible in valid JS.
++        // ->
++        //   var x = new Foo(); // Remove useless call.
++        // TODO(johnlenz): Introduce a NoOp node type.
++
++        // We don't want to flag EXPR_RESULT nodes directly. We want to
++        // flag their children.
+         return;
+       }
+       String msg = "This code lacks side-effects. Is there a bug?";
+       if (n.isString()) {
+         msg = "Is there a missing '+' on the previous line?";
+       } else if (isSimpleOp) {
+         msg = "The result of the '" + Token.name(n.getType()).toLowerCase() +
+             "' operator is not being used.";
+       }
+ 
+       t.getCompiler().report(
+           t.makeError(n, level, USELESS_CODE_ERROR, msg));
+       // TODO(johnlenz): determine if it is necessary to
+       // try to protect side-effect free statements as well.
++      // We only remove things from the AST if they are not statements.
++      // Removing statements like IFs, LABELs, etc is handled by other
++      // optimization passes.
+       if (!NodeUtil.isStatement(n)) {
+         problemNodes.add(n);
+       }
+     }
+   }
+\ No newline at end of file

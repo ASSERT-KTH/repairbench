@@ -1,0 +1,448 @@
+diff --git a/tmp/313ee7c0-2ef8-4a55-8252-90e75d79125e_buggy.java b/tmp/4fd50fea-16c9-4268-8078-92581ef58826_fixed.java
+index 39bd733..94c1ee7 100644
+--- a/tmp/313ee7c0-2ef8-4a55-8252-90e75d79125e_buggy.java
++++ b/tmp/4fd50fea-16c9-4268-8078-92581ef58826_fixed.java
+@@ -1,193 +1,349 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+         buf.readUnsignedByte(); // header
+         int flags = buf.readUnsignedByte();
+         buf.readUnsignedShortLE(); // length
+         buf.readUnsignedShortLE(); // checksum
+         int index = buf.readUnsignedShortLE();
+         int type = buf.readUnsignedByte();
+ 
+         if (BitUtil.check(flags, 4)) {
+             sendResponse(channel, remoteAddress, index, type, buf);
++            // Data processing might still continue even after sending a response
+         }
+ 
+-        if (type == MSG_DATA) {
+-
+         List<Position> positions = new LinkedList<>();
+         Set<Integer> keys = new HashSet<>();
+         boolean hasLocation = false;
+         Position position = new Position(getProtocolName());
+ 
+-            DeviceSession deviceSession = null;
++        // Try to get existing session and deviceId first
++        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
++        long deviceId = (deviceSession != null) ? deviceSession.getDeviceId() : 0;
++        if (deviceId > 0) {
++            position.setDeviceId(deviceId);
++        }
+ 
+         while (buf.isReadable()) {
+-                int endIndex = buf.readUnsignedByte() + buf.readerIndex();
++            // Ensure enough bytes for length and key before reading them
++            if (buf.readableBytes() < 2) {
++                 break; // Not enough data for length + key
++            }
++            int fieldLength = buf.readUnsignedByte();
++            int readerIndexBeforeKey = buf.readerIndex(); // Need index before reading key
+             int key = buf.readUnsignedByte();
++            int endIndex = readerIndexBeforeKey + fieldLength; // Calculate end index relative to start of key's data
++
++            // Validate endIndex to prevent BufferOverflow or reading unrelated data
++            // It should be at least the current reader index and not beyond writer index
++            if (endIndex < buf.readerIndex() || endIndex > buf.writerIndex()) {
++                 // Log.warn("Invalid field length detected. Key: " + key + ", Length: " + fieldLength + ", EndIndex: " + endIndex);
++                 break; // Stop processing this message as it seems corrupt
++            }
+ 
+             if (keys.contains(key)) {
+-                    if (!hasLocation) {
++                // A key repeated means the start of a new logical record/position
++                // Add the completed position to the list if it contains useful data
++                if (position.getDeviceId() > 0 || position.getFixTime() != null || hasLocation || !position.getAttributes().isEmpty()) {
++                     if (!hasLocation && position.getFixTime() != null) {
++                         // Get last known location if this position only has time/attributes
++                         getLastLocation(position, position.getFixTime());
++                     } else if (!hasLocation && position.getFixTime() == null) {
++                         // Only call getLastLocation if we have some other data (like deviceId or attributes)
++                         if (position.getDeviceId() > 0 || !position.getAttributes().isEmpty()) {
+                             getLastLocation(position, null);
+                          }
++                     }
++                     // Final validity check if time and coords (possibly from getLastLocation) are present
++                     if (position.getFixTime() != null && position.getLatitude() != 0 && position.getLongitude() != 0) {
++                        position.setValid(true);
++                     }
+                      positions.add(position);
++                }
++                // Reset for the new record
+                 keys.clear();
+                 hasLocation = false;
+                 position = new Position(getProtocolName());
++                // Associate new position with the current deviceId if known
++                if (deviceId > 0) {
++                    position.setDeviceId(deviceId);
++                }
+             }
+             keys.add(key);
+ 
++            // Process the field's data, making sure not to read beyond its claimed endIndex
++            int currentReaderIndex = buf.readerIndex();
++            int actualFieldLength = endIndex - currentReaderIndex;
++
++            // Slice the buffer for the current field to avoid reading past endIndex in cases
++            ByteBuf fieldBuf = buf.slice(currentReaderIndex, Math.max(0, actualFieldLength)); // Use Math.max to avoid negative length
++
+             switch (key) {
+-                    case 0x01:
+-                        deviceSession = getDeviceSession(
+-                                channel, remoteAddress, buf.readCharSequence(15, StandardCharsets.US_ASCII).toString());
+-
+-                        position.setDeviceId(deviceSession.getDeviceId());
++                case 0x01: // IMEI / Device ID
++                    if (fieldBuf.readableBytes() >= 15) {
++                        String imei = fieldBuf.readCharSequence(15, StandardCharsets.US_ASCII).toString();
++                        // Find/create session based on IMEI. This might update deviceSession and deviceId.
++                        DeviceSession newSession = getDeviceSession(channel, remoteAddress, imei);
++                        if (newSession != null) {
++                           deviceSession = newSession; // Update session context
++                           deviceId = deviceSession.getDeviceId();
++                           position.setDeviceId(deviceId); // Set ID for the current position
++                        }
++                        // If newSession is null, device is not registered; keep existing deviceId (if any).
++                    }
+                     break;
+-                    case 0x02:
+-                        long alarm = buf.readUnsignedIntLE();
+-                        position.set(Position.KEY_ALARM, decodeAlarm(alarm));
++                case 0x02: // Alarm
++                    if (fieldBuf.readableBytes() >= 4) {
++                        long alarm = fieldBuf.readUnsignedIntLE();
++                        String decodedAlarm = decodeAlarm(alarm); // Assumes decodeAlarm exists
++                        if (decodedAlarm != null) {
++                           position.set(Position.KEY_ALARM, decodedAlarm);
++                        }
+                         if (BitUtil.check(alarm, 31)) {
+-                            position.set("bark", true);
++                            position.set("bark", true); // Custom attribute for bark alarm
++                        }
+                     }
+                     break;
+-                    case 0x14:
+-                        position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+-                        position.set(Position.KEY_BATTERY, buf.readUnsignedShortLE() * 0.001);
++                case 0x14: // Battery Info
++                    if (fieldBuf.readableBytes() >= 3) {
++                        position.set(Position.KEY_BATTERY_LEVEL, fieldBuf.readUnsignedByte()); // Percentage
++                        position.set(Position.KEY_BATTERY, fieldBuf.readUnsignedShortLE() * 0.001); // Voltage
++                    }
+                     break;
+-                    case 0x20:
+-                        hasLocation = true;
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShortLE()));
+-                        position.setCourse(buf.readUnsignedShortLE());
+-                        position.setAltitude(buf.readShortLE());
+-                        int hdop = buf.readUnsignedShortLE();
+-                        position.setValid(hdop > 0);
++                case 0x20: // Location GPS
++                    if (fieldBuf.readableBytes() >= 21) { // lat(4)+lon(4)+speed(2)+course(2)+alt(2)+hdop(2)+odom(4)+sats(1) = 21
++                        position.setLatitude(fieldBuf.readIntLE() * 0.0000001);
++                        position.setLongitude(fieldBuf.readIntLE() * 0.0000001);
++                        position.setSpeed(UnitsConverter.knotsFromKph(fieldBuf.readUnsignedShortLE()));
++                        position.setCourse(fieldBuf.readUnsignedShortLE());
++                        position.setAltitude(fieldBuf.readShortLE());
++                        int hdop = fieldBuf.readUnsignedShortLE();
++                        position.setValid(hdop > 0); // Basic validity based on HDOP > 0
++                        hasLocation = true; // Mark that this position object has coordinates
+                         position.set(Position.KEY_HDOP, hdop * 0.1);
+-                        position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
+-                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                        position.set(Position.KEY_ODOMETER, fieldBuf.readUnsignedIntLE());
++                        position.set(Position.KEY_SATELLITES, fieldBuf.readUnsignedByte());
++                        // Final validity check might happen when time (0x24) is also decoded
++                    }
+                     break;
+-                    case 0x21:
+-                        int mcc = buf.readUnsignedShortLE();
+-                        int mnc = buf.readUnsignedByte();
++                case 0x21: // Cell Towers
++                    if (fieldBuf.readableBytes() >= 3) { // Need MCC (2) + MNC (1)
++                        int mcc = fieldBuf.readUnsignedShortLE();
++                        int mnc = fieldBuf.readUnsignedByte();
+                         if (position.getNetwork() == null) {
+                             position.setNetwork(new Network());
+                         }
+-                        while (buf.readerIndex() < endIndex) {
+-                            int rssi = buf.readByte();
+-                            position.getNetwork().addCellTower(CellTower.from(
+-                                    mcc, mnc, buf.readUnsignedShortLE(), buf.readUnsignedShortLE(), rssi));
++                        while (fieldBuf.readableBytes() >= 5) { // Need RSSI (1) + LAC (2) + CID (2)
++                            // Original code read RSSI first. Assuming this order:
++                            int rssi = fieldBuf.readByte();
++                            int lac = fieldBuf.readUnsignedShortLE();
++                            int cid = fieldBuf.readUnsignedShortLE();
++                            position.getNetwork().addCellTower(CellTower.from(mcc, mnc, lac, cid, rssi));
++                        }
+                     }
+                     break;
+-                    case 0x22:
++                case 0x22: // WiFi APs
+                     if (position.getNetwork() == null) {
+                         position.setNetwork(new Network());
+                     }
+-                        while (buf.readerIndex() < endIndex) {
+-                            int rssi = buf.readByte();
+-                            String mac = ByteBufUtil.hexDump(buf.readSlice(6)).replaceAll("(..)", "$1:");
++                    while (fieldBuf.readableBytes() >= 7) { // Need RSSI (1) + MAC (6)
++                         // Original code read RSSI first. Assuming this order:
++                         int rssi = fieldBuf.readByte();
++                         String mac = ByteBufUtil.hexDump(fieldBuf.readSlice(6)).replaceAll("(..)", "$1:");
+                          position.getNetwork().addWifiAccessPoint(WifiAccessPoint.from(
+                                  mac.substring(0, mac.length() - 1), rssi));
+                     }
+                     break;
+-                    case 0x23:
+-                        position.set("tagId", readTagId(buf));
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setValid(true);
++                case 0x23: // Tag Location
++                    if (fieldBuf.readableBytes() >= 14) { // Tag ID(6) + Lat(4) + Lon(4)
++                        position.set("tagId", readTagId(fieldBuf.readSlice(6))); // Assuming readTagId reads 6 bytes
++                        position.setLatitude(fieldBuf.readIntLE() * 0.0000001);
++                        position.setLongitude(fieldBuf.readIntLE() * 0.0000001);
++                        position.setValid(true); // Location from tag is considered valid
+                         hasLocation = true;
++                    }
+                     break;
+-                    case 0x24:
+-                        position.setTime(new Date(buf.readUnsignedIntLE() * 1000));
+-                        long status = buf.readUnsignedIntLE();
+-                        if (BitUtil.check(status, 4)) {
+-                            position.set(Position.KEY_CHARGE, true);
+-                        }
+-                        if (BitUtil.check(status, 7)) {
+-                            position.set(Position.KEY_ARCHIVE, true);
+-                        }
++                case 0x24: // Timestamp & Status
++                    if (fieldBuf.readableBytes() >= 8) { // Timestamp(4) + Status(4)
++                        position.setTime(new Date(fieldBuf.readUnsignedIntLE() * 1000));
++                        long status = fieldBuf.readUnsignedIntLE();
++                        position.set(Position.KEY_STATUS, status); // Store raw status
++                        position.set(Position.KEY_CHARGE, BitUtil.check(status, 4));
++                        position.set(Position.KEY_ARCHIVE, BitUtil.check(status, 7));
+                         position.set(Position.KEY_MOTION, BitUtil.check(status, 9));
+-                        position.set(Position.KEY_RSSI, BitUtil.between(status, 19, 24));
+-                        position.set(Position.KEY_BATTERY_LEVEL, BitUtil.from(status, 24));
+-                        position.set(Position.KEY_STATUS, status);
++                        position.set(Position.KEY_RSSI, BitUtil.between(status, 19, 24)); // Signal strength
++                        int batteryLevelFromStatus = BitUtil.from(status, 24);
++                        // Only set battery level from status if not already set by 0x14
++                        if (!position.getAttributes().containsKey(Position.KEY_BATTERY_LEVEL)) {
++                           position.set(Position.KEY_BATTERY_LEVEL, batteryLevelFromStatus);
++                        }
++                        // If we now have both time and location, mark position as valid
++                        if (hasLocation && position.getFixTime() != null) {
++                           position.setValid(true);
++                        }
++                    }
+                     break;
+-                    case 0x28:
+-                        int beaconFlags = buf.readUnsignedByte();
+-                        position.set("tagId", readTagId(buf));
+-                        position.set("tagRssi", (int) buf.readByte());
+-                        position.set("tag1mRssi", (int) buf.readByte());
++                case 0x28: // Beacon Info
++                    // Min length: Flags(1) + TagID(6) + RSSI(1) + 1mRSSI(1) = 9
++                    if (fieldBuf.readableBytes() >= 9) {
++                         int beaconFlags = fieldBuf.readUnsignedByte();
++                         position.set("tagId", readTagId(fieldBuf.readSlice(6))); // Read 6 bytes for tag ID
++                         position.set("tagRssi", (int) fieldBuf.readByte());
++                         position.set("tag1mRssi", (int) fieldBuf.readByte());
+                          if (BitUtil.check(beaconFlags, 7)) {
+-                            position.setLatitude(buf.readIntLE() * 0.0000001);
+-                            position.setLongitude(buf.readIntLE() * 0.0000001);
+-                            position.setValid(true);
++                             // Location data follows if flag 7 is set
++                             if (fieldBuf.readableBytes() >= 8) { // Lat(4) + Lon(4)
++                                 position.setLatitude(fieldBuf.readIntLE() * 0.0000001);
++                                 position.setLongitude(fieldBuf.readIntLE() * 0.0000001);
++                                 position.setValid(true); // Beacon location implies validity
+                                  hasLocation = true;
+                              }
++                         }
+                          if (BitUtil.check(beaconFlags, 6)) {
+-                            position.set("description", buf.readCharSequence(
+-                                    endIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString());
++                             // Description follows if flag 6 is set
++                             if (fieldBuf.readableBytes() > 0) {
++                                 position.set("description", fieldBuf.readCharSequence(
++                                         fieldBuf.readableBytes(), StandardCharsets.US_ASCII).toString());
++                             }
++                         }
+                     }
+                     break;
+-                    case 0x2A:
+-                        buf.readUnsignedByte(); // flags
+-                        buf.skipBytes(6); // mac
+-                        buf.readUnsignedByte(); // rssi
+-                        position.setLatitude(buf.readIntLE() * 0.0000001);
+-                        position.setLongitude(buf.readIntLE() * 0.0000001);
+-                        position.setValid(true);
++                case 0x2A: // WiFi Location (from network scan)
++                     // flags(1) + mac(6) + rssi(1) + lat(4) + lon(4) = 16
++                    if (fieldBuf.readableBytes() >= 16) {
++                        fieldBuf.readUnsignedByte(); // flags
++                        fieldBuf.skipBytes(6); // mac (possibly redundant if 0x22 is used)
++                        fieldBuf.readUnsignedByte(); // rssi
++                        position.setLatitude(fieldBuf.readIntLE() * 0.0000001);
++                        position.setLongitude(fieldBuf.readIntLE() * 0.0000001);
++                        position.setValid(true); // Location from WiFi scan is valid
+                         hasLocation = true;
++                    }
+                     break;
+-                    case 0x30:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        position.set(Position.KEY_STEPS, buf.readUnsignedIntLE());
++                case 0x30: // Steps
++                    if (fieldBuf.readableBytes() >= 8) { // timestamp(4) + steps(4)
++                        fieldBuf.readUnsignedIntLE(); // timestamp (could be stored if needed)
++                        position.set(Position.KEY_STEPS, fieldBuf.readUnsignedIntLE());
++                    }
+                     break;
+-                    case 0x31:
+-                        int i = 1;
+-                        while (buf.readerIndex() < endIndex) {
+-                            position.set("activity" + i + "Time", buf.readUnsignedIntLE());
+-                            position.set("activity" + i, buf.readUnsignedIntLE());
+-                            i += 1;
++                case 0x31: // Activity Data
++                    int activityIndex = 1;
++                    while (fieldBuf.readableBytes() >= 8) { // time(4) + activity(4)
++                        position.set("activity" + activityIndex + "Time", fieldBuf.readUnsignedIntLE());
++                        position.set("activity" + activityIndex, fieldBuf.readUnsignedIntLE());
++                        activityIndex += 1;
+                     }
+                     break;
+-                    case 0x37:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        long barking = buf.readUnsignedIntLE();
++                case 0x37: // Barking Event
++                    if (fieldBuf.readableBytes() >= 8) { // timestamp(4) + barking info(4)
++                        fieldBuf.readUnsignedIntLE(); // timestamp (could be stored)
++                        long barking = fieldBuf.readUnsignedIntLE();
+                         if (BitUtil.check(barking, 31)) {
+                             position.set("barkStop", true);
+                         }
+                         position.set("barkCount", BitUtil.to(barking, 31));
++                    }
+                     break;
+-                    case 0x40:
+-                        buf.readUnsignedIntLE(); // timestamp
+-                        int heartRate = buf.readUnsignedByte();
+-                        if (heartRate > 1) {
++                case 0x40: // Heart Rate
++                    if (fieldBuf.readableBytes() >= 5) { // timestamp(4) + heartRate(1)
++                        fieldBuf.readUnsignedIntLE(); // timestamp (could be stored)
++                        int heartRate = fieldBuf.readUnsignedByte();
++                        if (heartRate > 1) { // Assuming 0/1 are invalid readings
+                             position.set(Position.KEY_HEART_RATE, heartRate);
+                         }
++                    }
+                     break;
+                 default:
++                    // Unknown key, ignore its content by advancing reader index later
++                    // Log.debug("Unknown key type: " + key);
+                     break;
+             }
++            // Ensure the main buffer's reader index is advanced to the end of the current field,
++            // even if the field was skipped or partially read due to insufficient data.
+             buf.readerIndex(endIndex);
+         }
+ 
+-            if (!hasLocation) {
++        // Add the last processed position if it has any meaningful data
++        if (position.getDeviceId() > 0 || position.getFixTime() != null || hasLocation || !position.getAttributes().isEmpty()) {
++             if (!hasLocation && position.getFixTime() != null) {
++                 getLastLocation(position, position.getFixTime());
++             } else if (!hasLocation && position.getFixTime() == null) {
++                 if (position.getDeviceId() > 0 || !position.getAttributes().isEmpty()) {
+                     getLastLocation(position, null);
+                  }
++             }
++             // Final validity check
++             if (position.getFixTime() != null && position.getLatitude() != 0 && position.getLongitude() != 0) {
++                 position.setValid(true);
++             }
++             // Ensure deviceId is set from the overall session if not set by key 0x01
++             if (position.getDeviceId() == 0 && deviceId > 0) {
++                 position.setDeviceId(deviceId);
++             }
+             positions.add(position);
++        }
+ 
+-            if (deviceSession != null) {
++        if (positions.isEmpty()) {
++            // No positions were successfully decoded.
++            return null;
++        }
++
++        // Verify that we have a device context for the decoded positions.
++        // This replicates the original behavior where null was returned if deviceSession was null.
++        boolean deviceIdentified = false;
++        if (deviceId > 0) {
++             deviceIdentified = true;
++             // Ensure all positions have the ID if it wasn't set individually by key 0x01
+              for (Position p : positions) {
+-                    p.setDeviceId(deviceSession.getDeviceId());
++                 if (p.getDeviceId() == 0) {
++                     p.setDeviceId(deviceId);
++                 }
+              }
+         } else {
++            // Check if key 0x01 happened to set the ID on any position
++            for (Position p : positions) {
++                if (p.getDeviceId() != 0) {
++                    deviceIdentified = true;
++                    // If one position has an ID, maybe assign it to others? Or require session?
++                    // For now, just confirm at least one has an ID.
++                    break;
++                }
++            }
++        }
++
++        if (!deviceIdentified) {
++            // If no deviceId was found (neither from session nor from key 0x01), return null.
+             return null;
+         }
+ 
+         return positions;
++    }
+ 
++    // Helper method stubs (ensure these exist and are correctly implemented in the actual class)
++    private DeviceSession getDeviceSession(Channel channel, SocketAddress remoteAddress, String imei) {
++        // Actual implementation should use BaseProtocolDecoder.getDeviceSession
++        return super.getDeviceSession(channel, remoteAddress, imei);
+     }
+ 
+-        return null;
++    private String readTagId(ByteBuf buf) {
++        // Assuming reads 6 bytes hex representation
++        if (buf.readableBytes() >= 6) {
++           return ByteBufUtil.hexDump(buf.readSlice(6));
++        }
++        return null; // Handle error case appropriately
++    }
++
++    private String decodeAlarm(long alarmValue) {
++        // Implement alarm decoding based on protocol specification
++        // Example placeholder:
++        if (alarmValue != 0) {
++             // Check specific bits for specific alarms like SOS, low battery etc.
++             // Return Position.ALARM_SOS, Position.ALARM_LOW_BATTERY etc.
++             return Position.ALARM_GENERAL; // Default if specific type unknown
++        }
++        return null; // No alarm
+     }
+\ No newline at end of file

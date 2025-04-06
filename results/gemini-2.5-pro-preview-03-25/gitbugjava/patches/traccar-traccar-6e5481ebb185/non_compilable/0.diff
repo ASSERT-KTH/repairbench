@@ -1,0 +1,135 @@
+diff --git a/tmp/841c374d-b211-48c5-88fe-44ceb1b071a7_buggy.java b/tmp/3d8fe5a8-b92d-4984-b955-e8fec35aefd3_fixed.java
+index ee599aa..1ae6575 100644
+--- a/tmp/841c374d-b211-48c5-88fe-44ceb1b071a7_buggy.java
++++ b/tmp/3d8fe5a8-b92d-4984-b955-e8fec35aefd3_fixed.java
+@@ -1,50 +1,99 @@
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+         int length = 0;
++        int startIndex = buf.readerIndex(); // Mark start index before potential length byte
++
+         if (hasLength) {
++            // Check if there's at least 1 byte for length
++            if (!buf.isReadable()) {
++                return false;
++            }
+             length = buf.readUnsignedByte();
+             if (length == 0) {
+-                boolean zeroedData = true;
+-                for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
+-                    if (buf.getByte(i) != 0) {
+-                        zeroedData = false;
+-                        break;
+-                    }
+-                }
+-                if (zeroedData) {
+-                    buf.skipBytes(Math.min(buf.readableBytes(), 45));
+-                }
++                // Original code had a check for zeroed data here.
++                // Simplification: Assume length 0 means no valid LBS data or marker for invalidity.
+                 return false;
+             }
++            // Adjust startIndex to be AFTER the length byte for LBS data reading.
++            startIndex = buf.readerIndex();
+         }
+ 
++        // Check minimum required bytes for MCC
++        if (buf.readableBytes() < 2) {
++            return false; // Not enough data even for MCC
++        }
+         int mcc = buf.readUnsignedShort();
+-        int mnc;
+-        if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
+-            mnc = buf.readUnsignedShort();
+-        } else {
+-            mnc = buf.readUnsignedByte();
+-        }
+-        int lac;
+-        if (type == MSG_LBS_ALARM) {
+-            lac = buf.readInt();
+-        } else {
+-            lac = buf.readUnsignedShort();
+-        }
+-        long cid;
++        int effectiveMcc = BitUtil.to(mcc, 15);
++
++        // Determine sizes based on type/mcc high bit
++        int mncSize = (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) ? 2 : 1;
++        int lacSize = (type == MSG_LBS_ALARM) ? 4 : 2;
++        int cidSize;
+         if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
+-            cid = buf.readLong();
++            cidSize = 8;
+         } else if (type == MSG_GPS_LBS_6) {
++            cidSize = 4;
++        } else {
++            cidSize = 3;
++        }
++
++        // Check if enough bytes remain *before* reading MNC, LAC, CID
++        int remainingBytesNeeded = mncSize + lacSize + cidSize;
++        if (buf.readableBytes() < remainingBytesNeeded) {
++            // Not enough data for the rest of the expected fields.
++            // If hasLength, we should consume the remainder specified by length.
++            if (hasLength) {
++                int bytesReadSoFar = 2; // MCC
++                int bytesToSkip = length - bytesReadSoFar;
++                if (bytesToSkip > 0) {
++                    buf.skipBytes(Math.min(bytesToSkip, buf.readableBytes()));
++                }
++            }
++            return false; // Indicate failure as data is truncated
++        }
++
++        // Read MNC, LAC, CID
++        int mnc = (mncSize == 2) ? buf.readUnsignedShort() : buf.readUnsignedByte();
++        int lac = (lacSize == 4) ? buf.readInt() : buf.readUnsignedShort();
++        long cid;
++        if (cidSize == 8) {
++            cid = buf.readLong();
++        } else if (cidSize == 4) {
+             cid = buf.readUnsignedInt();
+-        } else {
++        } else { // cidSize == 3
+             cid = buf.readUnsignedMedium();
+         }
+ 
+-        position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
++        // Calculate bytes actually read for LBS fields (starting after length byte if present)
++        int endIndex = buf.readerIndex();
++        int bytesRead = endIndex - startIndex;
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
+-        }
++        // Validate MCC (must be 3 digits, 001-999)
++        boolean isValid = (effectiveMcc > 0 && effectiveMcc <= 999);
++        // Could add stricter checks like lac != 0 && cid != 0 if required by protocol nuances.
++
++        if (isValid) {
++            position.setNetwork(new Network(CellTower.from(effectiveMcc, mnc, lac, cid)));
+ 
+-        return true;
++            // Skip any remaining bytes declared by the length field
++            if (hasLength) {
++                int bytesToSkip = length - bytesRead;
++                if (bytesToSkip > 0) {
++                    buf.skipBytes(Math.min(bytesToSkip, buf.readableBytes()));
++                }
++                // Warn if bytesToSkip < 0 (length field was smaller than data read)?
++            }
++            return true; // Successfully decoded valid LBS data
++        } else {
++            // LBS data is invalid (e.g., MCC out of range)
++            // Consume the rest of the bytes specified by length, if provided.
++            if (hasLength) {
++                int bytesToSkip = length - bytesRead;
++                if (bytesToSkip > 0) {
++                    buf.skipBytes(Math.min(bytesToSkip, buf.readableBytes()));
++                }
++            }
++            // If no length provided, buffer pointer is already after reading the invalid fields.
++            return false; // Indicate failure due to invalid data
++        }
+     }
+\ No newline at end of file

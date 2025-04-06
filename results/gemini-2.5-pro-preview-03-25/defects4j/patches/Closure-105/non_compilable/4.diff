@@ -1,0 +1,220 @@
+diff --git a/tmp/f9190a9e-4de2-4521-9278-4ba14ea9d7b3_buggy.java b/tmp/7194f3db-4127-4d8f-bd10-6496331354ad_fixed.java
+index ef65dd9..0180f10 100644
+--- a/tmp/f9190a9e-4de2-4521-9278-4ba14ea9d7b3_buggy.java
++++ b/tmp/7194f3db-4127-4d8f-bd10-6496331354ad_fixed.java
+@@ -1,92 +1,158 @@
++import com.google.common.collect.Lists;
++import com.google.javascript.jscomp.NodeUtil;
++import com.google.javascript.jscomp.InlineCostEstimator;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.Token;
++
++import java.util.List;
++
++// Note: NodeTraversal, Compiler classes are assumed to exist elsewhere.
++// Placeholders provided for context if needed:
++/*
++class NodeTraversal {
++  private Compiler compiler;
++  public NodeTraversal(Compiler compiler) { this.compiler = compiler; }
++  public Compiler getCompiler() { return compiler; }
++}
++class Compiler {
++  public void reportCodeChange() {}
++}
++*/
++
++/**
++ * Folds array joins, such as ['a', 'b'].join('') -> "ab".
++ * Handles constant elements (strings, numbers, booleans, null, undefined)
++ * and leaves non-constant elements in place, potentially merging adjacent
++ * constants. ['a', x, 'b', 'c'].join(',') -> ['a', x, 'b,c'].join(',')
++ */
++class PeepholeFoldConstants { // Assumed class name
++
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
++    // Ensure the structure is array.join(separator)
++    // n is the CALL node, left is the GETPROP node (array.join), right is the separator argument.
+     if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
+       return;
+     }
+ 
+     Node arrayNode = left.getFirstChild();
+-    Node functionName = arrayNode.getNext();
++    Node functionName = left.getLastChild(); // The property name "join"
+ 
+-    if ((arrayNode.getType() != Token.ARRAYLIT) ||
++    // Check if it's an array literal and the function is "join"
++    if (arrayNode.getType() != Token.ARRAYLIT ||
++        !functionName.isString() ||
+         !functionName.getString().equals("join")) {
+       return;
+     }
+ 
+     String joinString = NodeUtil.getStringValue(right);
++    // Need a constant string separator to perform folding.
++    if (joinString == null) {
++      return;
++    }
++
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+-    StringBuilder sb = new StringBuilder();
+-    int foldedSize = 0;
++    StringBuilder currentConstantSegment = new StringBuilder();
+     Node elem = arrayNode.getFirstChild();
+-    // Merges adjacent String nodes.
++    boolean canFoldEverythingToConstant = true; // Assume full folding is possible initially
++    Node lastConstant = null; // Keep track of last constant node for source info
++
++    // Iterate through the elements of the array literal
+     while (elem != null) {
+       if (NodeUtil.isImmutableValue(elem)) {
+-        if (sb.length() > 0) {
+-          sb.append(joinString);
++        // Append the constant value, using joinString as separator if needed
++        if (currentConstantSegment.length() > 0) {
++          currentConstantSegment.append(joinString);
+         }
+-        sb.append(NodeUtil.getStringValue(elem));
++        currentConstantSegment.append(NodeUtil.getStringValue(elem));
++        lastConstant = elem; // Remember last constant node processed
+       } else {
+-        if (sb.length() > 0) {
+-          // + 2 for the quotes.
+-          foldedSize += sb.length() + 2;
+-          arrayFoldedChildren.add(Node.newString(sb.toString()));
+-          sb = new StringBuilder();
+-        }
+-        foldedSize += InlineCostEstimator.getCost(elem);
+-        arrayFoldedChildren.add(elem);
+-      }
+-      elem = elem.getNext();
+-    }
++        // Encountered a non-constant element
++        canFoldEverythingToConstant = false;
+ 
+-    if (sb.length() > 0) {
+-      // + 2 for the quotes.
+-      foldedSize += sb.length() + 2;
+-      arrayFoldedChildren.add(Node.newString(sb.toString()));
++        // Add the constant segment accumulated so far (if any)
++        if (currentConstantSegment.length() > 0) {
++          Node foldedString = Node.newString(currentConstantSegment.toString());
++          // Copy source info from the last constant node that contributed to this segment
++          if (lastConstant != null) {
++              foldedString.copyInformationFrom(lastConstant);
++          }
++          arrayFoldedChildren.add(foldedString);
++          currentConstantSegment = new StringBuilder(); // Reset for the next segment
++        }
++        // Add the non-constant element (cloned, as original nodes will be detached)
++        arrayFoldedChildren.add(elem.cloneTree());
++        lastConstant = null; // Reset last constant tracker
++      }
++      Node next = elem.getNext(); // Store next before detaching/modifying elem if necessary
++      elem = next;
+     }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
+ 
+     int originalSize = InlineCostEstimator.getCost(n);
+-    switch (arrayFoldedChildren.size()) {
+-      case 0:
+-        Node emptyStringNode = Node.newString("");
+-        parent.replaceChild(n, emptyStringNode);
+-        break;
++    Node replacement = null;
+ 
+-      case 1:
+-        Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
+-          return;
++    if (canFoldEverythingToConstant) {
++      // All elements were constants, the result is a single string.
++      Node foldedString = Node.newString(currentConstantSegment.toString());
++      // Copy source info from the original call node `n` if no specific constant was found,
++      // otherwise, use the last constant's info potentially.
++      foldedString.copyInformationFrom(n);
++      replacement = foldedString;
++    } else {
++      // Mixed constants and non-constants.
++      // Add the final constant segment if it exists.
++      if (currentConstantSegment.length() > 0) {
++         Node foldedString = Node.newString(currentConstantSegment.toString());
++         // Copy source info from the last constant node that contributed.
++         if (lastConstant != null) {
++             foldedString.copyInformationFrom(lastConstant);
++         } else {
++             // Fallback to original call node info if last segment had no source node
++             foldedString.copyInformationFrom(n);
+          }
+-        arrayNode.detachChildren();
+-        if (foldedStringNode.getType() != Token.STRING) {
+-          // If the Node is not a string literal, ensure that
+-          // it is coerced to a string.
+-          Node replacement = new Node(Token.ADD,
+-              Node.newString(""), foldedStringNode);
+-          foldedStringNode = replacement;
++         arrayFoldedChildren.add(foldedString);
+       }
+-        parent.replaceChild(n, foldedStringNode);
+-        break;
+ 
+-      default:
+-        // No folding could actually be performed.
+-        if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+-          return;
++      // If the resulting array has the same or more elements than the original,
++      // then no structural simplification was possible (e.g., [foo, bar].join(',') ).
++      if (arrayFoldedChildren.size() >= arrayNode.getChildCount()) {
++         return; // No reduction in elements.
+       }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += InlineCostEstimator.getCost(right);
+-        if (foldedSize > originalSize) {
+-          return;
+-        }
+-        arrayNode.detachChildren();
++
++      // If folding resulted in an empty list (e.g., `['', '']` with `canFoldEverythingToConstant=true`
++      // should have been handled above, resulting in `""`), this path implies multiple elements remain.
++      // Build the new array literal node
++      Node newArray = new Node(Token.ARRAYLIT);
++      // Copy source info from original array
++      newArray.copyInformationFrom(arrayNode);
+       for (Node node : arrayFoldedChildren) {
+-          arrayNode.addChildToBack(node);
++        newArray.addChildToBack(node); // Nodes are already new strings or clones
+       }
+-        break;
++
++      // Build the new GETPROP node
++      Node newGetProp = new Node(Token.GETPROP, newArray, Node.newString("join"));
++      newGetProp.copyInformationFrom(left); // Copy source info from original GETPROP
++
++      // Build the new CALL node
++      Node newCall = new Node(Token.CALL, newGetProp);
++      newCall.copyInformationFrom(n); // Copy source info from original CALL
++      newCall.addChildToBack(right.cloneTree()); // Add cloned separator argument
++
++      replacement = newCall;
+     }
++
++    // Perform replacement if beneficial and the node actually changed
++    if (replacement != null) {
++      int replacementSize = InlineCostEstimator.getCost(replacement);
++      // Only replace if the new node is smaller or equal in size and is semantically different.
++      // Note: isEquivalentTo checks structure and values, not just cost.
++      if (replacementSize <= originalSize && !n.isEquivalentTo(replacement)) {
++        parent.replaceChild(n, replacement);
+         t.getCompiler().reportCodeChange();
+       }
++    }
++  }
++} // End assumed class
+\ No newline at end of file

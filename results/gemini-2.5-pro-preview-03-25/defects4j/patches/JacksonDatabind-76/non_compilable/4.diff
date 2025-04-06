@@ -1,0 +1,139 @@
+diff --git a/tmp/cc47fda2-80f9-429c-b9f9-49d225f1bbe7_buggy.java b/tmp/0b4dd362-f2c1-4861-9cfa-4354b87d6eb1_fixed.java
+index 3effef5..7029e48 100644
+--- a/tmp/cc47fda2-80f9-429c-b9f9-49d225f1bbe7_buggy.java
++++ b/tmp/0b4dd362-f2c1-4861-9cfa-4354b87d6eb1_fixed.java
+@@ -1,73 +1,120 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithUnwrapped(JsonParser p,
+     		DeserializationContext ctxt)
+         throws IOException, JsonProcessingException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
+         TokenBuffer tokens = new TokenBuffer(p, ctxt);
+         tokens.writeStartObject();
+ 
+         JsonToken t = p.getCurrentToken();
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
+             p.nextToken(); // to point to value
+             // creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
++                // Last creator property to set?
+                 if (buffer.assignParameter(creatorProp, creatorProp.deserialize(p, ctxt))) {
+-                    t = p.nextToken();
++                    t = p.nextToken(); // to move to following FIELD_NAME/END_OBJECT
+                     Object bean;
+                     try {
+                         bean = creator.build(ctxt, buffer);
+                     } catch (Exception e) {
++                        // 26-Oct-2016, tatu: Need to retain property name, if possible
+                         wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+-                        continue;
++                        // never gets here, unless we modify wrapAndThrow to not throw, which seems unlikely.
++                        // Added for compiler, IDE warnings:
++                        continue; // Added for stricter compiler compliance
+                     }
+-                    while (t == JsonToken.FIELD_NAME) {
+-                        p.nextToken();
+-                        tokens.copyCurrentStructure(p);
+-                        t = p.nextToken();
+-                    }
+-                    tokens.writeEndObject();
++                    // if we have already created the bean, must handle extra properties separately..
++                    // If we get polymorphic builders, things are trickier... Fix is possible,
++                    // but tricky for now leave as unsupported, fail
+                     if (bean.getClass() != _beanType.getRawClass()) {
+-                        ctxt.reportMappingException("Can not create polymorphic instances with unwrapped values");
+-                        return null;
++                        // 13-Jan-2017, tatu: Not sure if this can be supported, actually...
++                        //   Need to delegate update/merge to actual deserializer; may require configuration etc?
++                        return ctxt.reportBadDefinition(_beanType,
++                                String.format("Cannot create builder instances of type %s (%s) using creator property '%s': incompatible builder type",
++                                        _beanType, bean.getClass().getName(), creatorProp.getName()));
+                     }
++
++                    // Ok: need to feed buffered tokens into bean (builder) being built:
++                    // Important: must create a NEW parser, since given parser points somewhere else...
++                    // also: tokens have been fetched so need to start from beginning
++                    // 24-Feb-2017, tatu: Need to copy *remaining* tokens from incoming parser too...
++                    while (t == JsonToken.FIELD_NAME) {
++                        // *** FIX START ***
++                        // Need to copy lingered tokens, field name first then value
++                        tokens.writeFieldName(p.getCurrentName());
++                        p.nextToken(); // move to value
++                        // *** FIX END ***
++                        tokens.copyCurrentStructure(p);
++                        // And then move to the next token
++                        t = p.nextToken();
++                    }
++                    // tokens.writeEndObject(); // REMOVED as per [databind#139] / [databind#1648] fix; processUnwrapped will do it
++
++                    // Phew! All done!
++                    // 08-Dec-2016, tatu: Need to use `builder` instance, not `p` (parser) for context
++                    // Let processUnwrapped handle buffer finalization and parsing
+                     return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+                 }
+                 continue;
+             }
+             // Object Id property?
+             if (buffer.readIdProperty(propName)) {
+                 continue;
+             }
+             // regular property? needs buffering
+             SettableBeanProperty prop = _beanProperties.find(propName);
+             if (prop != null) {
+                 buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+                 continue;
+             }
++            // As per [databind#318], need to ensure we call view-processing settings
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+                 handleIgnoredProperty(p, ctxt, handledType(), propName);
+                 continue;
+             }
+-            tokens.writeFieldName(propName);
+-            tokens.copyCurrentStructure(p);
+             // "any property"?
++            // 09-Jan-2017, tatu: Is this even possible? How could it work? Assume not possible for now.
++            /*
+             if (_anySetter != null) {
++                 // Need to be buffered, otherwise could be problematic for ordering
+                  buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
++                 continue;
++            }
++            */
++
++            // Ok, then it is likely an unwrapped property, buffer
++            tokens.writeFieldName(propName);
++            tokens.copyCurrentStructure(p);
++
++            // 09-Jan-2017, tatu: Is AnySetter possible? Let's assume NO, for now.
++            //   But if yes, would need buffering:
++            if (_anySetter != null) {
++                 try {
++                     // note: can not call "_anySetter.deserializeAndSet()" since we don't have an instance yet
++                     buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
++                 } catch (Exception e) {
++                     wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
++                 }
+             }
+         }
+ 
+         // We hit END_OBJECT, so:
+         Object bean;
+-        // !!! 15-Feb-2012, tatu: Need to modify creator to use Builder!
+         try {
+             bean = creator.build(ctxt, buffer);
+         } catch (Exception e) {
++            // 26-Oct-2016, tatu: Need to retain property name, maybe? None available though.
++            // 28-Oct-2016, tatu: As per [databind#1414], need to ensure relationship with underlying cause is not lost
+             return wrapInstantiationProblem(e, ctxt);
+         }
++        // Still need to process buffered tokens too
++        // 08-Dec-2016, tatu: Need to use `builder` instance, not `p` (parser) for context
++        // Let processUnwrapped handle buffer finalization and parsing
+         return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+     }
+\ No newline at end of file

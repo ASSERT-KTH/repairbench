@@ -1,0 +1,114 @@
+diff --git a/tmp/37bfb5c5-ade8-4af5-94b6-b543d72961f2_buggy.java b/tmp/1c6e0936-362f-44ff-8044-bd8991122ba5_fixed.java
+index 63641d0..62705b6 100644
+--- a/tmp/37bfb5c5-ade8-4af5-94b6-b543d72961f2_buggy.java
++++ b/tmp/1c6e0936-362f-44ff-8044-bd8991122ba5_fixed.java
+@@ -1,33 +1,97 @@
++import com.google.common.base.Preconditions;
++import com.google.common.collect.ImmutableList;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.jstype.FunctionType;
++import com.google.javascript.rhino.jstype.JSType;
++import com.google.javascript.rhino.jstype.JSTypeRegistry;
++import com.google.javascript.rhino.jstype.TemplateType;
++import com.google.javascript.rhino.jstype.TemplateTypeMap;
++import com.google.javascript.rhino.jstype.TemplatizedType;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++
+ /**
+  * For functions with function(this: T, ...) and T as parameters, type
+  * inference will set the type of this on a function literal argument to the
+  * the actual type of T.
++ *
++ * <p>This function is also responsible for inferring method template types
++ * based on the call arguments and resolving class template types based on the
++ * receiver type.
+  */
+ private boolean inferTemplatedTypesForCall(
+     Node n, FunctionType fnType) {
+-    final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+-        .getTemplateKeys();
++  final TemplateTypeMap typeMap = fnType.getTemplateTypeMap();
++  final ImmutableList<TemplateType> keys = typeMap.getTemplateKeys();
+   if (keys.isEmpty()) {
+     return false;
+   }
+ 
+-    // Try to infer the template types
+-    Map<TemplateType, JSType> inferred =
++  // Try to infer the template types from parameters.
++  // This primarily infers method-specific template types (like K in method<K>).
++  Map<TemplateType, JSType> inferredFromParams =
+       inferTemplateTypesFromParameters(fnType, n);
+ 
++  // Resolve template types that come from the receiver object's type.
++  // For example, if calling `instanceOfClass<string>.method()`, resolve the class's
++  // template parameter based on `instanceOfClass<string>`.
++  Map<TemplateType, JSType> resolvedFromReceiver = Collections.emptyMap();
++  Node callTargetNode = n.getFirstChild();
++  JSType receiverType = null;
++  // Safely get the type of the receiver expression (e.g., 'obj' in obj.method()).
++  if (callTargetNode.isQualifiedName() || callTargetNode.isGetElem()) {
++    Node receiverNode = callTargetNode.getFirstChild();
++    if (receiverNode != null) {
++       receiverType = getJSType(receiverNode);
++    }
++  }
++  // Note: This doesn't handle all call patterns, e.g., `super`.
+ 
+-    // Replace all template types. If we couldn't find a replacement, we
+-    // replace it with UNKNOWN.
++  if (receiverType != null) {
++    // If the receiver type is explicitly templatized (e.g., Class<string>),
++    // extract the type arguments relevant to the function's template keys.
++    if (receiverType.isTemplatizedType()) {
++      TemplatizedType templatizedReceiver = receiverType.toMaybeTemplatizedType();
++      Map<TemplateType, JSType> resolved = new HashMap<>();
++      // Iterate over the function's template keys. If a key is also defined
++      // by the receiver's type definition (matching by TemplateType object identity),
++      // use the receiver's resolved type for it.
++      for (TemplateType key : keys) {
++         if (templatizedReceiver.hasTemplateType(key)) {
++            resolved.put(key, templatizedReceiver.getTemplateType(key));
++         }
++      }
++      resolvedFromReceiver = resolved;
++    } else if (receiverType.isInstanceType()) {
++      // Handle cases like raw `new C()` where C itself is generic.
++      // The receiverType might be `C<?>` or `C`. We might need more complex matching
++      // against the constructor if necessary, but often `C<?>` is represented as a
++      // TemplatizedType resolving templates to UNKNOWN, handled above.
++    }
++  }
++
++  // Combine parameter inference and receiver resolution. Receiver resolution takes precedence
++  // for any template keys defined by the receiver's class.
++  Map<TemplateType, JSType> combined = new HashMap<>(inferredFromParams);
++  combined.putAll(resolvedFromReceiver); // Overwrite inferred with resolved from receiver.
++
++  // Replace template types in the function signature using the combined map.
++  // The standard TemplateTypeReplacer substitutes JSTypeRegistry#getNativeType(UNKNOWN_TYPE)
++  // for any template keys encountered that are *not* in the 'combined' map. It also
++  // uses the types provided in the map, even if they are UNKNOWN/?.
+   TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+-        registry, inferred);
+-    Node callTarget = n.getFirstChild();
+-
++      registry, combined);
+   FunctionType replacementFnType = fnType.visit(replacer)
+       .toMaybeFunctionType();
+-    Preconditions.checkNotNull(replacementFnType);
++  Preconditions.checkNotNull(replacementFnType); // Should still be a function type
+ 
+-    callTarget.setJSType(replacementFnType);
++  // Update the type information on the AST nodes.
++  // The call target (e.g., `obj.method`) gets the specialized function type.
++  callTargetNode.setJSType(replacementFnType);
++  // The call node itself (e.g., `obj.method(...)`) gets the specialized return type.
+   n.setJSType(replacementFnType.getReturnType());
+ 
++  // Return value indicates if the replacer actually substituted any types.
+   return replacer.madeChanges;
+ }
+\ No newline at end of file

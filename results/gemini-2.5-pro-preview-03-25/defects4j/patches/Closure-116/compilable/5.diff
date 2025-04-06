@@ -1,0 +1,141 @@
+diff --git a/tmp/d49e7a3e-ebc4-4504-a2cb-fedb401eee19_buggy.java b/tmp/177e2796-09b5-445f-ab76-277402786da2_fixed.java
+index 233a867..0654f65 100644
+--- a/tmp/d49e7a3e-ebc4-4504-a2cb-fedb401eee19_buggy.java
++++ b/tmp/177e2796-09b5-445f-ab76-277402786da2_fixed.java
+@@ -1,73 +1,116 @@
+   /**
+    * Determines whether a function can be inlined at a particular call site.
+    * There are several criteria that the function and reference must hold in
+    * order for the functions to be inlined:
+    * 1) If a call's arguments have side effects,
+    * the corresponding argument in the function must only be referenced once.
+    * For instance, this will not be inlined:
+    * <pre>
+    *     function foo(a) { return a + a }
+    *     x = foo(i++);
+    * </pre>
++   * 2) If the function body has side effects, arguments must not have side
++   * effects or refer to objects whose state may be changed by the body's
++   * side effects. This prevents reordering of side effects.
++   * For instance, this will not be inlined:
++   * <pre>
++   *     function foo(a) { x=1; return a; }
++   *     y = foo(x); // If x=0 initially, returns 0, but x becomes 1.
++   *                 // Inlined: { x=1; y=x; } which results in y=1.
++   *     function bar(a) { return a; }
++   *     bar(x=1); // Argument has side effect. If inlined into a function
++   *               // with side effects, order might change.
++   * </pre>
+    */
+   private CanInlineResult canInlineReferenceDirectly(
+       Node callNode, Node fnNode) {
+     if (!isDirectCallNodeReplacementPossible(fnNode)) {
+       return CanInlineResult.NO;
+     }
+ 
+     Node block = fnNode.getLastChild();
+ 
++    // Check for side-effect interactions early.
++    boolean functionBodyHasSideEffects = NodeUtil.mayHaveSideEffects(block, compiler);
+ 
+-    // CALL NODE: [ NAME, ARG1, ARG2, ... ]
++    // Arguments start after the call target.
+     Node cArg = callNode.getFirstChild().getNext();
+ 
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
++    // Handle 'this' in .call and .apply
++    boolean isCallOrApply = false;
+     if (!callNode.getFirstChild().isName()) {
+       if (NodeUtil.isFunctionObjectCall(callNode)) {
++        isCallOrApply = true;
+         // TODO(johnlenz): Support replace this with a value.
++        // Parameter list does not include the 'this' argument.
+         if (cArg == null || !cArg.isThis()) {
+           return CanInlineResult.NO;
+         }
+-        cArg = cArg.getNext();
++        cArg = cArg.getNext(); // Skip 'this', move to real arguments.
+       } else {
+         // ".apply" call should be filtered before this.
+         Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+       }
+     }
+ 
++    // If the function body has side-effects, check for arguments that have
++    // side-effects or that reference aliased state. This prevents the order of
++    // side-effects from changing.
++    if (functionBodyHasSideEffects) {
++        Node currentArg = cArg;
++        while (currentArg != null) {
++            // An argument is problematic if it has side effects or refers to
++            // names/properties that might be affected by the function body's
++            // side effects (captured by canBeSideEffected).
++            if (NodeUtil.mayHaveSideEffects(currentArg, compiler)
++                || NodeUtil.canBeSideEffected(currentArg)) {
++                 return CanInlineResult.NO;
++            }
++            currentArg = currentArg.getNext();
++        }
++    }
++
+     // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+     Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
++
++    // Check each parameter/argument pair.
+     while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
++      // Check arguments (cArg) first.
+       if (cArg != null) {
+-
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
++        // Check for arguments with side effects that are evaluated more than once.
++        if (fnParam != null) {
+           if (NodeUtil.mayEffectMutableState(cArg, compiler)
+               && NodeUtil.getNameReferenceCount(
+                   block, fnParam.getString()) > 1) {
+             return CanInlineResult.NO;
+           }
+         }
+ 
+-        // Move to the next name.
+-        fnParam = fnParam.getNext();
+-      }
+-
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+-      if (cArg != null) {
++        // Check arguments that are not used by the function.
++        // If the function body has no side-effects, an argument function call
++        // will be preserved by the FunctionArgumentInjector. However, this is
++        // probably not what the user expects, so we don't inline.
++        // This is the original Check #2. Let's keep it for safety, as removing it
++        // caused issues in the past (see comments in original code/history).
++        // It prevents `foo(modify())` where `foo(){}` from being inlined to `{}`.
+         if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
++           // This check might be too strict if functionBodyHasSideEffects is false,
++           // but better safe than sorry without deeper analysis of argument injector guarantees.
++           // The check above already handled the functionBodyHasSideEffects=true case.
++           if (!functionBodyHasSideEffects) {
+                 return CanInlineResult.NO;
+            }
++           // If body had side effects, the check at the top would have returned NO already.
++        }
++
+         cArg = cArg.getNext();
+       }
++
++      // Move to the next parameter.
++      if (fnParam != null) {
++        fnParam = fnParam.getNext();
++      }
+     }
+ 
+-    return CanInlineResult.YES;
++    return CanInlineResult.YES; // Passed all checks.
+   }
+\ No newline at end of file

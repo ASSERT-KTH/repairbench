@@ -1,0 +1,145 @@
+diff --git a/tmp/e9bce4d3-8b00-4268-9156-692234bed278_buggy.java b/tmp/8cdc2af5-af49-4189-b9b0-25cc88b9b2e5_fixed.java
+index 30d7266..4279932 100644
+--- a/tmp/e9bce4d3-8b00-4268-9156-692234bed278_buggy.java
++++ b/tmp/8cdc2af5-af49-4189-b9b0-25cc88b9b2e5_fixed.java
+@@ -1,69 +1,96 @@
++import com.google.javascript.rhino.JSDocInfo;
++import com.google.javascript.rhino.Node;
++import com.google.javascript.rhino.Token;
++import com.google.javascript.jscomp.NodeTraversal;
++import com.google.javascript.jscomp.NodeUtil;
++
++// NOTE: This code assumes the existence and correct behavior of NodeUtil methods
++// like getBestJSDocInfo, isExprAssign, isPrototypeProperty, and Node#isObjectLitKey
++// (or equivalent checks for STRING_KEY, GETTER_DEF, SETTER_DEF).
++
+ /**
+  * Since this pass reports errors only when a global {@code this} keyword
+-   * is encountered, there is no reason to traverse non global contexts.
++ * is encountered, there is no reason to traverse functions where 'this'
++ * is bound to a specific object (e.g., constructors, prototype methods,
++ * methods in @lends objects, or methods with @this annotations).
+  */
++@Override
+ public boolean shouldTraverse(NodeTraversal t, Node n, Node parent) {
+ 
++  // We are only interested in pruning the traversal of functions.
+   if (n.getType() == Token.FUNCTION) {
+-      // Don't traverse functions that are constructors or have the @this
+-      // or @override annotation.
+-      JSDocInfo jsDoc = getFunctionJsDocInfo(n);
++
++    // 1. Don't traverse functions that are constructors, interfaces,
++    //    or have annotations indicating 'this' is fixed (@this, @override).
++    //    We use getBestJSDocInfo to find JSDoc potentially attached to parent nodes.
++    JSDocInfo jsDoc = NodeUtil.getBestJSDocInfo(n);
+     if (jsDoc != null &&
+         (jsDoc.isConstructor() ||
+          jsDoc.isInterface() ||
+          jsDoc.hasThisType() ||
+          jsDoc.isOverride())) {
+       return false;
+     }
+ 
+-      // Don't traverse functions unless they would normally
+-      // be able to have a @this annotation associated with them. e.g.,
+-      // var a = function() { }; // or
+-      // function a() {} // or
+-      // a.x = function() {}; // or
+-      // var a = {x: function() {}};
+-      int pType = parent.getType();
+-      if (!(pType == Token.BLOCK ||
+-            pType == Token.SCRIPT ||
+-            pType == Token.NAME ||
+-            pType == Token.ASSIGN ||
+-
+-            // object literal keys
+-            pType == Token.STRING ||
+-            pType == Token.NUMBER)) {
+-        return false;
+-      }
+-
+-      // Don't traverse functions that are getting lent to a prototype.
+-    }
+-
++    // 2. Don't traverse functions assigned directly to a prototype property.
++    //    e.g., Foo.prototype.bar = function() { ... };
++    //    or Foo.prototype = function() { ... };
+     if (parent != null && parent.getType() == Token.ASSIGN) {
+       Node lhs = parent.getFirstChild();
+-      Node rhs = lhs.getNext();
+-
+-      if (n == lhs) {
+-        // Always traverse the left side of the assignment. To handle
+-        // nested assignments properly (e.g., (a = this).property = c;),
+-        // assignLhsChild should not be overridden.
+-        if (assignLhsChild == null) {
+-          assignLhsChild = lhs;
+-        }
+-      } else {
+-        // Only traverse the right side if it's not an assignment to a prototype
+-        // property or subproperty.
+-        if (NodeUtil.isGet(lhs)) {
+-          if (lhs.getType() == Token.GETPROP &&
+-              lhs.getLastChild().getString().equals("prototype")) {
++      Node rhs = parent.getLastChild();
++      // Check if the function node 'n' is the RHS of the assignment
++      if (n == rhs && NodeUtil.isExprAssign(parent)) { // Ensure it's a simple assignment LHS = RHS
++        // Check if the LHS is modifying a prototype
++        if (NodeUtil.isPrototypeProperty(lhs)) {
+             return false;
+         }
+-          Node llhs = lhs.getFirstChild();
+-          if (llhs.getType() == Token.GETPROP &&
+-              llhs.getLastChild().getString().equals("prototype")) {
++      }
++    }
++
++    // 3. Don't traverse functions inside an object literal annotated with @lends.
++    //    e.g., /** @lends {Foo.prototype} */ ({ m: function() { ... } })
++    //    The function node 'n' would be the child of a STRING_KEY, GETTER_DEF, or SETTER_DEF node 'parent'.
++    //    The parent of 'parent' would be the OBJECTLIT node.
++    if (parent != null) {
++      Node objectLit = null;
++      // Check if the parent is an object literal key/definition node
++      // Use isObjectLitKey() or check specific token types
++       if (parent.isObjectLitKey() || // Covers STRING_KEY, GETTER_DEF, SETTER_DEF if method exists
++           parent.getType() == Token.STRING_KEY || // Explicit check otherwise
++           parent.getType() == Token.GETTER_DEF ||
++           parent.getType() == Token.SETTER_DEF) {
++         objectLit = parent.getParent();
++       }
++
++      if (objectLit != null && objectLit.getType() == Token.OBJECTLIT) {
++          // Find the JSDoc associated with the object literal, potentially
++          // coming from a parent node (e.g., a CALL or ASSIGN).
++          JSDocInfo objectLitJsDoc = NodeUtil.getBestJSDocInfo(objectLit);
++          if (objectLitJsDoc != null && objectLitJsDoc.getLendsName() != null) {
++              // This object literal's properties are lent, treat 'this' as non-global.
+               return false;
+           }
+       }
+     }
++
++    // 4. Don't traverse functions nested inside other functions.
++    //    The 'this' keyword in nested functions depends on the call site,
++    //    and isn't the primary target of CheckGlobalThis which focuses on
++    //    potentially global contexts.
++    if (parent != null && parent.getType() == Token.FUNCTION) {
++       return false;
++    }
++
++    // NOTE: The original code had a check based on parent types (BLOCK, SCRIPT, NAME, ASSIGN, STRING, NUMBER)
++    // to allow traversal only in specific contexts. This has been removed in favor of
++    // explicitly skipping known non-global contexts above. The default is now to traverse,
++    // allowing checks in IIFEs, global functions, simple method assignments, etc.
++
++    // NOTE: The original code had logic for nested assignments (assignLhsChild). This was removed
++    // as it doesn't seem relevant for deciding whether to traverse a function body for 'this' checks.
+   }
+ 
++  // Default behavior: traverse the node and its children.
++  // This allows visiting other node types and function bodies not explicitly excluded above.
+   return true;
+ }
+\ No newline at end of file

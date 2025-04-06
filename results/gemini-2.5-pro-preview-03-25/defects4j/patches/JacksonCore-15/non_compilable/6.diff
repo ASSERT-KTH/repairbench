@@ -1,0 +1,349 @@
+diff --git a/tmp/55502161-6bca-4903-9361-cc1a44c9e9d3_buggy.java b/tmp/b4708e55-0223-4f98-ae52-08b901709cf6_fixed.java
+index 82cd856..e7f8cc5 100644
+--- a/tmp/55502161-6bca-4903-9361-cc1a44c9e9d3_buggy.java
++++ b/tmp/b4708e55-0223-4f98-ae52-08b901709cf6_fixed.java
+@@ -1,213 +1,293 @@
+     @Override
+     public JsonToken nextToken() throws IOException
+     {
+-    	//Check for _allowMultipleMatches - false and atleast there is one token - which is _currToken
+-    	// check for no buffered context _exposedContext - null
+-    	//If all the conditions matches then check for scalar / non-scalar property
+-    		//if not scalar and ended successfully, then return null
+-    		//else if scalar, and scalar not present in obj/array and !includePath and INCLUDE_ALL matched once
+-    		// then return null 
++        // [APR] Check if we've already found a match and further matches are disallowed.
++        // If multiple matches not allowed, and we have found the first match,
++        // and we are not still processing buffered tokens from that match, return null.
++        // (_foundMatch is a new protected boolean field, initialized to false)
++        if (!_allowMultipleMatches && _foundMatch && _exposedContext == null) {
++             // Signal EOF for the filter stream
++             return (_currToken = null);
++        }
++
+         // Anything buffered?
+         TokenFilterContext ctxt = _exposedContext;
+-
+         if (ctxt != null) {
+             while (true) {
+                 JsonToken t = ctxt.nextTokenToRead();
+                 if (t != null) {
+                     _currToken = t;
+                     return t;
+                 }
+                 // all done with buffered stuff?
+                 if (ctxt == _headContext) {
+                     _exposedContext = null;
++                    // If we get here, previous context is now fully read.
++                    // If _foundMatch was true, the next call will return null via the check above.
+                     if (ctxt.inArray()) {
+                         t = delegate.getCurrentToken();
+-// Is this guaranteed to work without further checks?
+-//                        if (t != JsonToken.START_ARRAY) {
++                        // Is this guaranteed to work without further checks? Yes, context handled.
+                         _currToken = t;
+                         return t;
+                     }
+ 
+                     // Almost! Most likely still have the current token;
+-                    // with the sole exception of 
++                    // with the sole exception of FIELD_NAME, which can't be current token
++                    // after spending time buffered
++                    //
++                    // BUT: [JACKSON-291] May need to improve handling of FIELD_NAME matching
++                    // things...
++                    /* Let's assume it's ok: that is, FIELD_NAME is only returned by main loop,
++                     * if this occurs?
++                     */
+                     /*
+-                    t = delegate.getCurrentToken();
++                    JsonToken t = delegate.getCurrentToken();
+                     if (t != JsonToken.FIELD_NAME) {
+                        _currToken = t;
+                        return t;
+                     }
+                     */
+-                    break;
++
++                    break; // Break from while, resume main loop
+                 }
+                 // If not, traverse down the context chain
+                 ctxt = _headContext.findChildOf(ctxt);
+                 _exposedContext = ctxt;
+                 if (ctxt == null) { // should never occur
+                     throw _constructError("Unexpected problem: chain of filtered context broken");
+                 }
+             }
+         }
+ 
+         // If not, need to read more. If we got any:
+         JsonToken t = delegate.nextToken();
+         if (t == null) {
+-            // no strict need to close, since we have no state here
++            // End-of-input is always passed directly (although contexts may need closing?)
++            /* NOTE: there is one possible edge case; where the last token is END_OBJECT/ARRAY,
++             * which could match a filter. But let's assume that's not the case; handling
++             * would require significant rooting around. And initial goal is just to get
++             * basic path/property filtering working.
++             */
++            // No need to close anything here
+             return (_currToken = t);
+         }
+ 
+         // otherwise... to include or not?
+         TokenFilter f;
+ 
+-        switch (t.id()) {
++        // Use ID constants for switch for performance
++        final int id = t.id();
++        switch (id) {
+         case ID_START_ARRAY:
+             f = _itemFilter;
+             if (f == TokenFilter.INCLUDE_ALL) {
+                 _headContext = _headContext.createChildArrayContext(f, true);
++                // [APR] Set flag if this START_ARRAY itself constitutes the single match result
++                if (!_includePath && !_allowMultipleMatches && !_foundMatch) {
++                    _foundMatch = true;
++                }
+                 return (_currToken = t);
+             }
+-            if (f == null) { // does this occur?
++            if (f == null) { // filter indicates skip
+                 delegate.skipChildren();
+                 break;
+             }
+-            // Otherwise still iffy, need to check
++            // Non-trivial filter, need to check
+             f = _headContext.checkValue(f);
+-            if (f == null) {
++            if (f == null) { // value filter indicates skip
+                 delegate.skipChildren();
+                 break;
+             }
++            // Ok, value check passes; check structure itself:
+             if (f != TokenFilter.INCLUDE_ALL) {
+                 f = f.filterStartArray();
+             }
+-            _itemFilter = f;
++             // Check filter result for the array itself
++             if (f == null) { // filter indicates skip
++                 delegate.skipChildren();
++                 break;
++             }
++            _itemFilter = f; // filter for items
+             if (f == TokenFilter.INCLUDE_ALL) {
+                 _headContext = _headContext.createChildArrayContext(f, true);
++                // [APR] Set flag if this START_ARRAY itself constitutes the single match result
++                if (!_includePath && !_allowMultipleMatches && !_foundMatch) {
++                    _foundMatch = true;
++                }
+                 return (_currToken = t);
+             }
++            // Not-INCLUDE_ALL; include container structure if parent path is included
+             _headContext = _headContext.createChildArrayContext(f, false);
+-            
+-            // Also: only need buffering if parent path to be included
+             if (_includePath) {
+                 t = _nextTokenWithBuffering(_headContext);
+                 if (t != null) {
+                     _currToken = t;
+                     return t;
+                 }
+             }
++            // If !includePath or buffering didn't provide token, we need to call
++            // _nextToken2() to find the first actual token to return
+             break;
+ 
+         case ID_START_OBJECT:
+             f = _itemFilter;
+             if (f == TokenFilter.INCLUDE_ALL) {
+                 _headContext = _headContext.createChildObjectContext(f, true);
++                 // [APR] Set flag if this START_OBJECT itself constitutes the single match result
++                 if (!_includePath && !_allowMultipleMatches && !_foundMatch) {
++                     _foundMatch = true;
++                 }
+                 return (_currToken = t);
+             }
+-            if (f == null) { // does this occur?
++            if (f == null) { // filter indicates skip
+                 delegate.skipChildren();
+                 break;
+             }
+-            // Otherwise still iffy, need to check
++            // Non-trivial filter, need to check
+             f = _headContext.checkValue(f);
+-            if (f == null) {
++            if (f == null) { // value filter indicates skip
+                 delegate.skipChildren();
+                 break;
+             }
++            // Ok, value check passes; check structure itself:
+             if (f != TokenFilter.INCLUDE_ALL) {
+                 f = f.filterStartObject();
+             }
+-            _itemFilter = f;
++              // Check filter result for the object itself
++              if (f == null) { // filter indicates skip
++                  delegate.skipChildren();
++                  break;
++              }
++            _itemFilter = f; // filter for properties
+             if (f == TokenFilter.INCLUDE_ALL) {
+                 _headContext = _headContext.createChildObjectContext(f, true);
++                 // [APR] Set flag if this START_OBJECT itself constitutes the single match result
++                 if (!_includePath && !_allowMultipleMatches && !_foundMatch) {
++                     _foundMatch = true;
++                 }
+                 return (_currToken = t);
+             }
++             // Not-INCLUDE_ALL; include container structure if parent path is included
+             _headContext = _headContext.createChildObjectContext(f, false);
+-            // Also: only need buffering if parent path to be included
+             if (_includePath) {
+                 t = _nextTokenWithBuffering(_headContext);
+                 if (t != null) {
+                     _currToken = t;
+                     return t;
+                 }
+             }
+-            // note: inclusion of surrounding Object handled separately via
+-            // FIELD_NAME
++             // If !includePath or buffering didn't provide token, we need to call
++             // _nextToken2() to find the first actual token to return
+             break;
+ 
+         case ID_END_ARRAY:
+         case ID_END_OBJECT:
+             {
+                 boolean returnEnd = _headContext.isStartHandled();
+                 f = _headContext.getFilter();
+                 if ((f != null) && (f != TokenFilter.INCLUDE_ALL)) {
++                    // Call the filter method appropriate for the token type
++                    if (id == ID_END_ARRAY) { // Use id directly
+                         f.filterFinishArray();
++                    } else { // Must be END_OBJECT
++                        f.filterFinishObject();
++                    }
+                 }
+                 _headContext = _headContext.getParent();
+-                _itemFilter = _headContext.getFilter();
++                // Update item filter based on the parent context's filter
++                _itemFilter = (_headContext != null) ? _headContext.getFilter() : null; // Need null check for root
+                 if (returnEnd) {
+                     return (_currToken = t);
+                 }
+             }
+             break;
+ 
+         case ID_FIELD_NAME:
+             {
+                 final String name = delegate.getCurrentName();
+-                // note: this will also set 'needToHandleName'
++                // note: this will also set 'needToHandleName' in context
+                 f = _headContext.setFieldName(name);
+                 if (f == TokenFilter.INCLUDE_ALL) {
+-                    _itemFilter = f;
++                    _itemFilter = f; // filter for value is also INCLUDE_ALL
++                    // If including path, return FIELD_NAME.
++                    // If not including path, but need to include START_OBJECT, buffer it.
++                    // This logic follows the original closely.
+                     if (!_includePath) {
+-                        // Minor twist here: if parent NOT included, may need to induce output of
+-                        // surrounding START_OBJECT/END_OBJECT
+                          if (_includeImmediateParent && !_headContext.isStartHandled()) {
+                              t = _headContext.nextTokenToRead(); // returns START_OBJECT but also marks it handled
+                              _exposedContext = _headContext;
++                             // Original code returned FIELD_NAME even after buffering START_OBJECT.
++                             // Let next call return START_OBJECT from buffer.
++                             // The current call returns FIELD_NAME.
+                          }
+                     }
+-                    return (_currToken = t);
++                    return (_currToken = t); // Return FIELD_NAME
+                 }
+-                if (f == null) {
++                if (f == null) { // field name filtered out
+                     delegate.nextToken();
+                     delegate.skipChildren();
+                     break;
+                 }
+-                f = f.includeProperty(name);
+-                if (f == null) {
++                 // Ok, maybe include? Check specific property filter:
++                TokenFilter fprop = f.includeProperty(name); // filter for property value
++                if (fprop == null) { // property filtered out
+                     delegate.nextToken();
+                     delegate.skipChildren();
+                     break;
+                 }
+-                _itemFilter = f;
+-                if (f == TokenFilter.INCLUDE_ALL) {
+-                    if (_includePath) {
+-                        return (_currToken = t);
++                // Property included, 'fprop' is the filter for the value.
++                _itemFilter = fprop;
++                if (fprop == TokenFilter.INCLUDE_ALL) {
++                    // Value is included automatically. Return FIELD_NAME?
++                    if (_includePath) { // Original check
++                        return (_currToken = t); // Return FIELD_NAME
+                     }
++                    // If !_includePath, check buffering for parent START_OBJECT
++                    if (_includeImmediateParent && !_headContext.isStartHandled()) {
++                         t = _headContext.nextTokenToRead(); // returns START_OBJECT
++                         _exposedContext = _headContext;
++                         return (_currToken = t); // Return buffered START_OBJECT first
+                     }
++                    // Otherwise break to let value be processed by nextToken2 (value follows FIELD_NAME)
++                } else { // fprop is not null, not INCLUDE_ALL. Value needs filtering.
++                    // Need buffering check?
+                     if (_includePath) {
+                         t = _nextTokenWithBuffering(_headContext);
+                         if (t != null) {
+                             _currToken = t;
+                             return t;
+                         }
+                     }
+-                break;
++                 // If !includePath or buffering yields nothing, break to process value.
++                }
++                break; // Proceed to _nextToken2() for value/structure
+             }
+ 
+-        default: // scalar value
++        default: // scalar value (primitive types, null, text)
+             f = _itemFilter;
++            boolean included = false;
+             if (f == TokenFilter.INCLUDE_ALL) {
+-                return (_currToken = t);
++                included = true;
++            } else if (f != null) {
++                TokenFilter f2 = _headContext.checkValue(f);
++                if ((f2 == TokenFilter.INCLUDE_ALL) || ((f2 != null) && f2.includeValue(delegate))) {
++                    included = true;
+                 }
+-            if (f != null) {
+-                f = _headContext.checkValue(f);
+-                if ((f == TokenFilter.INCLUDE_ALL)
+-                        || ((f != null) && f.includeValue(delegate))) {
+-                    return (_currToken = t);
+             }
++
++            if (included) {
++                // [APR] This scalar is included. If multiple matches not allowed, set the flag
++                // only if it hasn't been set already (first match).
++                if (!_allowMultipleMatches && !_foundMatch) {
++                     _foundMatch = true;
++                }
++                return (_currToken = t);
+             }
+-            // Otherwise not included (leaves must be explicitly included)
++            // Otherwise scalar value is filtered out, continue loop via _nextToken2()
+             break;
+         }
+ 
+-        // We get here if token was not yet found; offlined handling
++        // We get here if token was filtered out, or needs further processing (like FIELD_NAME value)
++        // find next token to return (may be null)
+         return _nextToken2();
+     }
+\ No newline at end of file

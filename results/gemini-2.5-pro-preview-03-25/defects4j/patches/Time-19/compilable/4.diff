@@ -1,0 +1,138 @@
+diff --git a/tmp/887d6249-3a07-407e-8016-c42c3e7cea30_buggy.java b/tmp/8e21f210-512d-49ee-9b59-68b31cc5b399_fixed.java
+index f8caf72..2ecd316 100644
+--- a/tmp/887d6249-3a07-407e-8016-c42c3e7cea30_buggy.java
++++ b/tmp/8e21f210-512d-49ee-9b59-68b31cc5b399_fixed.java
+@@ -1,65 +1,102 @@
+     /**
+      * Gets the millisecond offset to subtract from local time to get UTC time.
+      * This offset can be used to undo adding the offset obtained by getOffset.
+      *
+      * <pre>
+      * millisLocal == millisUTC   + getOffset(millisUTC)
+      * millisUTC   == millisLocal - getOffsetFromLocal(millisLocal)
+      * </pre>
+      *
+      * NOTE: After calculating millisLocal, some error may be introduced. At
+      * offset transitions (due to DST or other historical changes), ranges of
+      * local times may map to different UTC times.
+      * <p>
+      * This method will return an offset suitable for calculating an instant
+      * after any DST gap. For example, consider a zone with a cutover
+      * from 01:00 to 01:59:<br />
+      * Input: 00:00  Output: 00:00<br />
+      * Input: 00:30  Output: 00:30<br />
+      * Input: 01:00  Output: 02:00<br />
+      * Input: 01:30  Output: 02:30<br />
+      * Input: 02:00  Output: 02:00<br />
+      * Input: 02:30  Output: 02:30<br />
+      * <p>
+      * During a DST overlap (where the local time is ambiguous) this method will return
+      * the earlier instant. The combination of these two rules is to always favour
+      * daylight (summer) time over standard (winter) time.
+      * <p>
+      * NOTE: Prior to v2.0, the DST overlap behaviour was not defined and varied by hemisphere.
+      * Prior to v1.5, the DST gap behaviour was also not defined.
+      *
+      * @param instantLocal  the millisecond instant, relative to this time zone, to get the offset for
+      * @return the millisecond offset to subtract from local time to get UTC time
+      */
+     public int getOffsetFromLocal(long instantLocal) {
+-        // get the offset at instantLocal (first estimate)
+-        final int offsetLocal = getOffset(instantLocal);
+-        // adjust instantLocal using the estimate and recalc the offset
+-        final long instantAdjusted = instantLocal - offsetLocal;
+-        final int offsetAdjusted = getOffset(instantAdjusted);
+-        // if the offsets differ, we must be near a DST boundary
+-        if (offsetLocal != offsetAdjusted) {
+-            // we need to ensure that time is always after the DST gap
+-            // this happens naturally for positive offsets, but not for negative
+-            if ((offsetLocal - offsetAdjusted) < 0) {
+-                // if we just return offsetAdjusted then the time is pushed
+-                // back before the transition, whereas it should be
+-                // on or after the transition
+-                long nextLocal = nextTransition(instantAdjusted);
+-                long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+-                if (nextLocal != nextAdjusted) {
+-                    return offsetLocal;
+-                }
+-            }
+-        } else if (offsetLocal > 0) {
+-            long prev = previousTransition(instantAdjusted);
+-            if (prev < instantAdjusted) {
+-                int offsetPrev = getOffset(prev);
+-                int diff = offsetPrev - offsetLocal;
+-                if (instantAdjusted - prev <= diff) {
+-                    return offsetPrev;
+-                }
+-            }
+-        }
+-        return offsetAdjusted;
++        // get the offset by guessing that 'instantLocal' isdey UTC
++        int guess = getOffset(instantLocal);
++        // adjust 'instantLocal' by the guess to get an estimate of the actual UTC
++        long guessUTC = instantLocal - guess;
++        int actualOffset = getOffset(guessUTC);
++    
++        // check if the guessed offset and the actual offset match
++        if (guess == actualOffset) {
++             // guess is correct, go with actualOffset
++
++             // If in an overlap period, ensure we are returning the daylight offset
++             // This occurs if we are in the second occurrence of an overlap D->S,
++             // and our calculation landed on the S offset.
++             long prevTrans = previousTransition(guessUTC);
++             if (prevTrans < guessUTC) {
++                 int offsetBefore = getOffset(prevTrans - 1);
++                 int offsetAt = getOffset(prevTrans); // Should equal actualOffset if this is the S case we need to fix
++                 if (offsetBefore > offsetAt) { // Check if it was a D->S transition
++                     long overlapDuration = offsetBefore - offsetAt;
++                     // Check if the estimated UTC instant falls within the UTC range corresponding
++                     // to the second occurrence of the duplicated local time.
++                     if (guessUTC >= prevTrans && guessUTC < (prevTrans + overlapDuration)) {
++                         // Ambiguous time, and we calculated the UTC/Offset for the *later* instant (Standard time S).
++                         // We need to return the offset for the *earlier* instant (Daylight time D).
++                         return offsetBefore; // Return D
++                     }
++                 }
++             }
++             return actualOffset; // Return the consistent offset found
++        }
++    
++        // guess was wrong, probably crossed a transition
++        // calculate the offset using the actual offset to get another estimate of the actual UTC
++        long secondGuessUTC = instantLocal - actualOffset;
++        int secondActualOffset = getOffset(secondGuessUTC);
++
++        // If the second guess differs from the first actual offset, it confirms a transition.
++        // The desired behavior is to return the offset related to the 'daylight' or 'summer' time.
++        // For gaps (S->D), return offset *after* gap (D).
++        // For overlaps (D->S), return offset for *earlier* instant (D).
++        // In both cases, this corresponds to the larger offset value.
++        if (actualOffset != secondActualOffset) {
++             return Math.max(actualOffset, secondActualOffset);
++        }
++
++        // If actualOffset == secondActualOffset, it implies the transition was handled correctly by the first adjustment.
++        // However, we still need the overlap check logic as above, applied to 'actualOffset' and 'guessUTC'.
++        // (Duplicating the overlap check from the 'if (guess == actualOffset)' block)
++        long prevTrans = previousTransition(guessUTC);
++        if (prevTrans < guessUTC) {
++            int offsetBefore = getOffset(prevTrans - 1);
++            int offsetAt = getOffset(prevTrans); // Should equal actualOffset if this is the S case
++            if (offsetBefore > offsetAt) { // Check if it was a D->S transition
++                long overlapDuration = offsetBefore - offsetAt;
++                if (guessUTC >= prevTrans && guessUTC < (prevTrans + overlapDuration)) {
++                     // Return D offset (offsetBefore) if overlap detected and we landed on S (actualOffset).
++                     // Note: This check might seem redundant if actualOffset == secondActualOffset,
++                     // but it covers edge cases where the initial guess was S during an overlap.
++                     if (actualOffset == offsetAt) { // Ensure we landed on S
++                         return offsetBefore;
++                     }
++                }
++            }
++        }
++
++        // Default case: return the offset from the first corrected estimate.
++        return actualOffset;
+     }
+\ No newline at end of file

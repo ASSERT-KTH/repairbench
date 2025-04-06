@@ -1,0 +1,114 @@
+diff --git a/tmp/277da0f0-aa78-4520-836e-5388a9ff1245_buggy.java b/tmp/3096987d-f7d8-4b39-a8bb-ef07a084d9ae_fixed.java
+index 9353941..054b3de 100644
+--- a/tmp/277da0f0-aa78-4520-836e-5388a9ff1245_buggy.java
++++ b/tmp/3096987d-f7d8-4b39-a8bb-ef07a084d9ae_fixed.java
+@@ -1,30 +1,97 @@
+   /**
+    * Give an expression and a variable. It returns READ, if the first
+-   * reference of that variable is a read. It returns KILL, if the first
+-   * reference of that variable is an assignment. It returns MAY_LIVE otherwise.
++   * reference of that variable, according to evaluation order, is a read.
++   * It returns KILL, if the first reference of that variable, according
++   * to evaluation order, is an assignment or variable initialization.
++   * It returns MAY_LIVE otherwise.
++   * Note: This function's accuracy depends on the assumption of left-to-right
++   * evaluation order and does not account for control flow branching.
+    */
+   private VariableLiveness isVariableReadBeforeKill(
+       Node n, String variable) {
+-    if (NodeUtil.isName(n) && variable.equals(n.getString())) {
+-      if (NodeUtil.isLhs(n, n.getParent())) {
+-        // The expression to which the assignment is made is evaluated before
+-        // the RHS is evaluated (normal left to right evaluation) but the KILL
+-        // occurs after the RHS is evaluated.
++
++    switch (n.getToken()) {
++      case ASSIGN:
++        // Assignment: RHS is evaluated before the assignment occurs.
++        Node lhs = n.getFirstChild();
++        Node rhs = n.getLastChild();
++        // Check RHS first.
++        VariableLiveness rhsLiveness = isVariableReadBeforeKill(rhs, variable);
++        if (rhsLiveness != VariableLiveness.MAYBE_LIVE) {
++          return rhsLiveness;
++        }
++        // Check LHS. If the variable is the LHS, it's a kill, happening after RHS.
++        // The recursive call to isVariableReadBeforeKill for the LHS node
++        // itself (during the standard traversal below) will handle reads/kills
++        // within a complex LHS (e.g., obj[x] = 1). We only need to check
++        // here if the simple LHS name matches the variable.
++        if (NodeUtil.isName(lhs) && variable.equals(lhs.getString())) {
+           return VariableLiveness.KILL;
+-      } else {
++        }
++        // If LHS is complex, fall through to standard traversal to check its children.
++        // We still need to check the LHS structure itself via traversal.
++        VariableLiveness lhsLiveness = isVariableReadBeforeKill(lhs, variable);
++        if (lhsLiveness != VariableLiveness.MAYBE_LIVE) {
++           return lhsLiveness;
++        }
++        // If neither RHS nor LHS structure contains the first read/kill, it's MAYBE_LIVE.
++        // This point should technically not be reached if lhs is the variable name due to check above.
++        break;
++
++      case INC: // e.g., ++x or x++
++      case DEC: // e.g., --x or x--
++        Node operand = n.getFirstChild();
++        // Check if the operand is the variable itself.
++        if (NodeUtil.isName(operand) && variable.equals(operand.getString())) {
++          // Postfix (x++, x--) reads the value *before* the kill/update.
++          // Prefix (++x, --x) kills/updates the value *before* it's read (as the expression result).
++          boolean isPostfix = n.getBooleanProp(Node.INCRDECR_PROP);
++          return isPostfix ? VariableLiveness.READ : VariableLiveness.KILL;
++        }
++        // If operand is complex (e.g., obj[x]++), fall through for standard traversal of the operand.
++        break; // Let standard traversal handle operand children
++
++      case VAR:
++        // Handle declarations like 'var x = initializer;' or 'var x;'
++        Node nameNode = n.getFirstChild();
++        // Check if this VAR declares the variable we're looking for.
++        if (NodeUtil.isName(nameNode) && variable.equals(nameNode.getString())) {
++          Node initializer = nameNode.getFirstChild();
++          if (initializer != null) {
++            // Check initializer first.
++            VariableLiveness initializerLiveness = isVariableReadBeforeKill(initializer, variable);
++            if (initializerLiveness != VariableLiveness.MAYBE_LIVE) {
++              return initializerLiveness; // Found read/kill in initializer first.
++            }
++          }
++          // If no initializer or initializer didn't contain first read/kill, the declaration is a KILL.
++          return VariableLiveness.KILL;
++        }
++        // If this VAR is not for the variable, fall through for standard traversal of children (initializer).
++        break;
++
++       case NAME:
++         // If we encounter the name directly, it's a read, unless it's an LHS
++         // handled by the specific logic in ASSIGN, VAR, INC, DEC cases which check parents.
++         // Since those cases return directly, reaching here implies it's not one of those LHS cases.
++         if (variable.equals(n.getString())) {
+            return VariableLiveness.READ;
+          }
++         break;
+     }
+ 
+-    // Expressions are evaluated left-right, depth first.
++    // Standard recursive descent: process children left-to-right.
+     for (Node child = n.getFirstChild();
+         child != null; child = child.getNext()) {
+-      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // Not a FUNCTION
++      // Skip nodes that introduce new control flow or scopes for this analysis.
++      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // e.g., FUNCTION
+         VariableLiveness state = isVariableReadBeforeKill(child, variable);
+         if (state != VariableLiveness.MAYBE_LIVE) {
+-          return state;
++          return state; // Return first read/kill found in children.
+         }
+       }
+     }
++
++    // Variable not found as the first read/kill in this subtree.
+     return VariableLiveness.MAYBE_LIVE;
+   }
+\ No newline at end of file

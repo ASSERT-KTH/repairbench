@@ -1,0 +1,229 @@
+diff --git a/tmp/15eb75d0-6f7e-4e62-be55-6d4d884dd181_buggy.java b/tmp/d6bbcab3-8ee2-4ed3-bd98-4fafa6786835_fixed.java
+index 3b47cfa..012e398 100644
+--- a/tmp/15eb75d0-6f7e-4e62-be55-6d4d884dd181_buggy.java
++++ b/tmp/d6bbcab3-8ee2-4ed3-bd98-4fafa6786835_fixed.java
+@@ -1,141 +1,218 @@
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import io.netty.buffer.ByteBuf;
++import java.nio.charset.StandardCharsets;
++import java.util.Date;
++import java.util.TimeZone;
++// Add other necessary imports like Position, DeviceSession, UnitsConverter etc.
++// Assume Log, Position, DeviceSession, readDate, getLastLocation, decodeCoordinates, getProtocolName etc. exist as in the original context.
++
++    // Assume Log is initialized appropriately, e.g.:
++    // private static final Logger Log = LoggerFactory.getLogger(HuabaoProtocolDecoder.class);
++
+     private Position decodeTransparent(DeviceSession deviceSession, ByteBuf buf) {
+ 
+         int type = buf.readUnsignedByte();
+ 
+         if (type == 0xF0) {
+             Position position = new Position(getProtocolName());
+             position.setDeviceId(deviceSession.getDeviceId());
+ 
+-            Date time = readDate(buf, deviceSession.get(DeviceSession.KEY_TIMEZONE));
++            Date time;
++            try {
++                // Mark position after 0xF0 in case date parsing fails
++                buf.markReaderIndex();
++                time = readDate(buf, deviceSession.get(DeviceSession.KEY_TIMEZONE));
++            } catch (IllegalArgumentException | IllegalStateException e) {
++                // Catch specific exceptions from BCD conversion or DateBuilder validation (like year > 1999)
++                buf.resetReaderIndex(); // Reset to position after 0xF0
++                Log.warn("Invalid date format in transparent message type 0xF0 for device "
++                        + deviceSession.getDeviceId() + " - " + e.getMessage());
++                // Discard the message as the date is crucial and likely indicates corruption
++                return null;
++            } catch (IndexOutOfBoundsException e) {
++                // Catch if buffer doesn't even have 6 bytes for the date
++                buf.resetReaderIndex();
++                 Log.warn("Buffer too short for date in transparent message type 0xF0 for device "
++                        + deviceSession.getDeviceId());
++                // Discard the message
++                return null;
++            }
+ 
++            // Original logic continues...
+             if (buf.readUnsignedByte() > 0) {
+                 position.set(Position.KEY_ARCHIVE, true);
+             }
+ 
+             buf.readUnsignedByte(); // vehicle type
+ 
+             int count;
+             int subtype = buf.readUnsignedByte();
+             switch (subtype) {
+                 case 0x01:
+                     count = buf.readUnsignedByte();
+                     for (int i = 0; i < count; i++) {
+                         int id = buf.readUnsignedShort();
+                         int length = buf.readUnsignedByte();
++                        // Check buffer readability before reading value
++                        if (buf.readableBytes() < length) {
++                            Log.warn("Buffer too short for item ID " + id + " length " + length + " in transparent subtype 0x01 for device " + deviceSession.getDeviceId());
++                            buf.skipBytes(buf.readableBytes()); // Skip remaining bytes
++                            break; // Exit loop
++                        }
+                         switch (id) {
+                             case 0x0102:
+                             case 0x0528:
+                             case 0x0546:
+                                 position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 100);
+                                 break;
+                             case 0x0103:
+                                 position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedInt() * 0.01);
+                                 break;
+                             case 0x052A:
+                                 position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedShort() * 0.01);
+                                 break;
+                             case 0x0105:
+                             case 0x052C:
+                                 position.set(Position.KEY_FUEL_USED, buf.readUnsignedInt() * 0.01);
+                                 break;
+                             case 0x014A:
+                             case 0x0537:
+                             case 0x0538:
+                             case 0x0539:
+                                 position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                                 break;
+                             case 0x052D:
+                                 position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedByte() - 40);
+                                 break;
+                             case 0x0530:
+                                 position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.001);
+                                 break;
+                             case 0x0535:
+                                 position.set(Position.KEY_OBD_SPEED, buf.readUnsignedShort() * 0.1);
+                                 break;
+                             case 0x0536:
+                                 position.set(Position.KEY_RPM, buf.readUnsignedShort());
+                                 break;
+                             case 0x0547:
+                             case 0x0548:
+                                 position.set(Position.KEY_THROTTLE, buf.readUnsignedByte());
+                                 break;
+                             default:
++                                // Generic IO handling or skip
+                                 switch (length) {
++                                    case 0: // Explicitly handle length 0 (do nothing)
++                                        break;
+                                     case 1:
+                                         position.set(Position.PREFIX_IO + id, buf.readUnsignedByte());
+                                         break;
+                                     case 2:
+                                         position.set(Position.PREFIX_IO + id, buf.readUnsignedShort());
+                                         break;
+                                     case 4:
+                                         position.set(Position.PREFIX_IO + id, buf.readUnsignedInt());
+                                         break;
+                                     default:
+-                                        buf.skipBytes(length);
++                                        buf.skipBytes(length); // Skip unknown length items
+                                         break;
+                                 }
+                                 break;
+                         }
+                     }
+                     getLastLocation(position, time);
+                     decodeCoordinates(position, buf);
+                     break;
+                 case 0x02:
+                     count = buf.readUnsignedByte();
+                     for (int i = 0; i < count; i++) {
+                         buf.readUnsignedInt(); // system id
+                         int codeCount = buf.readUnsignedShort();
+-                        for (int j = 0; j < codeCount; j++) {
+-                            buf.skipBytes(16); // code
++                        // Ensure multiplication doesn't overflow and check readability
++                        long bytesToSkip = (long) codeCount * 16;
++                        if (buf.readableBytes() < bytesToSkip) {
++                             Log.warn("Buffer too short for codes in transparent subtype 0x02 for device " + deviceSession.getDeviceId());
++                             buf.skipBytes(buf.readableBytes());
++                             break; // Exit loop
+                         }
++                        buf.skipBytes((int) bytesToSkip); // skipBytes takes int
+                     }
+                     getLastLocation(position, time);
+                     decodeCoordinates(position, buf);
+                     break;
+                 case 0x03:
+                     count = buf.readUnsignedByte();
+                     for (int i = 0; i < count; i++) {
+                         int id = buf.readUnsignedByte();
+                         int length = buf.readUnsignedByte();
++                        // Check buffer readability before skipping/reading
++                        if (buf.readableBytes() < length) {
++                            Log.warn("Buffer too short for item ID " + id + " length " + length + " in transparent subtype 0x03 for device " + deviceSession.getDeviceId());
++                            buf.skipBytes(buf.readableBytes()); // Skip remaining bytes
++                            break; // Exit loop
++                        }
++                        boolean processed = false;
+                         switch (id) {
+                             case 0x1A:
+                                 position.set(Position.KEY_ALARM, Position.ALARM_ACCELERATION);
++                                processed = true;
+                                 break;
+                             case 0x1B:
+                                 position.set(Position.KEY_ALARM, Position.ALARM_BRAKING);
++                                processed = true;
+                                 break;
+                             case 0x1C:
+                                 position.set(Position.KEY_ALARM, Position.ALARM_CORNERING);
++                                processed = true;
+                                 break;
+                             case 0x1D:
+                             case 0x1E:
+                             case 0x1F:
+                                 position.set(Position.KEY_ALARM, Position.ALARM_LANE_CHANGE);
++                                processed = true;
+                                 break;
+                             case 0x23:
+                                 position.set(Position.KEY_ALARM, Position.ALARM_FATIGUE_DRIVING);
++                                processed = true;
+                                 break;
+                             default:
++                                // Unknown ID, processed remains false
+                                 break;
+                         }
++                        // Always skip the specified length, regardless of processing
+                         buf.skipBytes(length);
+                     }
+                     getLastLocation(position, time);
+                     decodeCoordinates(position, buf);
+                     break;
+                 case 0x0B:
+-                    if (buf.readUnsignedByte() > 0) {
++                    // Check length/presence byte before reading VIN
++                    int vinPresent = buf.readUnsignedByte();
++                    if (vinPresent > 0) {
++                        if (buf.readableBytes() >= 17) { // Check readability for VIN
+                             position.set(Position.KEY_VIN, buf.readCharSequence(17, StandardCharsets.US_ASCII).toString());
++                        } else {
++                            Log.warn("Buffer too short for VIN in transparent message subtype 0x0B for device " + deviceSession.getDeviceId());
++                            // Skip remaining bytes? Or return null? For now, just log and continue.
++                            buf.skipBytes(buf.readableBytes());
++                        }
+                     }
+                     getLastLocation(position, time);
+                     break;
+                 default:
++                    Log.warn("Unknown transparent message subtype: " + subtype + " for device " + deviceSession.getDeviceId());
++                    // Discard message with unknown subtype
+                     return null;
+             }
+ 
++            // Ensure position has valid time before returning
++            if (position.getFixTime() == null) {
++                 Log.warn("Position decoded from transparent message has null time for device " + deviceSession.getDeviceId());
++                 // Return null or position? Returning position might be okay if time isn't strictly required later.
++                 // Let's return it but the log indicates a potential issue.
++            }
++
+             return position;
+         }
+ 
+         return null;
+     }
+\ No newline at end of file

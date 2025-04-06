@@ -1,0 +1,393 @@
+diff --git a/tmp/83231066-b751-4c7e-8e45-377e58f07130_buggy.java b/tmp/63606abf-fb31-4f1a-866e-2e6e7be7bb65_fixed.java
+index 7b8ee38..00aa8ea 100644
+--- a/tmp/83231066-b751-4c7e-8e45-377e58f07130_buggy.java
++++ b/tmp/63606abf-fb31-4f1a-866e-2e6e7be7bb65_fixed.java
+@@ -1,179 +1,301 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+-        buf.skipBytes(1); // '[' header
+-        manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
+-        buf.skipBytes(1); // '*' delimiter
++        // Assume frame includes '[' and ']'
++        // Basic check for minimal structure like [M*I*L*C] requires more bytes
++        if (buf.readableBytes() < 8) {
++            return null;
++        }
+ 
+-        int idIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        String id = buf.readSlice(idIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++        buf.skipBytes(1); // Skip '['
++        // Determine the end of content, which is before the final ']'
++        // We assume the buffer ends exactly with ']', so writerIndex - 1 is the position of ']'
++        int contentEndLimit = buf.writerIndex() - 1;
++        if (contentEndLimit <= buf.readerIndex()) {
++            return null; // Empty or invalid frame
++        }
++
++        // 1. Manufacturer (2 bytes)
++        if (buf.readableBytes() < 2 + 1) return null; // Need Manu + '*' before content end
++        String parsedManufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
++        // Store manufacturer in instance variable if needed by sendResponse, or pass it.
++        // Assuming sendResponse is modified or manufacturer is accessible via instance var.
++        // Let's store it for compatibility with original sendResponse helper usage pattern.
++        this.manufacturer = parsedManufacturer;
++        buf.skipBytes(1); // Skip '*' (first '*')
++
++        // 2. ID (variable length until '*')
++        int idEndIndex = buf.indexOf(buf.readerIndex(), contentEndLimit, (byte) '*');
++        if (idEndIndex < 0 || idEndIndex == buf.readerIndex()) {
++             return null; // No ID or delimiter found
++        }
++        String id = buf.readSlice(idEndIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, id);
+         if (deviceSession == null) {
+-            return null;
++             return null; // Unknown device
+         }
++        buf.skipBytes(1); // Skip '*' (second '*')
+ 
+-        buf.skipBytes(1); // '*' delimiter
+-
++        // 3. Optional Index / Length (Check format)
+         String index = null;
+-        int contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        if (contentIndex + 5 < buf.writerIndex() && buf.getByte(contentIndex + 5) == '*'
+-                && buf.toString(contentIndex + 1, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
+-            int indexLength = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*') - buf.readerIndex();
+-            hasIndex = true;
++        // Find the third '*' which delimits the index or length field
++        int thirdStarIndex = buf.indexOf(buf.readerIndex(), contentEndLimit, (byte) '*');
++        if (thirdStarIndex < 0) {
++            return null; // Malformed structure, missing third '*'
++        }
++
++        // Look ahead: Check if the field *after* the third star looks like a 4-hex-digit length followed by '*'
++        int lengthCheckStartIndex = thirdStarIndex + 1;
++        // Ensure space for 4 hex digits + 1 for '*' before the content end limit ']'
++        if (lengthCheckStartIndex + 4 < contentEndLimit &&
++            buf.getByte(lengthCheckStartIndex + 4) == '*' &&    // Check for the fourth '*' delimiter
++            buf.toString(lengthCheckStartIndex, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
++
++            // Format matches: Field *before* third star is index, field *after* is length.
++            int indexLength = thirdStarIndex - buf.readerIndex();
++            if (indexLength > 0) {
+                 index = buf.readSlice(indexLength).toString(StandardCharsets.US_ASCII);
+-            buf.skipBytes(1); // '*' delimiter
++            } // else: empty index field, index remains null
++            buf.skipBytes(1); // Skip '*' (third '*') - delimiter after index
++
++            // Now skip the length field (which we confirmed looks like length) and its delimiter
++            if (buf.readableBytes() < 4 + 1) return null; // Not enough bytes left
++            buf.skipBytes(4); // Skip length
++            buf.skipBytes(1); // Skip '*' (fourth '*') - delimiter after length
++
++        } else {
++            // Format doesn't match: Field *before* third star is assumed to be length. No index field.
++            // index remains null.
++            int lengthLength = thirdStarIndex - buf.readerIndex();
++            // Validate the assumed length field: must be 4 hex digits
++            if (lengthLength != 4 || !buf.toString(buf.readerIndex(), 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
++                 return null; // Malformed message, field doesn't look like length
++            }
++            if (buf.readableBytes() < lengthLength + 1) return null; // Not enough bytes left
++            buf.skipBytes(lengthLength); // Skip length
++            buf.skipBytes(1); // Skip '*' (third '*') - delimiter after length
+         }
+ 
+-        buf.skipBytes(4); // length
+-        buf.skipBytes(1); // '*' delimiter
++        // Now readerIndex is at the start of the message content (type + data)
++        int actualContentEnd = contentEndLimit; // The effective end of the payload
+ 
+-        buf.writerIndex(buf.writerIndex() - 1); // ']' ignore ending
++        // 4. Message Type (until first comma or end of content)
++        int typeEndIndex = buf.indexOf(buf.readerIndex(), actualContentEnd, (byte) ',');
++        if (typeEndIndex < 0) { // No comma found before end
++             typeEndIndex = actualContentEnd; // Type is everything up to end
++        }
+ 
+-        contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-        if (contentIndex < 0) {
+-            contentIndex = buf.writerIndex();
++        // Ensure type is not empty
++        if (typeEndIndex <= buf.readerIndex()) {
++             return null; // No type found or empty content after headers
+         }
++        String type = buf.readSlice(typeEndIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
+ 
+-        String type = buf.readSlice(contentIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++        // Position reader index after the type (and comma, if present)
++        int dataStartIndex = (typeEndIndex < actualContentEnd && buf.getByte(typeEndIndex) == ',') ? typeEndIndex + 1 : typeEndIndex;
++        // Ensure dataStartIndex doesn't exceed actualContentEnd
++        dataStartIndex = Math.min(dataStartIndex, actualContentEnd);
++        buf.readerIndex(dataStartIndex); // Position reader at start of data payload
+ 
+-        if (contentIndex < buf.writerIndex()) {
+-            buf.readerIndex(contentIndex + 1);
+-        }
++        // Create a buffer representing only the data payload
++        // Slice creates a view, doesn't copy or retain unless needed later.
++        int dataLength = actualContentEnd - dataStartIndex;
++        ByteBuf data = buf.slice(dataStartIndex, dataLength);
++
++
++        // --- Process message based on type ---
++        // Use the 'data' buffer for payload processing
+ 
+         if (type.equals("INIT")) {
+-
+             sendResponse(channel, id, index, "INIT,1");
+-
++            return null;
+         } else if (type.equals("LK")) {
+-
+             sendResponse(channel, id, index, "LK");
+-
+-            if (buf.isReadable()) {
+-                String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
++            if (data.isReadable()) {
++                String[] values = data.toString(StandardCharsets.US_ASCII).split(",");
+                 if (values.length >= 3) {
++                    try {
+                         Position position = new Position(getProtocolName());
+                         position.setDeviceId(deviceSession.getDeviceId());
+-
+                         getLastLocation(position, null);
+-
+                         position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2]));
+                         position.set(Position.KEY_STEPS, Integer.parseInt(values[0]));
+-
+                         return position;
++                    } catch (NumberFormatException e) { /* Log potentially */ return null; }
+                 }
+             }
+-
++             return null;
+         } else if (type.startsWith("UD") || type.startsWith("AL") || type.startsWith("WT")) {
+-
+-            Position position = decodePosition(deviceSession, buf.toString(StandardCharsets.US_ASCII));
+-
+-            if (type.startsWith("AL")) {
+-                if (position != null) {
++            // decodePosition handles parsing the payload string
++            String payload = data.toString(StandardCharsets.US_ASCII);
++            Position position = decodePosition(deviceSession, payload);
++            if (position != null && type.startsWith("AL")) {
++                 // Keep original alarm logic, decodePosition might set specifics
+                  position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+-                }
+                  sendResponse(channel, id, index, "AL");
+             }
+-
+             return position;
+-
+         } else if (type.equals("TKQ") || type.equals("TKQ2")) {
+-
+              sendResponse(channel, id, index, type);
+-
++             return null;
+         } else if (type.equalsIgnoreCase("PULSE")
+                 || type.equalsIgnoreCase("HEART")
+                 || type.equalsIgnoreCase("BLOOD")
+                 || type.equalsIgnoreCase("BPHRT")
+                 || type.equalsIgnoreCase("btemp2")) {
+-
+-            if (buf.isReadable()) {
+-
++             if (data.isReadable()) {
+                  Position position = new Position(getProtocolName());
+                  position.setDeviceId(deviceSession.getDeviceId());
+-
+-                getLastLocation(position, new Date());
+-
+-                String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
++                 getLastLocation(position, new Date()); // Use current time for health data
++                 String[] values = data.toString(StandardCharsets.US_ASCII).split(",");
+                  int valueIndex = 0;
+-
++                 try {
+                     if (type.equalsIgnoreCase("btemp2")) {
+-                    if (Integer.parseInt(values[valueIndex++]) > 0) {
++                        // values[0] is status, values[1] is temp
++                        if (values.length > valueIndex + 1 && Integer.parseInt(values[valueIndex++]) > 0) {
+                             position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[valueIndex]));
+                         }
+                     } else {
+                         if (type.equalsIgnoreCase("BPHRT") || type.equalsIgnoreCase("BLOOD")) {
++                            // values[0] high, values[1] low, values[2] rate
++                            if (values.length > valueIndex + 1) {
+                                 position.set("pressureHigh", values[valueIndex++]);
+                                 position.set("pressureLow", values[valueIndex++]);
++                            } else { return null; /* Malformed */ }
+                         }
+-                    if (valueIndex <= values.length - 1) {
++                        // Heart rate might be present alone or after blood pressure
++                        if (valueIndex < values.length) {
+                             position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex]));
+                         }
+                     }
+-
++                    // Only return if we successfully parsed some attributes
++                    if (!position.getAttributes().isEmpty()) {
+                         return position;
+-
+                     }
+-
++                 } catch (NumberFormatException | IndexOutOfBoundsException e) { /* Log potentially */ return null; }
++             }
++             return null;
+         } else if (type.equals("img")) {
+-
++             if (!data.isReadable()) return null;
+              Position position = new Position(getProtocolName());
+              position.setDeviceId(deviceSession.getDeviceId());
+-
+-            getLastLocation(position, null);
+-
+-            int timeIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-            buf.readerIndex(timeIndex + 12 + 2);
+-            position.set(Position.KEY_IMAGE, writeMediaFile(id, buf, "jpg"));
+-
++             getLastLocation(position, null); // Image may not correspond to current location
++             // Assume format is time,image_bytes
++             int commaIndex = data.indexOf(data.readerIndex(), data.writerIndex(), (byte) ',');
++             if (commaIndex >= data.readerIndex()) { // Allow comma at start if time is empty? Check protocol.
++                 data.readerIndex(commaIndex + 1); // Skip time and comma
++                 if (data.isReadable()) {
++                     // Pass a retained slice to writeMediaFile as 'data' might be invalidated
++                     position.set(Position.KEY_IMAGE, writeMediaFile(id, data.readRetainedSlice(data.readableBytes()), "jpg"));
+                      return position;
+-
++                 }
++             }
++             return null; // Image data format error or empty after comma
+         } else if (type.equals("JXTK")) {
++            // Payload: 0,watch_7_...,1,6,AMR_BYTES
++            if (!data.isReadable()) return null;
++            // Find the 4th comma to locate the end of the header section
++            int headerEndIndex = BufferUtil.indexOf(data, data.readerIndex(), data.writerIndex(), (byte) ',', 4);
++            if (headerEndIndex < 0) { return null; } // Not enough commas
+ 
+-            int dataIndex = BufferUtil.indexOf(buf, buf.readerIndex(), buf.writerIndex(), (byte) ',', 4) + 1;
+-            String[] values = buf.readCharSequence(
+-                    dataIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString().split(",");
++            // Read header for parsing without advancing reader yet
++            String headerPart = data.toString(data.readerIndex(), headerEndIndex - data.readerIndex(), StandardCharsets.US_ASCII);
++            String[] values = headerPart.split(",");
++            if (values.length < 4) { return null; } // Malformed header
+ 
++            // Advance reader index of 'data' buffer past header and the final comma
++            data.readerIndex(headerEndIndex + 1);
++
++            try {
+                 int current = Integer.parseInt(values[2]);
+                 int total = Integer.parseInt(values[3]);
+ 
++                // Get the actual audio bytes from the rest of the data buffer
++                ByteBuf audioChunk = data.readRetainedSlice(data.readableBytes()); // Use retained slice
++
++                // Manage the combined audio buffer (instance field 'audio')
+                 if (audio == null) {
+                     audio = Unpooled.buffer();
+                 }
+-            audio.writeBytes(buf);
++                audio.writeBytes(audioChunk);
++                audioChunk.release(); // Release the slice
+ 
+                 sendResponse(channel, id, index, "JXTKR,1");
+ 
+                 if (current < total) {
+-                return null;
++                    return null; // Intermediate chunk
+                 } else {
++                    // Last chunk arrived, process the complete audio buffer
+                     Position position = new Position(getProtocolName());
+                     position.setDeviceId(deviceSession.getDeviceId());
+-                getLastLocation(position, null);
++                    getLastLocation(position, null); // Get last known location
++                    // 'audio' now holds the complete data
+                     position.set(Position.KEY_AUDIO, writeMediaFile(id, audio, "amr"));
+-                audio.release();
+-                audio = null;
+-                return position;
++                    audio.release(); // Release the combined buffer
++                    audio = null;    // Reset the instance field
++                    return position; // Return position with audio key
++                }
++            } catch (NumberFormatException e) {
++                 // Clean up partially assembled audio if header parsing fails
++                 if (audio != null) { audio.release(); audio = null; }
++                 return null;
+             }
+-
+         } else if (type.equals("TK")) {
+-
+-            if (buf.readableBytes() == 1) {
+-                return null;
+-            }
+-
++            // Standalone audio message
++            if (!data.isReadable()) return null;
+             Position position = new Position(getProtocolName());
+             position.setDeviceId(deviceSession.getDeviceId());
+-
+             getLastLocation(position, null);
+-
+-            position.set(Position.KEY_AUDIO, writeMediaFile(id, buf, "amr"));
+-
++            // Pass retained slice of data buffer to writer
++            position.set(Position.KEY_AUDIO, writeMediaFile(id, data.readRetainedSlice(data.readableBytes()), "amr"));
+             return position;
++        }
+ 
++        return null; // Unknown type
+     }
+ 
+-        return null;
++    // Assumes this.manufacturer field is set in decode method
++    // Or modify to accept manufacturer as a parameter
++    private void sendResponse(Channel channel, String id, String index, String text) {
++        if (channel != null && channel.isActive()) {
++            if (this.manufacturer == null) {
++                // Log.error("Manufacturer not available for sending response");
++                return;
++            }
++            StringBuilder response = new StringBuilder("[");
++            response.append(this.manufacturer); // Use instance field
++            response.append("*");
++            response.append(id);
++            response.append("*");
++            if (index != null) {
++                response.append(index);
++                response.append("*");
++            }
++            // Format length as 4 hex digits
++            String hexLength = String.format("%04x", text.length());
++            response.append(hexLength);
++            response.append("*");
++            response.append(text);
++            response.append("]");
++            channel.writeAndFlush(new NetworkMessage(
++                    Unpooled.copiedBuffer(response.toString(), StandardCharsets.US_ASCII),
++                    channel.remoteAddress()));
++        }
+     }
++
++    // Instance field for manufacturer (if using the sendResponse pattern above)
++    // Alternatively, pass manufacturer explicitly to sendResponse
++    private String manufacturer;
++
++    // Instance field for JXTK audio assembly
++    private ByteBuf audio;
++
++    // Abstract methods assumed to be implemented elsewhere:
++    // protected abstract DeviceSession getDeviceSession(Channel channel, SocketAddress remoteAddress, String... uniqueIds);
++    // protected abstract void getLastLocation(Position position, Date date);
++    // protected abstract String writeMediaFile(String uniqueId, ByteBuf buf, String extension);
++    // protected abstract Position decodePosition(DeviceSession deviceSession, String data);
++    // private String getProtocolName() { return protocol.getName(); } // Assumed helper
+\ No newline at end of file

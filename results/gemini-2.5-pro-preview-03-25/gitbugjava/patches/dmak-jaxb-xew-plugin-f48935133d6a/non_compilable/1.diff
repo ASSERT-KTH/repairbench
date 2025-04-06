@@ -1,0 +1,138 @@
+diff --git a/tmp/01166e7b-25f4-4a0e-bf65-ba7d0b2700cd_buggy.java b/tmp/d14e3a23-495f-43ae-9f2f-29739fbdab73_fixed.java
+index 47a8941..0699c94 100644
+--- a/tmp/01166e7b-25f4-4a0e-bf65-ba7d0b2700cd_buggy.java
++++ b/tmp/d14e3a23-495f-43ae-9f2f-29739fbdab73_fixed.java
+@@ -1,53 +1,109 @@
++import com.sun.codemodel.JClassContainer;
++import com.sun.codemodel.JDefinedClass;
++import com.sun.codemodel.JMod;
++import com.sun.codemodel.JPackage;
++import com.sun.tools.xjc.model.ClassOutline;
++import com.sun.tools.xjc.outline.Outline;
++import com.sun.xml.xsom.XSComponent;
++import com.sun.xml.xsom.XSDeclaration;
++
++import java.util.Map;
++
++// Assuming getPrivateField, setPrivateField, and writeSummary are utility methods available in the class scope.
++
+ 	/**
+ 	 * Move the given class to his grandparent (either class or package). The given {@code clazz} should be inner class.
+ 	 */
+ 	private void moveClassLevelUp(Outline outline, JDefinedClass clazz) {
+-		// Modify the container so it now refers the class. Container can be a class or package.
++		// Get parent and grandparent containers
+ 		JDefinedClass parent = (JDefinedClass) clazz.parentContainer();
+ 		JClassContainer grandParent = parent.parentContainer();
+-		// Allows to track class name collisions:
+-		Map<String, JDefinedClass> classes;
++		Map<String, JDefinedClass> grandParentClasses; // Map for the grandparent's classes
+ 
++		// --- Step 1: Remove class from original parent's internal map ---
++		// Get parent's classes map using reflection
++		Map<String, JDefinedClass> parentClasses = getPrivateField(parent, "classes");
++		// Remove the class using its current name (before potential rename)
++		if (parentClasses != null) {
++			if (parentClasses.remove(clazz.name()) != null) {
++				writeSummary("\tDetached inner class " + clazz.fullName() + " from parent " + parent.fullName());
++			} else {
++				// This might happen if the class wasn't properly in the parent's map? Log a warning.
++				writeSummary("\tWARN: Class " + clazz.name() + " not found in parent " + parent.fullName() + "'s internal map for removal.");
++			}
++		} else {
++			// Log a warning/error as this is unexpected if parent is a JDefinedClass
++			writeSummary("\tWARN: Could not get 'classes' map from parent class " + parent.fullName());
++		}
++
++		// --- Step 2: Determine grandparent type and get its class map ---
++		// Also perform specific adjustments based on target container type
+ 		// FIXME: Pending https://java.net/jira/browse/JAXB-957
+ 		if (grandParent.isClass()) {
+-			// Element class should be added as its container child:
++			// Grandparent is a Class
+ 			JDefinedClass grandParentClass = (JDefinedClass) grandParent;
+-
+-			writeSummary("\tMoving inner class " + clazz.fullName() + " to class " + grandParentClass.fullName());
+-
+-			classes = getPrivateField(grandParentClass, "classes");
++			writeSummary("\tMoving inner class " + clazz.fullName() + " into outer class " + grandParentClass.fullName());
++			grandParentClasses = getPrivateField(grandParentClass, "classes");
+ 		}
+ 		else {
++			// Grandparent is a Package
+ 			JPackage grandParentPackage = (JPackage) grandParent;
++			writeSummary("\tMoving inner class " + clazz.fullName() + " into package " + grandParentPackage.name());
++			grandParentClasses = getPrivateField(grandParentPackage, "classes");
+ 
+-			writeSummary("\tMoving inner class " + clazz.fullName() + " to package " + grandParentPackage.name());
+-
+-			classes = getPrivateField(grandParentPackage, "classes");
+-
+-			// In this scenario class should have "static" modifier reset otherwise it won't compile:
++			// When moving to a package, the class becomes a top-level class.
++			// Ensure the 'static' modifier (relevant for nested classes) is removed.
++			if ((clazz.mods().getValue() & JMod.STATIC) != 0) {
++				writeSummary("\tRemoving static modifier from class " + clazz.name() + " as it moves to package scope.");
+ 				setPrivateField(clazz.mods(), "mods", Integer.valueOf(clazz.mods().getValue() & ~JMod.STATIC));
++			}
+ 
++			// Update associated schema component metadata if necessary
+ 			for (ClassOutline classOutline : outline.getClasses()) {
+ 				if (classOutline.implClass == clazz) {
+ 					XSComponent sc = classOutline.target.getSchemaComponent();
+-
+-					// FIXME: Inner class is always a local declaration.
+-					assert (sc instanceof XSDeclaration && ((XSDeclaration) sc).isLocal());
+-
++					// Check if it's a local declaration (as expected for inner classes)
++					if (sc instanceof XSDeclaration && ((XSDeclaration) sc).isLocal()) {
++						// Mark it as non-anonymous as it's moving to a potentially top-level scope
++						// Note: Using reflection implies this field isn't publicly mutable.
+ 						setPrivateField(sc, "anonymous", Boolean.FALSE);
+-
+-					break;
++						writeSummary("\tMarked schema component for " + clazz.name() + " as non-anonymous.");
++					} else {
++                         // Log if the assumption about the schema component is wrong
++                         writeSummary("\tWARN: Schema component for " + clazz.name() + " (" + (sc!=null?sc.getClass().getName():"null") + ") was not a local XSDeclaration as expected.");
++                    }
++					break; // Assume only one ClassOutline matches
++				}
+ 			}
+ 		}
++
++        // Check if we successfully got the grandparent's class map
++        if (grandParentClasses == null) {
++             writeSummary("\tERROR: Could not get 'classes' map from grandparent container: " + grandParent.toString() + ". Aborting move.");
++             // Abort the move. Ideally, we'd revert the removal from the parent, but that's complex.
++             // Failing here might leave the model inconsistent, but proceeding would cause NPEs.
++             return;
+         }
+ 
+-		if (classes.containsKey(clazz.name())) {
+-			writeSummary("\tRenaming class " + clazz.fullName() + " to class " + parent.name() + clazz.name());
+-			setPrivateField(clazz, "name", parent.name() + clazz.name());
++
++		// --- Step 3: Handle potential name collision in grandparent ---
++		String originalName = clazz.name();
++		String finalName = originalName;
++		if (grandParentClasses.containsKey(originalName)) {
++			// Collision detected: Rename the class by prepending the original parent's name
++			finalName = parent.name() + originalName;
++			writeSummary("\tName collision in " + (grandParent.isClass() ? "class " + ((JDefinedClass)grandParent).fullName() : "package " + ((JPackage)grandParent).name())
++                    + ". Renaming class " + originalName + " to " + finalName);
++			setPrivateField(clazz, "name", finalName);
+ 		}
+ 
+-		classes.put(clazz.name(), clazz);
++		// --- Step 4: Add the class (with final name) to the grandparent's map ---
++		grandParentClasses.put(finalName, clazz);
++        writeSummary("\tAdded class " + finalName + " to " + (grandParent.isClass() ? "class " + ((JDefinedClass)grandParent).fullName() : "package " + ((JPackage)grandParent).name()) + "'s map.");
++
+ 
++		// --- Step 5: Update the class's 'outer' reference to point to the new container ---
+ 		// Finally modify the class so that it refers back the container:
+ 		setPrivateField(clazz, "outer", grandParent);
++        writeSummary("\tUpdated outer container reference for class " + finalName + ".");
+ 	}
+\ No newline at end of file

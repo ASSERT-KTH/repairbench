@@ -1,0 +1,140 @@
+diff --git a/tmp/5c0201aa-6e5f-44d6-ae21-e70f7b0177fa_buggy.java b/tmp/069daa2b-2df6-4f16-ace1-fddf85ff8c9e_fixed.java
+index e69de29..c365446 100644
+--- a/tmp/5c0201aa-6e5f-44d6-ae21-e70f7b0177fa_buggy.java
++++ b/tmp/069daa2b-2df6-4f16-ace1-fddf85ff8c9e_fixed.java
+@@ -0,0 +1,134 @@
++    protected JavaType _fromClass(ClassStack context, Class<?> rawType, TypeBindings bindings)
++    {
++        final ClassKey key = new ClassKey(rawType);
++        // This is the main function-level cache
++        JavaType type = _typeCache.get(key);
++
++        if (type != null) {
++            // 15-Jan-2016, tatu: Need to handle ResolvedRecursiveType...
++            if (type instanceof ResolvedRecursiveType) {
++                // Two main cases: referring back to the type currently being resolved
++                // (handled by ClassStack); or referring to a type that has not been
++                // resolved AFTER placeholder was added. Second case is the more
++                // complex one; need to determine how to wait, how to handle.
++
++                // Found a placeholder, need to check if it's for type we are resolving
++                ResolvedRecursiveType rrt = (ResolvedRecursiveType) type;
++                if (context.find(rawType) != null) {
++                    // Ok, we seem to be resolving the type (possibly indirectly);
++                    // need to return the placeholder temporarily. Let caller figure out what to do.
++                    return type;
++                }
++                // If not direct recursion, should be resolved reference; placeholder is just
++                // for thread-safety / concurrent resolution issues.
++
++                // 21-Feb-2016, tatu: Actually, we must have resolved it already...
++                //   so, must be able to find it:
++                type = rrt.getSelfReferencedType();
++                if (type == null) { // Sanity check... usually never occurs
++                     _reportProblem(rawType, "Could not resolve recursive type definition");
++                }
++            }
++            return type;
++        }
++
++        // Nope: need to construct and cache. Add placeholder to handle recursive definitions
++        if (context == null) {
++            context = new ClassStack(rawType);
++        } else {
++            ClassStack prev = context.find(rawType);
++            if (prev != null) {
++                // Ok, then, this is a recursive self-reference, which we can handle.
++                // Need to just return a placeholder marker type
++                ResolvedRecursiveType selfRef = new ResolvedRecursiveType(rawType, bindings);
++                prev.addSelfReference(selfRef);
++                return selfRef;
++            }
++            // Otherwise, need context, possibly push new frame
++            context = context.child(rawType);
++        }
++
++        // Ok, need to create and put placeholder in cache for now.
++        ResolvedRecursiveType selfRef = new ResolvedRecursiveType(rawType, bindings);
++        _typeCache.put(key, selfRef);
++
++        // Try to figure out type components:
++        List<JavaType> HACK = Collections.emptyList(); // static is fine, just need immutability
++        JavaType superClass = null;
++        List<JavaType> interfaces = HACK;
++
++        // Handle arrays first...
++        if (rawType.isArray()) {
++            if (rawType == byte[].class) { // Special handling for byte[]
++                type = PrimitiveArrayType.construct(SimpleType.constructUnsafe(Byte.TYPE), bindings);
++            } else {
++                type = ArrayType.construct(_fromAny(context, rawType.getComponentType(), bindings), bindings);
++            }
++        } else {
++            // Then primitive types
++            if (rawType.isPrimitive()) {
++                // We should have exact types for primitives; but none for void
++                // (should we check for void?)
++                // Also; only need unsafe instances as we don't care about handlers, bindings
++                if (rawType == Boolean.TYPE) { type = SimpleType.constructUnsafe(Boolean.TYPE); }
++                else if (rawType == Integer.TYPE) { type = SimpleType.constructUnsafe(Integer.TYPE); }
++                else if (rawType == Long.TYPE) { type = SimpleType.constructUnsafe(Long.TYPE); }
++                // others should be added if/when needed...
++                else {
++                    // Should we validate that it's primitive? Or fail later? Let's fail later.
++                    type = SimpleType.constructUnsafe(rawType);
++                }
++            } else {
++                // Then Enum types
++                if (rawType.isEnum()) {
++                    type = EnumType.construct(rawType, bindings);
++                } else if (rawType.isInterface()) {
++                    // "important" interfaces, pre-defined? Maybe Map/List/Set?
++                    // Nah, let's not assume anything about those.
++                    interfaces = _resolveSuperInterfaces(context, rawType, bindings);
++                    // And possible super-interface:
++                    // Interfaces have null super class, but may have super interfaces
++                    // May not have super-class, but we do use Object.class default for some checks
++                    superClass = _resolveSuperClass(context, rawType, bindings);
++                    type = InterfaceType.construct(rawType, bindings, superClass, interfaces);
++                } else { // And finally, regular classes
++                    superClass = _resolveSuperClass(context, rawType, bindings);
++                    interfaces = _resolveSuperInterfaces(context, rawType, bindings);
++                    type = SimpleType.construct(rawType, bindings, superClass, interfaces);
++                    // 15-Jan-2016, tatu: If we have generic type, need to resolve its type parameters.
++                    //    Need to do this AFTER construction, before setting references, to make
++                    //    sure reference itself is resolved. Not 100% sure this is the best place,
++                    //    seems to work...
++                    if (type.hasGenericTypes()) {
++                        _resolveSelfReferences(type, bindings);
++                    }
++                }
++            }
++            // TODO: optimize by perhaps calling resolve-methods only when type has generic parameters?
++            // Or perhaps that would not help much...
++
++            // 15-Jan-2016, tatu: Make sure we resolve self-references if we did
++            //    create non-trivial type.
++            // 21-Feb-2016, tatu: ... but note that this needs to be done before
++            //    calling setReference, to avoid race conditions -- that is, need
++            //    to link type completely before making it available via placeholder.
++            //    But seems like we can't easily do that. Check [databind#1332] for details.
++            //    (Perhaps someday could handle this better?)
++/* // 21-Feb-2016, tatu: Too eager; causes [databind#1332]
++            if (!type.equals(selfRef)) {
++                _resolveSelfReferences(type, bindings);
++            }
++ */
++        }
++        selfRef.setReference(type); // Resolve placeholder AFTER resolving refs
++
++        // And possible self-references within type?
++        List<ResolvedRecursiveType> refs = context.getSelfReferences();
++        if (refs != null) {
++            for (ResolvedRecursiveType ref : refs) {
++                ref.setReference(type);
++            }
++        }
++
++        return type;
++    }
+\ No newline at end of file

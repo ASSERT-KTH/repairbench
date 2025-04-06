@@ -1,0 +1,204 @@
+diff --git a/tmp/fabe836f-5df3-414e-a99e-3a779a68e2a0_buggy.java b/tmp/f7a42c2b-71f4-4269-b504-0a03c9a04ebc_fixed.java
+index 851ffc2..7135539 100644
+--- a/tmp/fabe836f-5df3-414e-a99e-3a779a68e2a0_buggy.java
++++ b/tmp/f7a42c2b-71f4-4269-b504-0a03c9a04ebc_fixed.java
+@@ -1,70 +1,167 @@
+     /**
+      * Replace the provide statement.
+      *
+      * If we're providing a name with no definition, then create one.
+      * If we're providing a name with a duplicate definition, then make sure
+      * that definition becomes a declaration.
+      */
+     void replace() {
++      // If already processed, return.
++      // This ensures idempotency if called multiple times (e.g., recursively).
++      if (replacementNode != null) {
++        return;
++      }
++
++      // Ensure parent namespace is processed first if this namespace declaration
++      // needs to be moved to the minimumModule. This is crucial for inserting
++      // this namespace relative to its parent.
++      if (firstModule != minimumModule && candidateDefinition == null) {
++        int indexOfDot = namespace.indexOf('.');
++        if (indexOfDot != -1) {
++          ProvidedName parentName =
++              providedNames.get(namespace.substring(0, indexOfDot));
++          // The parent *must* exist in the map, either explicitly provided or implicitly created.
++          Preconditions.checkNotNull(parentName, "Parent namespace %s not found for %s", namespace.substring(0, indexOfDot), namespace);
++
++          // If the parent hasn't been processed yet (its replacementNode is null),
++          // process it now recursively.
++          if (parentName.replacementNode == null) {
++            parentName.replace(); // This recursive call will handle the parent.
++
++            // After the recursive call returns, the parent's replacementNode must have been set.
++            Preconditions.checkNotNull(parentName.replacementNode,
++                "Recursive parent replace call failed to set replacement node for %s (parent of %s)",
++                parentName.namespace, namespace);
++          }
++          // If parentName.replacementNode was already non-null, the parent was already processed.
++        }
++      }
++
++      // Base case: 'goog' is predefined. ProcessClosurePrimitives handles this by setting
++      // candidateDefinition to the goog object node. firstNode is null for 'goog'.
+       if (firstNode == null) {
+-        // Don't touch the base case ('goog').
+         replacementNode = candidateDefinition;
+         return;
+       }
+ 
+-      // Handle the case where there is a duplicate definition for an explicitly
+-      // provided symbol.
++      // Case 1: Handle duplicate definition (goog.provide + user definition exists)
+       if (candidateDefinition != null && explicitNode != null) {
++        // Remove the goog.provide() call node if it's still in the AST.
++        if (explicitNode.getParent() != null) {
+           explicitNode.detachFromParent();
+           compiler.reportCodeChange();
++        }
+ 
+-        // Does this need a VAR keyword?
++        // Default replacement is the user's definition.
+         replacementNode = candidateDefinition;
+-        if (NodeUtil.isExpressionNode(candidateDefinition)) {
++
++        // If the user definition is an EXPR_RESULT (like 'ns = value;' or 'ns.sub = value;'),
++        // we might need to transform it (e.g., to 'var ns = value;').
++        if (candidateDefinition.isExprResult()) {
++          // Mark the expression node as potentially defining a namespace part.
+           candidateDefinition.putBooleanProp(Node.IS_NAMESPACE, true);
+           Node assignNode = candidateDefinition.getFirstChild();
+-          Node nameNode = assignNode.getFirstChild();
+-          if (nameNode.getType() == Token.NAME) {
+-            // Need to convert this assign to a var declaration.
+-            Node valueNode = nameNode.getNext();
+-            assignNode.removeChild(nameNode);
+-            assignNode.removeChild(valueNode);
+-            nameNode.addChildToFront(valueNode);
+-            Node varNode = new Node(Token.VAR, nameNode);
++
++          // Check if it's an assignment.
++          if (assignNode.isAssign()) {
++            Node nameNode = assignNode.getFirstChild(); // The L-value (NAME or GETPROP)
++
++            if (nameNode.isName()) {
++              // It's an assignment to a simple name: 'name = value;'
++              // Convert it to a VAR declaration: 'var name = value;'
++              Node valueNode = nameNode.getNext(); // The R-value
++
++              // Detach children from the original ASSIGN node.
++              assignNode.detachChildren();
++              // Build the NAME node structure for the VAR (NAME -> value).
++              nameNode.addChildToFront(valueNode == null ? IR.empty() : valueNode);
++              // Create the new VAR node.
++              Node varNode = IR.var(nameNode);
++
++              // Copy source info and JSDoc from original EXPR_RESULT/ASSIGN to new VAR/NAME.
+               varNode.copyInformationFrom(candidateDefinition);
+-            candidateDefinition.getParent().replaceChild(
+-                candidateDefinition, varNode);
+-            nameNode.setJSDocInfo(assignNode.getJSDocInfo());
++              JSDocInfo jsDocInfo = candidateDefinition.getJSDocInfo() != null ?
++                  candidateDefinition.getJSDocInfo() : assignNode.getJSDocInfo();
++              varNode.setJSDocInfo(jsDocInfo);
++              // Copy JSDoc to NAME node as well? Often useful for type checking.
++              nameNode.setJSDocInfo(jsDocInfo);
++
++              // Replace the original EXPR_RESULT node with the new VAR node.
++              Node parent = candidateDefinition.getParent();
++              if (parent != null) {
++                  parent.replaceChild(candidateDefinition, varNode);
+                   compiler.reportCodeChange();
++                  replacementNode = varNode; // The replacement is the new VAR node.
++              } else {
++                  // Should not happen if candidateDefinition was from the AST.
++                  // Log error or handle? For now, just point replacementNode to varNode.
+                    replacementNode = varNode;
+               }
++            } else if (nameNode.isGetProp()) {
++              // It's an assignment to a property: 'ns.sub = value;'
++              // Keep it as is. The EXPR_RESULT node is the correct structure.
++              // Ensure JSDoc is associated with the EXPR_RESULT node if needed.
++              // replacementNode is already set to candidateDefinition.
+             }
++            // Else: Other assignment types? (e.g., destructuring) Not typically used for namespaces.
++          }
++          // Else: EXPR_RESULT node doesn't contain ASSIGN? Unusual.
++        }
++        // Else: candidateDefinition is not an EXPR_RESULT (e.g., already a VAR, FUNCTION). Use as is.
++        // replacementNode is already set to candidateDefinition.
++
+       } else {
+-        // Handle the case where there's not a duplicate definition.
++        // Case 2: No duplicate definition (implicit namespace or only goog.provide)
++        // Create a declaration node (e.g., 'var ns = {};' or 'ns.sub = {};').
+         replacementNode = createDeclarationNode();
++
++        // Remove the original goog.provide() call node if it existed and is still in the tree.
++        // Do this *before* adding the new node, especially if insertion is relative to firstNode.
++        Node nodeToInsertBefore = firstNode;
++        if (explicitNode != null && explicitNode.getParent() != null) {
++            // If the node we plan to insert before *is* the goog.provide call,
++            // update our reference to be the node *after* the goog.provide call.
++            if (explicitNode == firstNode) {
++                nodeToInsertBefore = firstNode.getNext();
++            }
++            explicitNode.detachFromParent();
++            compiler.reportCodeChange();
++        }
++
++        // Insert the newly created declaration node into the AST.
+         if (firstModule == minimumModule) {
+-          firstNode.getParent().addChildBefore(replacementNode, firstNode);
++          // Place in the module where the namespace first appeared.
++          Node insertParent = firstNode.getParent(); // Parent of the original first reference.
++          if (insertParent != null) {
++              // Add the new node before the first usage/reference (or adjusted nodeToInsertBefore).
++              insertParent.addChildBefore(replacementNode, nodeToInsertBefore);
++              compiler.reportCodeChange();
++          } // else: Parent is somehow null? Cannot insert. Error state.
+         } else {
+-          // In this case, the name was implicitly provided by two independent
+-          // modules. We need to move this code up to a common module.
++          // Namespace was implicitly provided across modules. Place it in the common ancestor module.
+           int indexOfDot = namespace.indexOf('.');
+           if (indexOfDot == -1) {
+-            // Any old place is fine.
++            // Top-level implicit namespace (e.g., "apps"). Add to the start of minimumModule.
+             compiler.getNodeForCodeInsertion(minimumModule)
+-                .addChildToBack(replacementNode);
++                .addChildToFront(replacementNode); // ToFront is suitable for declarations.
++            compiler.reportCodeChange();
+           } else {
+-            // Add it after the parent namespace.
++            // Nested implicit namespace (e.g., "apps.foo"). Add after the parent's declaration node.
+             ProvidedName parentName =
+                 providedNames.get(namespace.substring(0, indexOfDot));
++            // Parent and its replacement node must exist due to the recursive check/call at the function start.
+             Preconditions.checkNotNull(parentName);
+-            Preconditions.checkNotNull(parentName.replacementNode);
+-            parentName.replacementNode.getParent().addChildAfter(
+-                replacementNode, parentName.replacementNode);
+-          }
+-        }
+-        if (explicitNode != null) {
+-          explicitNode.detachFromParent();
+-        }
++            Preconditions.checkNotNull(parentName.replacementNode, "Parent namespace %s has no replacement node for %s", parentName.namespace, namespace);
++
++            Node parentNode = parentName.replacementNode;
++            Node insertionPoint = parentNode.getParent(); // The node containing the parent's declaration.
++            Preconditions.checkState(insertionPoint != null, "Parent node %s is not in the AST for %s", parentNode.toStringTree(), namespace);
++
++            // Add the new node right after the parent's node.
++            insertionPoint.addChildAfter(replacementNode, parentNode);
+             compiler.reportCodeChange();
+           }
+         }
++        // Note: explicitNode detachment moved earlier for safety.
++      }
++    }
+\ No newline at end of file

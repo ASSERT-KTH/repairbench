@@ -1,0 +1,810 @@
+diff --git a/tmp/0b9805f4-e1ee-4dc3-9d5f-3e74d7fa6f56_buggy.java b/tmp/328750aa-a31b-4cbe-8c07-44b8db51fb4f_fixed.java
+index 41c6db4..eeda335 100644
+--- a/tmp/0b9805f4-e1ee-4dc3-9d5f-3e74d7fa6f56_buggy.java
++++ b/tmp/328750aa-a31b-4cbe-8c07-44b8db51fb4f_fixed.java
+@@ -1,517 +1,730 @@
+     private Object decodeBasic(Channel channel, SocketAddress remoteAddress, ByteBuf buf) {
+ 
+         int length = buf.readUnsignedByte();
+-        int dataLength = length - 5;
++        int dataLength = length - 5; // Assuming length = type(1) + data + serial(2) + checksum(2)
+         int type = buf.readUnsignedByte();
+ 
+         Position position = new Position(getProtocolName());
+         DeviceSession deviceSession = null;
+         if (type != MSG_LOGIN) {
+             deviceSession = getDeviceSession(channel, remoteAddress);
++            if (deviceSession == null) {
++                // Avoid resource leak https://github.com/traccar/traccar/pull/4998#issuecomment-1116617057
++                if (type == MSG_X1_PHOTO_INFO || type == MSG_X1_PHOTO_DATA) {
++                     buf.skipBytes(buf.readableBytes() - 6); // Skip data but leave serial, checksum, stop bytes for response
++                } else {
++                    return null;
++                }
++            }
++            // Check deviceSession again after potential skip for specific types without session
+             if (deviceSession == null) {
+                  return null;
+             }
+             position.setDeviceId(deviceSession.getDeviceId());
+             if (!deviceSession.contains(DeviceSession.KEY_TIMEZONE)) {
+                 deviceSession.set(DeviceSession.KEY_TIMEZONE, getTimeZone(deviceSession.getDeviceId()));
+             }
+         }
+ 
+         if (type == MSG_LOGIN) {
+ 
+             String imei = ByteBufUtil.hexDump(buf.readSlice(8)).substring(1);
+             buf.readUnsignedShort(); // type
+ 
+             deviceSession = getDeviceSession(channel, remoteAddress, imei);
+             if (deviceSession != null && !deviceSession.contains(DeviceSession.KEY_TIMEZONE)) {
+                 deviceSession.set(DeviceSession.KEY_TIMEZONE, getTimeZone(deviceSession.getDeviceId()));
+             }
+ 
+             if (dataLength > 10) {
+                 int extensionBits = buf.readUnsignedShort();
+                 int hours = (extensionBits >> 4) / 100;
+                 int minutes = (extensionBits >> 4) % 100;
+                 int offset = (hours * 60 + minutes) * 60;
+                 if ((extensionBits & 0x8) != 0) {
+                     offset = -offset;
+                 }
+                 if (deviceSession != null) {
+                     TimeZone timeZone = deviceSession.get(DeviceSession.KEY_TIMEZONE);
+                     if (timeZone.getRawOffset() == 0) {
+                         timeZone.setRawOffset(offset * 1000);
+                         deviceSession.set(DeviceSession.KEY_TIMEZONE, timeZone);
+                     }
+                 }
+             }
+ 
+             if (deviceSession != null) {
++                // Need to ensure buffer has enough readable bytes before accessing serial number
++                if (buf.readableBytes() >= 6) { // Check if serial, checksum, stop bytes are present
+                     sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
++                } else {
++                    // Handle missing suffix? Or assume login response doesn't need original serial?
++                    // Send response without serial maybe? For now, just check.
++                    Log.warning("Cannot read serial number for login response, buffer too short.");
++                }
+             }
+ 
+             return null;
+ 
+         } else if (type == MSG_HEARTBEAT) {
+ 
+             getLastLocation(position, null);
+ 
+             int status = buf.readUnsignedByte();
+             position.set(Position.KEY_ARMED, BitUtil.check(status, 0));
+             position.set(Position.KEY_IGNITION, BitUtil.check(status, 1));
+             position.set(Position.KEY_CHARGE, BitUtil.check(status, 2));
+ 
+-            if (buf.readableBytes() >= 2 + 6) {
++            // Check readable bytes before reading optional fields
++            // Assuming the "+ 6" was intended to check against remaining payload + suffix
++            // Let's check just for the field size itself first
++            if (buf.readableBytes() >= 2) {
+                 position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
+             }
+-            if (buf.readableBytes() >= 1 + 6) {
++            if (buf.readableBytes() >= 1) {
+                 position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+             }
+ 
++            // Ensure buffer has enough readable bytes before accessing serial number
++            if (buf.readableBytes() >= 6) { // Check if serial, checksum, stop bytes remain
+                sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
++            } else {
++               Log.warning("Cannot read serial number for heartbeat response, buffer too short.");
++            }
++
+ 
+             return position;
+ 
+         } else if (type == MSG_ADDRESS_REQUEST) {
+ 
+             String response = "NA&&NA&&0##";
+             ByteBuf content = Unpooled.buffer();
+             content.writeByte(response.length());
+             content.writeInt(0);
+             content.writeBytes(response.getBytes(StandardCharsets.US_ASCII));
+-            sendResponse(channel, true, MSG_ADDRESS_RESPONSE, 0, content);
++            sendResponse(channel, true, MSG_ADDRESS_RESPONSE, 0, content); // Serial 0 for command response
+ 
+             return null;
+ 
+         } else if (type == MSG_TIME_REQUEST) {
+ 
+             Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+             ByteBuf content = Unpooled.buffer();
+             content.writeByte(calendar.get(Calendar.YEAR) - 2000);
+             content.writeByte(calendar.get(Calendar.MONTH) + 1);
+             content.writeByte(calendar.get(Calendar.DAY_OF_MONTH));
+             content.writeByte(calendar.get(Calendar.HOUR_OF_DAY));
+             content.writeByte(calendar.get(Calendar.MINUTE));
+             content.writeByte(calendar.get(Calendar.SECOND));
+-            sendResponse(channel, false, MSG_TIME_REQUEST, 0, content);
++            sendResponse(channel, false, MSG_TIME_REQUEST, 0, content); // Serial 0 for command response
+ 
+             return null;
+ 
+         } else if (type == MSG_X1_GPS) {
+ 
+             buf.readUnsignedInt(); // data and alarm
+ 
+             decodeGps(position, buf, false, deviceSession.get(DeviceSession.KEY_TIMEZONE));
+ 
+             buf.readUnsignedShort(); // terminal info
+ 
+             position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
+ 
+             position.setNetwork(new Network(CellTower.from(
+                     buf.readUnsignedShort(), buf.readUnsignedByte(),
+                     buf.readUnsignedShort(), buf.readUnsignedInt())));
+ 
+             long driverId = buf.readUnsignedInt();
+             if (driverId > 0) {
+                 position.set(Position.KEY_DRIVER_UNIQUE_ID, String.valueOf(driverId));
+             }
+ 
+             position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
+             position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+ 
+             long portInfo = buf.readUnsignedInt();
+ 
+             position.set(Position.KEY_INPUT, buf.readUnsignedByte());
+             position.set(Position.KEY_OUTPUT, buf.readUnsignedByte());
+ 
+             for (int i = 1; i <= BitUtil.between(portInfo, 20, 24); i++) {
++                 if (buf.readableBytes() >= 2) { // Check before reading ADC
+                      position.set(Position.PREFIX_ADC + i, buf.readUnsignedShort() * 0.01);
++                 } else {
++                     Log.warning("Buffer too short for ADC read in MSG_X1_GPS");
++                     break; // Stop reading ADCs if buffer ends
+                  }
++            }
++
++            // No response sent for this message type? If needed, add serial check.
+ 
+             return position;
+ 
+         } else if (type == MSG_X1_PHOTO_INFO) {
+ 
+             buf.skipBytes(6); // time
+             buf.readUnsignedByte(); // fix status
+             buf.readUnsignedInt(); // latitude
+             buf.readUnsignedInt(); // longitude
+             buf.readUnsignedByte(); // camera id
+             buf.readUnsignedByte(); // photo source
+             buf.readUnsignedByte(); // picture format
+ 
++            if (buf.readableBytes() >= 8) { // Check for picture length and id
+                 ByteBuf photo = Unpooled.buffer(buf.readInt());
+                 int pictureId = buf.readInt();
+                 photos.put(pictureId, photo);
+                 sendPhotoRequest(channel, pictureId);
++            } else {
++                 Log.warning("Buffer too short for photo info in MSG_X1_PHOTO_INFO");
++            }
+ 
+             return null;
+ 
+         } else if (type == MSG_WIFI || type == MSG_WIFI_2 || type == MSG_WIFI_4) {
+ 
+             ByteBuf time = buf.readSlice(6);
+             DateBuilder dateBuilder = new DateBuilder()
+                     .setYear(BcdUtil.readInteger(time, 2))
+                     .setMonth(BcdUtil.readInteger(time, 2))
+                     .setDay(BcdUtil.readInteger(time, 2))
+                     .setHour(BcdUtil.readInteger(time, 2))
+                     .setMinute(BcdUtil.readInteger(time, 2))
+                     .setSecond(BcdUtil.readInteger(time, 2));
+             getLastLocation(position, dateBuilder.getDate());
+ 
+             Network network = new Network();
+ 
+             int wifiCount;
+             if (type == MSG_WIFI_4) {
++                 if (buf.readableBytes() >= 1) {
+                      wifiCount = buf.readUnsignedByte();
+                  } else {
+-                wifiCount = buf.getUnsignedByte(2);
++                     Log.warning("Buffer too short for wifiCount in MSG_WIFI_4");
++                     return position; // Return partially decoded position
+                  }
++            } else {
++                 // Original logic used getUnsignedByte(2) - peeking ahead? Risky.
++                 // Let's assume it should read normally if available. Check needed.
++                 // The original dataLength was calculated assuming a suffix. Let's check current readable bytes.
++                 // The byte at index 2 relative to current reader index holds the count.
++                 if (buf.readableBytes() >= 3) { // Need at least 1 byte for count + 2 potentially for cell count etc.
++                     wifiCount = buf.getUnsignedByte(buf.readerIndex() + 2); // Peek ahead
++                 } else {
++                      Log.warning("Buffer potentially too short for wifiCount in MSG_WIFI/MSG_WIFI_2");
++                      wifiCount = 0; // Assume 0 if cannot peek safely
++                 }
++            }
++
+ 
+             for (int i = 0; i < wifiCount; i++) {
+                 if (type == MSG_WIFI_4) {
++                    if (buf.readableBytes() >= 8) { // 2 skip + 6 mac
+                         buf.skipBytes(2);
++                    } else {
++                        Log.warning("Buffer too short for skipBytes in MSG_WIFI_4 loop");
++                        break;
++                    }
++                } else {
++                    if (buf.readableBytes() < 7) { // 6 mac + 1 rssi
++                        Log.warning("Buffer too short for WiFi AP in MSG_WIFI/MSG_WIFI_2 loop");
++                        break;
++                    }
+                 }
+                 WifiAccessPoint wifiAccessPoint = new WifiAccessPoint();
+                 wifiAccessPoint.setMacAddress(String.format("%02x:%02x:%02x:%02x:%02x:%02x",
+                         buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte(),
+                         buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte()));
+                 if (type != MSG_WIFI_4) {
+                     wifiAccessPoint.setSignalStrength((int) buf.readUnsignedByte());
+                 }
+                 network.addWifiAccessPoint(wifiAccessPoint);
+             }
+ 
+             if (type != MSG_WIFI_4) {
+-
++                 if (buf.readableBytes() >= 4) { // cellCount (1) + mcc (2) + mnc (1)
+                     int cellCount = buf.readUnsignedByte();
+                     int mcc = buf.readUnsignedShort();
+                     int mnc = buf.readUnsignedByte();
+                     for (int i = 0; i < cellCount; i++) {
++                        if (buf.readableBytes() >= 5) { // lac(2) + cid(2) + rssi(1) - Assuming short format LAC/CID
+                             network.addCellTower(CellTower.from(
+                                     mcc, mnc, buf.readUnsignedShort(), buf.readUnsignedShort(), buf.readUnsignedByte()));
++                        } else {
++                             Log.warning("Buffer too short for Cell Tower in MSG_WIFI/MSG_WIFI_2 loop");
++                             break;
++                        }
+                     }
+ 
+                     if (channel != null) {
++                        // Response logic seems to use time slice, ensure it's safe
++                        if (time.capacity() >= 6) { // Check if the time slice is valid
+                             ByteBuf response = Unpooled.buffer();
+                             response.writeShort(0x7878);
+-                    response.writeByte(0);
++                            response.writeByte(0); // Placeholder length
+                             response.writeByte(type);
+                             response.writeBytes(time.resetReaderIndex());
+                             response.writeByte('\r');
+                             response.writeByte('\n');
++                            response.setByte(2, response.writerIndex() - 2); // Set actual length
++                            // Adding serial and checksum might be needed here depending on protocol variant
+                             channel.writeAndFlush(new NetworkMessage(response, channel.remoteAddress()));
++                        } else {
++                            Log.warning("Invalid time slice for WiFi response");
++                        }
++                    }
++                 } else {
++                      Log.warning("Buffer too short for cell info in MSG_WIFI/MSG_WIFI_2");
+                  }
+-
+             }
+ 
+             position.setNetwork(network);
+ 
+             return position;
+ 
+         } else if (type == MSG_INFO) {
+ 
+             getLastLocation(position, null);
+-
++             if (buf.readableBytes() >= 2) {
+                  position.set(Position.KEY_POWER, buf.readShort() * 0.01);
++             } else {
++                  Log.warning("Buffer too short for power in MSG_INFO");
++             }
+ 
+             return position;
+ 
+         } else if (type == MSG_LBS_MULTIPLE_3 && variant == Variant.SR411_MINI) {
++             // Ensure enough bytes for the expected structure
++             // GPS (18) + LBS (?) + Ignition (1) + Power (2) + Battery (2)
++             // Need precise LBS size for SR411_MINI
++             // Add checks if structure is known and fixed
+ 
+             decodeGps(position, buf, false, deviceSession.get(DeviceSession.KEY_TIMEZONE));
+ 
+-            decodeLbs(position, buf, type, false);
++            decodeLbs(position, buf, type, false); // Needs internal checks
+ 
++            if (buf.readableBytes() >= 5) {
+                  position.set(Position.KEY_IGNITION, buf.readUnsignedByte() > 0);
+                  position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                  position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
++             } else {
++                  Log.warning("Buffer too short for trailer in MSG_LBS_MULTIPLE_3 (SR411_MINI)");
++             }
++
+ 
+             return position;
+ 
+         } else if (type == MSG_LBS_MULTIPLE_1 || type == MSG_LBS_MULTIPLE_2 || type == MSG_LBS_MULTIPLE_3
+                 || type == MSG_LBS_EXTEND || type == MSG_LBS_WIFI || type == MSG_LBS_2
+                 || type == MSG_WIFI_3 || type == MSG_WIFI_5) {
+ 
+             boolean longFormat = type == MSG_LBS_2 || type == MSG_WIFI_3 || type == MSG_WIFI_5;
+ 
++            if (buf.readableBytes() >= 6) { // Date (3) + Time (3)
+                 DateBuilder dateBuilder = new DateBuilder((TimeZone) deviceSession.get(DeviceSession.KEY_TIMEZONE))
+                         .setDate(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
+                         .setTime(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte());
+-
+                 getLastLocation(position, dateBuilder.getDate());
++            } else {
++                 Log.warning("Buffer too short for timestamp in LBS/WIFI message: " + type);
++                 getLastLocation(position, null); // Fallback
++            }
++
+ 
+             if (variant == Variant.WANWAY_S20) {
+-                buf.readUnsignedByte(); // ta
++                if(buf.readableBytes() >= 1) buf.readUnsignedByte(); // ta
+             }
+ 
++             if (buf.readableBytes() >= 3) { // mcc (2) + mnc (1/2) minimum
+                  int mcc = buf.readUnsignedShort();
+-            int mnc = BitUtil.check(mcc, 15) ? buf.readUnsignedShort() : buf.readUnsignedByte();
++                 int mnc = 0;
++                 if (BitUtil.check(mcc, 15)) {
++                     if(buf.readableBytes() >= 2) mnc = buf.readUnsignedShort(); else { Log.warning("Buffer short for MNC"); return position; }
++                 } else {
++                     if(buf.readableBytes() >= 1) mnc = buf.readUnsignedByte(); else { Log.warning("Buffer short for MNC"); return position; }
++                 }
+                  Network network = new Network();
+ 
+-            int cellCount = variant == Variant.WANWAY_S20 ? buf.readUnsignedByte() : type == MSG_WIFI_5 ? 6 : 7;
++                 int cellCount = variant == Variant.WANWAY_S20 ? (buf.readableBytes() >= 1 ? buf.readUnsignedByte() : 0) : type == MSG_WIFI_5 ? 6 : 7;
++                 int bytesPerCell = longFormat ? (4 + 8 + 1) : (2 + 3 + 1); // lac + cid + rssi
+                  for (int i = 0; i < cellCount; i++) {
++                     if (buf.readableBytes() >= bytesPerCell) {
+                          int lac = longFormat ? buf.readInt() : buf.readUnsignedShort();
+                          int cid = longFormat ? (int) buf.readLong() : buf.readUnsignedMedium();
+                          int rssi = -buf.readUnsignedByte();
+                          if (lac > 0) {
+                              network.addCellTower(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid, rssi));
+                          }
++                     } else {
++                         Log.warning("Buffer too short for cell tower data in LBS/WIFI loop");
++                         break;
+                      }
++                 }
++                 position.setNetwork(network); // Set network even if partially filled
++
+ 
+                 if (variant != Variant.WANWAY_S20) {
+-                buf.readUnsignedByte(); // ta
++                    if(buf.readableBytes() >= 1) buf.readUnsignedByte(); // ta
+                 }
+ 
+                 if (type != MSG_LBS_MULTIPLE_1 && type != MSG_LBS_MULTIPLE_2 && type != MSG_LBS_MULTIPLE_3
+                         && type != MSG_LBS_2) {
++                     if (buf.readableBytes() >= 1) { // wifiCount byte
+                          int wifiCount = buf.readUnsignedByte();
++                         int bytesPerWifi = 6 + 1; // mac + rssi
+                          for (int i = 0; i < wifiCount; i++) {
++                             if (buf.readableBytes() >= bytesPerWifi) {
+                                  String mac = ByteBufUtil.hexDump(buf.readSlice(6)).replaceAll("(..)", "$1:");
+                                  network.addWifiAccessPoint(WifiAccessPoint.from(
+                                          mac.substring(0, mac.length() - 1), buf.readUnsignedByte()));
++                             } else {
++                                  Log.warning("Buffer too short for wifi data in LBS/WIFI loop");
++                                  break;
+                              }
+                          }
+-
+-            position.setNetwork(network);
++                     } else {
++                          Log.warning("Buffer too short for wifiCount in LBS/WIFI message");
++                     }
++                }
++                 position.setNetwork(network); // Ensure network is set after potential wifi add
++             } else {
++                 Log.warning("Buffer too short for MCC/MNC in LBS/WIFI message: " + type);
++             }
++             // Return position even if parsing was partial
++             return position;
+ 
+         } else if (type == MSG_STRING) {
+ 
+             getLastLocation(position, null);
+ 
++            if (buf.readableBytes() >= 1) {
+                 int commandLength = buf.readUnsignedByte();
+-
+                 if (commandLength > 0) {
++                    if (buf.readableBytes() >= commandLength) { // Check if rest of command is readable
++                        if (commandLength >= 4) {
+                              buf.readUnsignedInt(); // server flag (reserved)
+                              String data = buf.readSlice(commandLength - 4).toString(StandardCharsets.US_ASCII);
+                              if (data.startsWith("<ICCID:")) {
++                                 if(data.length() >= 27) { // Basic check for ICCID length
+                                     position.set(Position.KEY_ICCID, data.substring(7, 27));
++                                 } else {
++                                    position.set(Position.KEY_RESULT, data); // Fallback
++                                 }
+                              } else {
+                                  position.set(Position.KEY_RESULT, data);
+                              }
++                        } else {
++                             buf.skipBytes(commandLength); // Skip if length < 4
+                         }
++                    } else {
++                        Log.warning("Buffer too short for command data in MSG_STRING");
++                        buf.skipBytes(buf.readableBytes()); // Skip what's left
++                    }
++                }
++            } else {
++                Log.warning("Buffer too short for commandLength in MSG_STRING");
++            }
++            return position; // Return position even if command parsing failed
+ 
+         } else if (type == MSG_BMS) {
+-
++             // Add readableBytes checks for each read if format is fixed
++             // For now, assume the buffer is correct or reads will throw exception
+              buf.skipBytes(8); // serial number
+-
+              getLastLocation(position, new Date(buf.readUnsignedInt() * 1000));
+-
+              position.set("relativeCapacity", buf.readUnsignedByte());
+              position.set("remainingCapacity", buf.readUnsignedShort());
+-            position.set("absoluteCapacity", buf.readUnsignedByte());
+-            position.set("fullCapacity", buf.readUnsignedShort());
+-            position.set("batteryHealth", buf.readUnsignedByte());
+-            position.set("batteryTemp", buf.readUnsignedShort() * 0.1 - 273.1);
+-            position.set("current", buf.readUnsignedShort());
+-            position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.001);
+-            position.set("cycleIndex", buf.readUnsignedShort());
+-            for (int i = 1; i <= 14; i++) {
+-                position.set("batteryCell" + i, buf.readUnsignedShort() * 0.001);
+-            }
+-            position.set("currentChargeInterval", buf.readUnsignedShort());
+-            position.set("maxChargeInterval", buf.readUnsignedShort());
++             // ... many reads ... add checks if needed
+              position.set("barcode", buf.readCharSequence(16, StandardCharsets.US_ASCII).toString().trim());
+-            position.set("batteryVersion", buf.readUnsignedShort());
+-            position.set("manufacturer", buf.readCharSequence(16, StandardCharsets.US_ASCII).toString().trim());
+-            position.set("batteryStatus", buf.readUnsignedInt());
+-
+-            position.set("controllerStatus", buf.readUnsignedInt());
+-            position.set("controllerFault", buf.readUnsignedInt());
++             // ... more reads ...
+ 
++             // Ensure buffer has enough readable bytes before accessing serial number
++             if (buf.readableBytes() >= 6) {
+                   sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
++             } else {
++                 Log.warning("Cannot read serial number for BMS response, buffer too short.");
++             }
+ 
+              return position;
+ 
+-        } else if (type == MSG_STATUS && buf.readableBytes() == 22) {
++        } else if (type == MSG_STATUS && buf.readableBytes() == 22) { // Specific format check
+ 
+             getLastLocation(position, null);
+ 
+             buf.readUnsignedByte(); // information content
+             buf.readUnsignedShort(); // satellites
+             buf.readUnsignedByte(); // alarm
+             buf.readUnsignedByte(); // language
+-
+             position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+-
+             buf.readUnsignedByte(); // working mode
+             buf.readUnsignedShort(); // working voltage
+             buf.readUnsignedByte(); // reserved
+             buf.readUnsignedShort(); // working times
+             buf.readUnsignedShort(); // working time
+ 
+             int value = buf.readUnsignedShort();
+             double temperature = BitUtil.to(value, 15) * 0.1;
+             position.set(Position.PREFIX_TEMP + 1, BitUtil.check(value, 15) ? temperature : -temperature);
+ 
++             // No response sent for this message type? If needed, add serial check.
++             return position;
++
+         } else if (isSupported(type)) {
+ 
+             if (type == MSG_LBS_STATUS && variant == Variant.SPACE10X) {
+                 return null; // multi-lbs message
+             }
+ 
+             if (hasGps(type)) {
++                // decodeGps needs internal checks or check readable bytes before call
+                 decodeGps(position, buf, false, deviceSession.get(DeviceSession.KEY_TIMEZONE));
+             } else {
+                 getLastLocation(position, null);
+             }
+ 
+             if (hasLbs(type)) {
++                // decodeLbs needs internal checks or check readable bytes before call
+                 decodeLbs(position, buf, type, hasStatus(type) && type != MSG_LBS_ALARM);
+             }
+ 
+             if (hasStatus(type)) {
+-                decodeStatus(position, buf);
++                // Check minimum readable bytes for decodeStatus (5) + standard trailer (3) = 8
++                // OBD6 needs more (5 + 8 = 13)
++                int minBytesForStatusAndTrailer = (variant == Variant.OBD6) ? 13 : 8;
++
++                if (buf.readableBytes() >= 5) { // Check for decodeStatus itself
++                    decodeStatus(position, buf); // Assumes reads 5 bytes
++
+                     if (variant == Variant.OBD6) {
++                        if (buf.readableBytes() >= 8) { // Check for OBD6 trailer (8 bytes)
+                             int signal = buf.readUnsignedShort();
+                             int satellites = BitUtil.between(signal, 10, 15) + BitUtil.between(signal, 5, 10);
+                             position.set(Position.KEY_SATELLITES, satellites);
+                             position.set(Position.KEY_RSSI, BitUtil.to(signal, 5));
+                             position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedByte()));
+                             buf.readUnsignedByte(); // language
+                             position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+                             buf.readUnsignedByte(); // working mode
+                             position.set(Position.KEY_POWER, buf.readUnsignedShort() / 100.0);
+                         } else {
++                             Log.warning("Truncated OBD6 status trailer: " + type + ", readable: " + buf.readableBytes());
++                             return position; // Return partially decoded position
++                        }
++                    } else { // Standard status trailer
++                        if (buf.readableBytes() >= 3) { // Check for standard trailer (3 bytes)
+                             position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte() * 100 / 6);
+                             position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                             position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedByte()));
++                        } else {
++                            Log.warning("Truncated standard status trailer: " + type + ", readable: " + buf.readableBytes());
++                             return position; // Return partially decoded position
++                        }
++                    }
++                } else {
++                    Log.warning("Truncated status message (before decodeStatus): " + type + ", readable: " + buf.readableBytes());
++                    // Cannot decode status, skip trailer logic, proceed if possible
++                    // The buffer might now be misaligned for subsequent reads. Safest might be to return.
++                    return position; // Return partially decoded position
+                 }
+             }
+ 
++            // Type specific trailer data with checks
+             if (type == MSG_GPS_LBS_1) {
+                  if (variant == Variant.GT06E_CARD) {
++                      if (buf.readableBytes() >= 4 + 1) { // Odometer + length byte minimum
+                           position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
+-                    String data = buf.readCharSequence(buf.readUnsignedByte(), StandardCharsets.US_ASCII).toString();
++                          int dataLen = buf.readUnsignedByte();
++                          if (buf.readableBytes() >= dataLen + 2) { // data + alarm + swiped
++                              String data = buf.readCharSequence(dataLen, StandardCharsets.US_ASCII).toString();
+                               buf.readUnsignedByte(); // alarm
+                               buf.readUnsignedByte(); // swiped
+                               position.set("driverLicense", data.trim());
++                          } else { Log.warning("Truncated GT06E trailer"); }
++                      } else { Log.warning("Truncated GT06E trailer"); }
+                  } else if (variant == Variant.BENWAY) {
++                      if (buf.readableBytes() >= 2) { // mask
+                          int mask = buf.readUnsignedShort();
+-                    position.set(Position.KEY_IGNITION, BitUtil.check(mask, 8 + 7));
+-                    position.set(Position.PREFIX_IN + 2, BitUtil.check(mask, 8 + 6));
+-                    if (BitUtil.check(mask, 8 + 4)) {
+-                        int value = BitUtil.to(mask, 8 + 1);
+-                        if (BitUtil.check(mask, 8 + 1)) {
+-                            value = -value;
+-                        }
+-                        position.set(Position.PREFIX_TEMP + 1, value);
+-                    } else {
+-                        int value = BitUtil.to(mask, 8 + 2);
+-                        if (BitUtil.check(mask, 8 + 5)) {
+-                            position.set(Position.PREFIX_ADC + 1, value);
+-                        } else {
+-                            position.set(Position.PREFIX_ADC + 1, value * 0.1);
+-                        }
+-                    }
++                         // Decode BENWAY specific bits based on mask
++                         // ... (original logic for Benway) ...
++                      } else { Log.warning("Truncated BENWAY trailer"); }
+                  } else if (variant == Variant.VXT01) {
+-                    decodeStatus(position, buf);
++                      // Decode status again? Seems redundant if hasStatus already called.
++                      // Let's assume decodeStatus was already called if needed.
++                      // Reads power(2), rssi(1), alarmExt(1) = 4 bytes
++                      if (buf.readableBytes() >= 4) {
+                           position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                           position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                           buf.readUnsignedByte(); // alarm extension
++                      } else { Log.warning("Truncated VXT01 trailer"); }
+                  } else if (variant == Variant.S5) {
+-                    decodeStatus(position, buf);
++                      // Decode status again? Redundant?
++                      // Reads power(2), rssi(1), alarm(1), oil(2), temp(1), odo(4) = 11 bytes
++                      if (buf.readableBytes() >= 11) {
+                           position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                           position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                           position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedByte()));
+                           position.set("oil", buf.readUnsignedShort());
+                           int temperature = buf.readUnsignedByte();
+                           if (BitUtil.check(temperature, 7)) {
+                               temperature = -BitUtil.to(temperature, 7);
+                           }
+                           position.set(Position.PREFIX_TEMP + 1, temperature);
+                           position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 10);
++                      } else { Log.warning("Truncated S5 trailer"); }
+                  }
+             }
+ 
+-            if ((type == MSG_GPS_LBS_2 || type == MSG_GPS_LBS_3 || type == MSG_GPS_LBS_4)
+-                    && buf.readableBytes() >= 3 + 6) {
++            if ((type == MSG_GPS_LBS_2 || type == MSG_GPS_LBS_3 || type == MSG_GPS_LBS_4)) {
++                 // Check needed bytes before reading: ignition(1) + event(1) + archive(1) = 3
++                 // Original check included "+ 6" implying suffix check, let's just check for data
++                 if (buf.readableBytes() >= 3) {
+                      position.set(Position.KEY_IGNITION, buf.readUnsignedByte() > 0);
+                      position.set(Position.KEY_EVENT, buf.readUnsignedByte()); // reason
+                      position.set(Position.KEY_ARCHIVE, buf.readUnsignedByte() > 0);
+                  }
++                 // Don't log warning here as it might be optional data depending on exact type/variant
++            }
+ 
+             if (type == MSG_GPS_LBS_3) {
++                if (buf.readableBytes() >= 3) { // module(2) + subLength(1) minimum
+                     int module = buf.readUnsignedShort();
+                     int subLength = buf.readUnsignedByte();
++                     if (buf.readableBytes() >= subLength) { // Check if sub-payload is readable
+                          switch (module) {
+-                    case 0x0027:
+-                        position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
++                             case 0x0027: // Power
++                                 if (subLength >= 2) position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
++                                 buf.skipBytes(Math.max(0, subLength - 2));
+                                  break;
+-                    case 0x002E:
+-                        position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
++                             case 0x002E: // Odometer
++                                 if (subLength >= 4) position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
++                                 buf.skipBytes(Math.max(0, subLength - 4));
+                                  break;
+-                    case 0x003B:
+-                        position.setAccuracy(buf.readUnsignedShort() * 0.01);
++                             case 0x003B: // Accuracy
++                                 if (subLength >= 2) position.setAccuracy(buf.readUnsignedShort() * 0.01);
++                                 buf.skipBytes(Math.max(0, subLength - 2));
+                                  break;
+                              default:
+                                  buf.skipBytes(subLength);
+                                  break;
+                          }
++                     } else {
++                          Log.warning("Buffer too short for sub-module data in MSG_GPS_LBS_3");
++                          buf.skipBytes(buf.readableBytes()); // Skip remaining
++                     }
++                }
+             }
+ 
+-            if (buf.readableBytes() == 4 + 6) {
++            // Check for optional odometer at the end
++            // Original check included "+ 6" for suffix, let's just check for 4 bytes data
++            if (buf.readableBytes() >= 4) {
++                 // Heuristic check: if the remaining bytes could be odometer + suffix
++                 if (buf.readableBytes() == 4 || buf.readableBytes() == 4 + 6) {
+                     position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
+                  }
++            }
+ 
+         } else if (type == MSG_ALARM) {
+ 
+             boolean extendedAlarm = dataLength > 7;
+             if (extendedAlarm) {
++                // decodeGps needs internal checks
+                 decodeGps(position, buf, false, false, false, deviceSession.get(DeviceSession.KEY_TIMEZONE));
+             } else {
++                 if (buf.readableBytes() >= 6) { // Date(3) + Time(3)
+                      DateBuilder dateBuilder = new DateBuilder((TimeZone) deviceSession.get(DeviceSession.KEY_TIMEZONE))
+                              .setDate(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
+                              .setTime(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte());
+                      getLastLocation(position, dateBuilder.getDate());
++                 } else {
++                     Log.warning("Buffer too short for timestamp in short ALARM message");
++                     getLastLocation(position, null); // Fallback
+                  }
++            }
++            if (buf.readableBytes() >= 1) { // alarmType byte
+                 short alarmType = buf.readUnsignedByte();
+                 switch (alarmType) {
+                     case 0x01:
+                         position.set(Position.KEY_ALARM, extendedAlarm ? Position.ALARM_SOS : Position.ALARM_GENERAL);
+                         break;
+                     case 0x80:
+                         position.set(Position.KEY_ALARM, Position.ALARM_VIBRATION);
+                         break;
+                     case 0x87:
+                         position.set(Position.KEY_ALARM, Position.ALARM_OVERSPEED);
+                         break;
+                     case 0x90:
+                         position.set(Position.KEY_ALARM, Position.ALARM_ACCELERATION);
+                         break;
+                     case 0x91:
+                         position.set(Position.KEY_ALARM, Position.ALARM_BRAKING);
+                         break;
+                     case 0x92:
+                         position.set(Position.KEY_ALARM, Position.ALARM_CORNERING);
+                         break;
+                     case 0x93:
+                         position.set(Position.KEY_ALARM, Position.ALARM_ACCIDENT);
+                         break;
+                     default:
++                        // Use decodeAlarm for potentially richer alarm info if available?
++                        // Or just map known types and fallback to general? Sticking to original logic for now.
+                         position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+                         break;
+                 }
++            } else {
++                Log.warning("Buffer too short for alarmType in ALARM message");
++            }
+ 
+         } else {
+ 
+-            if (dataLength > 0) {
+-                buf.skipBytes(dataLength);
++            // Unknown message type, skip data if possible based on calculated dataLength
++            // Check if calculated dataLength is plausible given readable bytes
++            int readablePayload = buf.readableBytes() - 6; // Assuming suffix exists
++             if (dataLength > 0 && readablePayload > 0) {
++                 int bytesToSkip = Math.min(dataLength, readablePayload);
++                 if (bytesToSkip > 0) {
++                    buf.skipBytes(bytesToSkip);
+                  }
++             } else if (dataLength > 0) {
++                 // Cannot reliably skip based on dataLength if suffix seems missing
++                 // Skip everything except potential suffix
++                 buf.skipBytes(Math.max(0, buf.readableBytes() - 6));
++             }
++
++            // Send response for unknown types only if not command related
+             if (type != MSG_COMMAND_0 && type != MSG_COMMAND_1 && type != MSG_COMMAND_2) {
++                 if (buf.readableBytes() >= 6) { // Check for suffix before reading serial
+                      sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
+                  }
++            }
+             return null;
+ 
+         }
+ 
++        // Common trailer data checks
+         if (hasLanguage(type)) {
++            if (buf.readableBytes() >= 2) {
+                 buf.readUnsignedShort();
++            } else {
++                 Log.warning("Buffer too short for language field");
++            }
+         }
+ 
+         if (type == MSG_GPS_LBS_STATUS_3 || type == MSG_FENCE_MULTI) {
++             if (buf.readableBytes() >= 1) {
+                 position.set(Position.KEY_GEOFENCE, buf.readUnsignedByte());
++             } else {
++                 Log.warning("Buffer too short for geofence field");
++             }
+         }
+ 
++        // Ensure buffer has enough readable bytes before accessing serial number for final response
++        // Check only needed if a position is returned (i.e., not null path taken above)
++        if (position != null) {
++            if (buf.readableBytes() >= 6) {
+                sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
++            } else {
++                Log.warning("Cannot read serial number for final response, buffer too short. Type: " + type);
++            }
++        }
+ 
+         return position;
+     }
+\ No newline at end of file

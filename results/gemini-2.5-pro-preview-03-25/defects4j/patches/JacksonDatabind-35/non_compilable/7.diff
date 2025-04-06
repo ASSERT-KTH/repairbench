@@ -1,0 +1,96 @@
+diff --git a/tmp/e2a0a2f4-3411-49be-b738-9b81a8b68ebc_buggy.java b/tmp/2aca7d32-ab67-44a9-9730-0280179c0f32_fixed.java
+index 7d8d756..cd0073e 100644
+--- a/tmp/e2a0a2f4-3411-49be-b738-9b81a8b68ebc_buggy.java
++++ b/tmp/2aca7d32-ab67-44a9-9730-0280179c0f32_fixed.java
+@@ -1,48 +1,71 @@
+     /**
+      * Method that handles type information wrapper, locates actual
+      * subtype deserializer to use, and calls it to do actual
+      * deserialization.
++     * Assumes that START_OBJECT wrapper has been consumed and parser is pointing at the
++     * FIELD_NAME that contains type id.
+      */
+     @SuppressWarnings("resource")
+     private final Object _deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+     {
+         // 02-Aug-2013, tatu: May need to use native type ids
+         if (p.canReadTypeId()) {
+             Object typeId = p.getTypeId();
+             if (typeId != null) {
++                // Delegate to native handling if possible
+                 return _deserializeWithNativeTypeId(p, ctxt, typeId);
+             }
+         }
+-        // first, sanity checks
+-        if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+-            throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+-                    "need JSON Object to contain As.WRAPPER_OBJECT type information for class "+baseTypeName());
+-        }
+-            // should always get field name, but just in case...
+-            if (p.nextToken() != JsonToken.FIELD_NAME) {
++
++        // Sanity check: verify we have FIELD_NAME, which indicates the type id
++        // This is the token stream state as expected when called via
++        // TypeDeserializer.deserializeTypedFromAny -> deserializeTypedFromObject
++        if (p.getCurrentToken() != JsonToken.FIELD_NAME) {
+             throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                     "need JSON String that contains type id (for subtype of "+baseTypeName()+")");
+         }
++
++        // Read the type id from the field name
+         final String typeId = p.getText();
+         JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeId);
+-        p.nextToken();
++
++        // Advance to the value token; for WRAPPER_OBJECT this should be START_OBJECT
++        if (p.nextToken() != JsonToken.START_OBJECT) {
++            throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT, String.format(
++                    "need JSON Object to contain the value for subtype `%s` (of base type %s)",
++                    typeId, baseTypeName()));
++        }
+ 
+         // Minor complication: we may need to merge type id in?
+-        if (_typeIdVisible && p.getCurrentToken() == JsonToken.START_OBJECT) {
+-            // but what if there's nowhere to add it in? Error? Or skip? For now, skip.
+-            TokenBuffer tb = new TokenBuffer(null, false);
+-            tb.writeStartObject(); // recreate START_OBJECT
+-            tb.writeFieldName(_typePropertyName);
+-            tb.writeString(typeId);
++        // (mostly for JAXB tooling compatibility features)
++        if (_typeIdVisible) {
++             // Need to create TokenBuffer that contains the type id as property,
++             // merge with the actual value object stream.
++             TokenBuffer tb = new TokenBuffer(p, ctxt); // Using 'p' for context
++             tb.writeStartObject(); // {
++             tb.writeFieldName(_typePropertyName); // "typeIdFieldName" :
++             tb.writeString(typeId); // "actualTypeId"
++
++             // Logic from original code: combine buffer with original parser using sequence.
++             // 'p' is currently at START_OBJECT of the value.
+              p = JsonParserSequence.createFlattened(tb.asParser(p), p);
+-            p.nextToken();
++
++             // And advance past the START_OBJECT simulated by the buffer
++             // The JsonParserSequence starts with the buffer's START_OBJECT.
++             p.nextToken(); // Now p points to the FIELD_NAME from the buffer
+         }
+         
++        // Deserialize the actual value object using the concrete deserializer found
++        // The parser 'p' is either the original parser pointing to START_OBJECT of the value,
++        // or the sequence parser pointing to the injected FIELD_NAME (_typePropertyName).
+         Object value = deser.deserialize(p, ctxt);
+-        // And then need the closing END_OBJECT
+-        if (p.nextToken() != JsonToken.END_OBJECT) {
+-            throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+-                    "expected closing END_OBJECT after type information and deserialized value");
+-        }
++
++        // Crucial: We should NOT consume the closing END_OBJECT of the wrapper object.
++        // The caller, typically looping (like CollectionDeserializer), is responsible
++        // for advancing the parser state after this method returns. This method's scope
++        // ends after processing the value associated with the type id field name.
++        // `deser.deserialize()` consumes the value object stream (e.g. { ... }), leaving
++        // 'p' positioned AFTER the value's closing token (e.g. END_OBJECT).
++        
+         return value;
+     }

@@ -1,0 +1,172 @@
+diff --git a/tmp/2766df89-c3d8-4fc5-8574-68d29ac142e2_buggy.java b/tmp/068903ed-9825-4737-9b2c-4d72bd642214_fixed.java
+index 5bc9804..c955104 100644
+--- a/tmp/2766df89-c3d8-4fc5-8574-68d29ac142e2_buggy.java
++++ b/tmp/068903ed-9825-4737-9b2c-4d72bd642214_fixed.java
+@@ -1,85 +1,156 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithExternalTypeId(JsonParser p, DeserializationContext ctxt)
+         throws IOException
+     {
+         final ExternalTypeHandler ext = _externalTypeIdHandler.start();
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
+-        TokenBuffer tokens = new TokenBuffer(p);
++        // 26-Feb-2015, tatu: Need to allow buffering of unknown properties, too,
++        //   for cases where we may need to merge information later.
++        // 16-Aug-2017, tatu: As per [databind#1734], need context for `copyCurrentStructure`
++        TokenBuffer tokens = new TokenBuffer(p, ctxt);
+         tokens.writeStartObject();
+ 
+         JsonToken t = p.getCurrentToken();
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
+             p.nextToken(); // to point to value
++
+             // creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
+                 // first: let's check to see if this might be part of value with external type id:
+                 // 11-Sep-2015, tatu: Important; do NOT pass buffer as last arg, but null,
+-                //   since it is not the bean
++                //   since it is not the bean. Per [databind#939], must check type handler first.
++                //   (prior to buffer.assignParameter())
++                // 03-Jan-2016, tatu: Also, need to distinguish between value-property-that-is-creator-property
++                //   and type-id-property-that-is-creator-property. If it's type-id, value needs
++                //   to be passed; if value-property, null.
++                //   Looks like `handlePropertyValue` does now handle this distinction.
++                 //   (by checking `prop.getMetadata().isTypeId()`)
++
++                // Fix for [databind#928]: check for possible type handler property FIRST
++                // 17-Jan-2018, tatu: Need to pass buffer, not null, per logic in ExternalTypeHandler
++                //   (use of buffer classifying non-bean parameter source)
+                 if (ext.handlePropertyValue(p, ctxt, propName, buffer)) {
++                    // Handled by type handler, skip buffer assignParameter below
+                     ;
+                 } else {
+-                    // Last creator property to set?
++                    // If not handled by type handler, just assign parameter value:
+                     if (buffer.assignParameter(creatorProp, _deserializeWithErrorWrapping(p, ctxt, creatorProp))) {
+                         t = p.nextToken(); // to move to following FIELD_NAME/END_OBJECT
+                         Object bean;
+                         try {
+                             bean = creator.build(ctxt, buffer);
+                         } catch (Exception e) {
+-                            wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+-                            continue; // never gets here
++                            // 24-Mar-2017, tatu: Note: must wrap here since we can't add checked
++                            //   exceptions to signature, and various places won't catch it otherwise
++                             // 15-Jan-2019, tatu: Also, with [databind#2221], need to call `ext.complete()` possibly
++                             //   Note that `p` is now likely pointing to FIELD_NAME for which value has
++                             //   not yet been consumed. Need to check... yes, points to FIELD_NAME or END_OBJECT.
++                             // 06-Mar-2019, tatu: Should NOT call `ext.complete` but let caller do that... How?
++                             //   Need to reconsider this part, but for now, do not call `complete`.
++                             // return ext.complete(p, ctxt, bean);
++                            return wrapInstantiationProblem(e, ctxt);
+                         }
+                         // if so, need to copy all remaining tokens into buffer
++                        // NOTE: If we hit here, consider merging with 'unwrapped' handling?
+                         while (t == JsonToken.FIELD_NAME) {
+-                            p.nextToken(); // to skip name
++                            // NOTE: do NOT skip name as we need to feed it to buffer
++                            // 16-Aug-2017, tatu: ... and MUST buffer FIELD_NAME first
++                            tokens.writeFieldName(p.getCurrentName());
++                            p.nextToken();
+                             tokens.copyCurrentStructure(p);
+                             t = p.nextToken();
+                         }
++                        // Must ensure END_OBJECT is copied too
++                        if (t != JsonToken.END_OBJECT) {
++                             // 17-Jan-2018, tatu: Need to skip END_OBJECT, too... ? For now, report error
++                             ctxt.reportWrongTokenException(bean, JsonToken.END_OBJECT,
++                                     "Attempted to create External type instance using property-based workflow from %s",
++                                     p.currentToken());
++                        }
++                        // We must be pointing to `END_OBJECT`, so append that to buffer
++                        tokens.writeEndObject();
++                        // [databind#1390]: check for type compatibility, possibly handle polymorphic cases
+                         if (bean.getClass() != _beanType.getRawClass()) {
+-                            // !!! 08-Jul-2011, tatu: Could theoretically support; but for now
+-                            //   it's too complicated, so bail out
+-                            throw ctxt.mappingException("Can not create polymorphic instances with unwrapped values");
++                             // 19-Jun-2017, tatu: As per [databind#1390], need to attach accumulated tokens for processing
++                             //   (although maybe this is wrong expectation? But for now seems necessary)
++                             // 16-Aug-2017, tatu: Actually, need to process buffered tokens first, THEN complete
++                             //   Ext type handler? Reverse the order perhaps? Need to investigate
++                             // 17-Jan-2018, tatu: Not quite sure what to do but report for now
++                             return ctxt.reportBadDefinition(_beanType, String.format(
++                                     "Cannot create polymorphic instances with external type ids (%s -> %s)",
++                                     _beanType, bean.getClass()));
+                         }
+-                        return ext.complete(p, ctxt, bean);
++                        // We don't need buffered tokens, just the bean:
++                         // 06-Mar-2019, tatu: ... except we might? Merging required for buffer?
++                         // For now, pass buffer which only has creator parameters, and `tokens` has remaining buffered stuff.
++                         // `ext.complete` needs to be able to handle this mixture...
++                         return ext.complete(p, ctxt, bean, tokens.asParser(p));
+                     }
+                 }
++                // Processing of creator property handled (either buffer assignment or ext handler), move to next
+                 continue;
+             }
++
+             // Object Id property?
+             if (buffer.readIdProperty(propName)) {
+                 continue;
+             }
+             // regular property? needs buffering
+             SettableBeanProperty prop = _beanProperties.find(propName);
+             if (prop != null) {
+                 buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+                 continue;
+             }
++
+             // external type id (or property that depends on it)?
++            // Important: this MUST be called AFTER creator property checks,
++            // mostly because it must NOT be called for creator properties -- ONLY
++            // for regular bean properties, or name of type id property itself.
++            // 17-Jan-2018, tatu: Pass `null` to indicate it's not a Creator property:
+             if (ext.handlePropertyValue(p, ctxt, propName, null)) {
+                 continue;
+             }
++
+             /* As per [JACKSON-313], things marked as ignorable should not be
+              * passed to any setter
+              */
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+                 handleIgnoredProperty(p, ctxt, handledType(), propName);
+                 continue;
+             }
+             // "any property"?
+             if (_anySetter != null) {
++                 // TODO: should this be done? Check [databind#939] coverage
++                 try {
+                      buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
++                 } catch (Exception e) {
++                     wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+                  }
++                 continue; // 02-Feb-2017, tatu: was missing continue
++            }
++
++            // Unknown property? Add to tokens to be processed when actual instance is built
++            // Need to copy name first
++            tokens.writeFieldName(propName);
++            tokens.copyCurrentStructure(p);
+         }
+ 
+         // We hit END_OBJECT; resolve the pieces:
+         try {
++            // We must have collected all creator properties by now, buffer has them
++            // 16-Aug-2017, tatu: As per [databind#1734] need to pass buffered tokens too
++            //    (if any), as they may be needed for merging etc.
++            // 06-Mar-2019, tatu: Since `tokens` may be needed, pass both `buffer` and possibly `tokens`
++            //    to `ext.complete`? Requires new method signature, or perhaps `tokens` passed as parser?
++            //    Actually... seems better to simply pass `buffer` and `creator`, and required `ext.complete`
++            //    to know it MUST use `creator` with `buffer`
+              return ext.complete(p, ctxt, buffer, creator);
+         } catch (Exception e) {
+             wrapInstantiationProblem(e, ctxt);
+             return null; // never gets here
+         }
+     }
+\ No newline at end of file

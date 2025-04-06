@@ -1,0 +1,193 @@
+diff --git a/tmp/61a4e93a-1dee-41d5-b99a-19e7a61d1025_buggy.java b/tmp/53a240f7-9666-4de9-b169-edc6529c454e_fixed.java
+index 7d7ab59..5fbc1ef 100644
+--- a/tmp/61a4e93a-1dee-41d5-b99a-19e7a61d1025_buggy.java
++++ b/tmp/53a240f7-9666-4de9-b169-edc6529c454e_fixed.java
+@@ -1,124 +1,144 @@
+   /**
+    * Attempts to minimize the number of explicit exit points in a control
+    * structure to take advantage of the implied exit at the end of the
+    * structure.  This is accomplished by removing redundant statements, and
+    * moving statements following a qualifying IF node into that node.
+    * For example:
+    *
+    * function () {
+    *   if (x) return;
+    *   else blah();
+    *   foo();
+    * }
+    *
+    * becomes:
+    *
+    * function () {
+    *  if (x) ;
+    *  else {
+    *    blah();
+    *    foo();
+    *  }
+    *
+    * @param n The execution node of a parent to inspect.
+    * @param exitType The type of exit to look for.
+    * @param labelName If parent is a label the name of the label to look for,
+    *   null otherwise.
+    * @nullable labelName non-null only for breaks within labels.
+    */
+   void tryMinimizeExits(Node n, int exitType, String labelName) {
+ 
+     // Just an 'exit'.
+     if (matchingExitNode(n, exitType, labelName)) {
+       NodeUtil.removeChild(n.getParent(), n);
+       compiler.reportCodeChange();
+       return;
+     }
+ 
+-    // Just an 'if'.
++    // Recurse into child structures. These recursive calls handle minimizing
++    // exits within the sub-structures. We don't return after these calls
++    // because the container node itself (if it's a block or is the last
++    // statement in a block) might be processed by the logic below.
++
+     if (n.isIf()) {
+       Node ifBlock = n.getFirstChild().getNext();
+       tryMinimizeExits(ifBlock, exitType, labelName);
+       Node elseBlock = ifBlock.getNext();
+       if (elseBlock != null) {
+         tryMinimizeExits(elseBlock, exitType, labelName);
+       }
+-      return;
+-    }
+-
+-    // Just a 'try/catch/finally'.
+-    if (n.isTry()) {
++    } else if (n.isTry()) {
+       Node tryBlock = n.getFirstChild();
+       tryMinimizeExits(tryBlock, exitType, labelName);
+       Node allCatchNodes = NodeUtil.getCatchBlock(n);
+       if (NodeUtil.hasCatchHandler(allCatchNodes)) {
++        // TODO(johnlenz): Handle multi-catch properly.
+         Preconditions.checkState(allCatchNodes.hasOneChild());
+         Node catchNode = allCatchNodes.getFirstChild();
+         Node catchCodeBlock = catchNode.getLastChild();
+         tryMinimizeExits(catchCodeBlock, exitType, labelName);
+       }
+-      /* Don't try to minimize the exits of finally blocks, as this
+-       * can cause problems if it changes the completion type of the finally
+-       * block. See ECMA 262 Sections 8.9 & 12.14
+-       */
+-      if (NodeUtil.hasFinally(n)) {
+-        Node finallyBlock = n.getLastChild();
+-        tryMinimizeExits(finallyBlock, exitType, labelName);
+-      }
+-    }
+-
+-    // Just a 'label'.
+-    if (n.isLabel()) {
++      // DO NOT process the finally block. Minimizing exits in finally blocks
++      // is problematic due to ECMA 262 control flow rules.
++      // See ECMA 262 Sections 8.9 & 12.14.
++      // if (NodeUtil.hasFinally(n)) {
++      //   Node finallyBlock = n.getLastChild();
++      //   tryMinimizeExits(finallyBlock, exitType, labelName); // This was the bug
++      // }
++    } else if (n.isLabel()) {
+       Node labelBlock = n.getLastChild();
+       tryMinimizeExits(labelBlock, exitType, labelName);
++    } else if (n.isSwitch()) {
++      // TODO(johnlenz): Handle switches properly by recursing into CASE blocks.
++      // It's complex because exits in one case can affect the next.
++      // For now, do nothing with the switch structure itself,
++      // allowing block processing below if the switch is in a block.
+     }
+ 
+-    // TODO(johnlenz): The last case of SWITCH statement?
+-
+-    // The rest assumes a block with at least one child, bail on anything else.
+-    if (!n.isBlock() || n.getLastChild() == null) {
++    // Block-level optimizations:
++    // These only apply if the current node 'n' is a BLOCK node.
++    if (!n.isBlock()) {
+       return;
+     }
+ 
+-    // Multiple if-exits can be converted in a single pass.
+-    // Convert "if (blah) break;  if (blah2) break; other_stmt;" to
+-    // become "if (blah); else { if (blah2); else { other_stmt; } }"
+-    // which will get converted to "if (!blah && !blah2) { other_stmt; }".
+-    for (Node c : n.children()) {
++    // Optimization 1: Process IF statements within this block.
++    // The helper tryMinimizeIfBlockExits is responsible for moving code
++    // following an IF into the appropriate branch if the other branch exits.
++    // We need to iterate carefully in case tryMinimizeIfBlockExits modifies
++    // the sibling structure.
++    Node c = n.getFirstChild();
++    while (c != null) {
++      Node next = c.getNext(); // Save the next sibling before processing 'c'
+ 
+-      // An 'if' block to process below.
+       if (c.isIf()) {
+         Node ifTree = c;
+         Node trueBlock, falseBlock;
+ 
+-        // First, the true condition block.
++        // Process the THEN block exit possibility.
+         trueBlock = ifTree.getFirstChild().getNext();
+         falseBlock = trueBlock.getNext();
+-        tryMinimizeIfBlockExits(trueBlock, falseBlock,
+-            ifTree, exitType, labelName);
++        tryMinimizeIfBlockExits(trueBlock, falseBlock, ifTree, exitType, labelName);
+ 
+-        // Now the else block.
+-        // The if blocks may have changed, get them again.
++        // Re-fetch blocks, as tryMinimizeIfBlockExits might have changed them
++        // (e.g., by creating an ELSE block).
+         trueBlock = ifTree.getFirstChild().getNext();
+         falseBlock = trueBlock.getNext();
++
++        // Process the ELSE block exit possibility.
+         if (falseBlock != null) {
+-          tryMinimizeIfBlockExits(falseBlock, trueBlock,
+-              ifTree, exitType, labelName);
++          tryMinimizeIfBlockExits(falseBlock, trueBlock, ifTree, exitType, labelName);
+         }
+       }
++      // Add handling for other structures like SWITCH here if needed in the future.
+ 
+-      if (c == n.getLastChild()) {
+-        break;
++      c = next; // Move to the next node that was originally after 'c'.
+     }
++
++    // Optimization 2: Remove redundant exit at the end of the block.
++    // If the last statement in the block is the exit we're looking for,
++    // remove it. Repeat if the new last statement is also such an exit.
++    while (true) {
++        Node lastChild = n.getLastChild();
++        if (lastChild == null) {
++            break; // Block is empty.
+         }
+ 
+-    // Now try to minimize the exits of the last child, if it is removed
+-    // look at what has become the last child.
+-    for (Node c = n.getLastChild(); c != null; c = n.getLastChild()) {
+-      tryMinimizeExits(c, exitType, labelName);
+-      // If the node is still the last child, we are done.
+-      if (c == n.getLastChild()) {
++        // Store the original state to detect removal.
++        Node lastChildParent = lastChild.getParent();
++
++        // Try to minimize the last child. This might be a recursive call
++        // (if it's an IF/TRY/LABEL/BLOCK) or it might remove the node
++        // directly if it's a matching simple exit node.
++        tryMinimizeExits(lastChild, exitType, labelName);
++
++        // Check if the last child node instance is still attached to 'n'
++        // and is still the last child. If tryMinimizeExits removed it,
++        // its parent will change or n.getLastChild() will point to a different node.
++        if (lastChild.getParent() == lastChildParent && n.getLastChild() == lastChild) {
++            // The node was not removed by the recursive call. Stop processing this block.
+             break;
+         }
++        // The last child was removed or replaced. Loop again to process the
++        // new last child (if any).
+     }
+   }
+\ No newline at end of file

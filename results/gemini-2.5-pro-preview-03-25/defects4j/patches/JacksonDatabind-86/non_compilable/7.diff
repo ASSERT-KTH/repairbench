@@ -1,0 +1,178 @@
+diff --git a/tmp/3f59c6b7-273a-4908-bd7d-4d14fdfbe231_buggy.java b/tmp/b7276d39-601d-45db-8ab6-28f4d9147cd0_fixed.java
+index e69de29..05cacee 100644
+--- a/tmp/3f59c6b7-273a-4908-bd7d-4d14fdfbe231_buggy.java
++++ b/tmp/b7276d39-601d-45db-8ab6-28f4d9147cd0_fixed.java
+@@ -0,0 +1,172 @@
++	protected JavaType _fromClass(ClassStack context, Class<?> cl, TypeBindings bindings)
++	{
++		// Sanity check: cannot handle array types with this method
++		if (cl.isArray()) {
++			// Neither can we do with this one.
++			// ... note: we could actually deal with array-types, possibly
++			// (depending on whether constructing array types recursively makes sense)
++			// but for now this seems safest:
++			return ArrayType.construct(_fromAny(context, cl.getComponentType(), bindings), bindings);
++		}
++		// Also, no Enums
++		if (cl.isEnum()) {
++			return EnumType.construct(cl, bindings);
++		}
++		// Map?
++		if (Map.class.isAssignableFrom(cl)) {
++			// Need to check if we need bindings for generic types
++			if (cl == Properties.class) {
++				return MapType.construct(cl, bindings, CORE_TYPE_OBJECT, CORE_TYPE_STRING, CORE_TYPE_STRING);
++			}
++			JavaType[] mapParams = findTypeParameters(context, cl, Map.class, bindings);
++			// ok, need 2 type parameters
++			JavaType keyType, contentType;
++			switch (mapParams.length) {
++			case 0: // parameters not defined, use defaults
++				keyType = contentType = CORE_TYPE_OBJECT;
++				break;
++			case 2:
++				keyType = mapParams[0];
++				contentType = mapParams[1];
++				break;
++			default:
++			    throw new IllegalArgumentException("Strange Map type "+cl.getName()+": can not determine type parameters");
++			}
++			return MapType.construct(cl, bindings, _fromClass(context, cl.getSuperclass(), bindings), keyType, contentType);
++		}
++		// Collection?
++		if (Collection.class.isAssignableFrom(cl)) {
++			JavaType[] collectionParams = findTypeParameters(context, cl, Collection.class, bindings);
++			JavaType elementType;
++			if (collectionParams.length == 0) { // raw type
++			     elementType = CORE_TYPE_OBJECT;
++			} else if (collectionParams.length == 1) {
++				elementType = collectionParams[0];
++			} else {
++				throw new IllegalArgumentException("Strange Collection type "+cl.getName()+": can not determine type parameters");
++			}
++			return CollectionType.construct(cl, bindings, _fromClass(context, cl.getSuperclass(), bindings), elementType);
++		}
++
++        // ReferenceType? (New for 2.6)
++		// 18-Sep-2017, tatu: Should probably consider an annotation for selecting this...
++		if (AtomicReference.class.isAssignableFrom(cl)) {
++		    JavaType[] refParams = findTypeParameters(context, cl, AtomicReference.class, bindings);
++		    JavaType referencedType;
++		    if (refParams.length == 0) { // raw type
++		        referencedType = CORE_TYPE_OBJECT;
++		    } else {
++		        referencedType = refParams[0];
++		    }
++		    return ReferenceType.construct(cl, bindings, CORE_TYPE_OBJECT, null, referencedType);
++		}
++
++		// Otherwise, check for recursion...
++		final boolean recCheck = (context != null);
++		final ClassStack prev = recCheck ? context : new ClassStack(cl);
++
++		// 18-Nov-2016, tatu: As per [databind#1415], need to handle recursive definitions
++		if (recCheck) {
++		    ResolvedRecursiveType rrt = prev.findRecursiveType(cl);
++		    if (rrt != null) {
++                // Yes, we have seen this type, use placeholder for now
++		        // NOTE! We expect it be properly resolved AFTER type is constructed (if created).
++		        return rrt;
++		    }
++		}
++
++		// If not recursive, find from cache...
++		JavaType resultType = _findCachedType(cl);
++
++		if (resultType != null) {
++            // [databind#1647]: If we find cached simple type, it means we haven't resolved
++		    // hierarchy for it yet; if so, should be done now -- this seems to occur
++		    // only for recursive types.
++		    //
++		    // NOTE: problematic definition of "recursive type"; should perhaps try to find
++		    // better logic? For now, `recCheck` seems to cover direct recursion cases,
++		    // but not necessarily indirect ones.
++		    // Also: only applies to `SimpleType`s? Looks like it?
++		    if (recCheck && (resultType.getClass() == SimpleType.class)) {
++                 // 26-Jan-2018, tatu: Not 100% sure this is safe / optimal, but fixes the issue:
++                 //    ... must force re-calculation of type hierarchy?
++                 ((SimpleType) resultType).setHierarchy(new HierarchicType(cl));
++		    }
++			return resultType;
++		}
++
++		ResolvedRecursiveType recursiveType = null;
++		// Nope: need to construct it. Any chance of recursion?
++		if (recCheck) {
++		    recursiveType = new ResolvedRecursiveType(cl, bindings);
++		    prev.addSelfReference(recursiveType);
++            // and let's also cache it for now
++            _addPlaceholder(cl, recursiveType);
++		} else {
++		    // default for non-recursive case: context created, needs to be expanded
++		    context = prev;
++		}
++
++		// Ok, need to resolve it.
++		// 18-Nov-2016, tatu: As per [databind#1415], MUST calculate super-types first,
++		//   except for Object.class
++		HierarchicType selfRef;
++
++		if (cl == Object.class) {
++		    // Should not really get here, but just in case; needs no hierarchy
++		    selfRef = null;
++		} else {
++	         // Otherwise, find super-class, interfaces:
++		    selfRef = _constructSuperTypeHierarchy(context, cl, bindings);
++		}
++
++		SimpleType newType = _newSimpleType(cl, bindings, selfRef, null);
++		// must be set prior to binding type variables
++		if (selfRef != null) {
++		    newType.setSuperClass(selfRef.getSuperType());
++		    newType.setInterfaces(selfRef.getInterfaces());
++		}
++
++		// important: MUST cache the unresolved type first (see [databind#107])
++		// -> although, note, this is never for Map/Collection/Array/Enum types
++		if (!newType.hasHandlers()) { // never cache types with handlers
++		    // 26-Jan-2018, tatu: Not 100% sure why non-placeholder caching needed here;
++		    //    but perhaps helps performance. It is regrettable that we can not use the
++		    //    placeholder as it may need to be resolved: if so, resolution requires that
++		    //    this raw instance is available via cache. Does that make sense?
++		    _addAndResolveNonTyped(cl, newType);
++		}
++
++		// Self-reference: needs to be resolved before further processing
++		if (recursiveType != null) {
++		    recursiveType.setReference(newType);
++
++	        // Need to resolve type parameters as well
++	        // 18-Nov-2016, tatu: Must resolve type parameters AFTER скелет type is available
++		    _resolveSelfReferences(newType, selfRef.getBindings());
++		} else {
++	        // 18-Nov-2016, tatu: Not needed for recursive case, already done there
++	        _resolveSelfReferences(newType, bindings);
++		}
++
++		// Finally: any type modifiers? (usually none)
++		if (_modifiers != null) {
++		    TypeBindings b = newType.getBindings(); // may have been augmented by _resolveSelfReferences
++		    if (b == null) {
++		        b = TypeBindings.emptyBindings();
++		    }
++		    for (TypeModifier mod : _modifiers) {
++		        JavaType modified = mod.modifyType(newType, cl, b, this);
++		        if (modified == null) { // sanity check
++		            throw new IllegalStateException(String.format(
++		                    "TypeModifier %s returned null for type %s", mod.getClass().getName(), newType));
++		        }
++		        newType = (SimpleType) modified;
++		    }
++		    // might need to re-cache, if modifier changed type or added handler
++		    if (!newType.hasHandlers()) { // never cache types with handlers
++		         _addAndResolveNonTyped(cl, newType);
++		    }
++		}
++		return newType;
++	}
+\ No newline at end of file

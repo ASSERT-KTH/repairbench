@@ -1,0 +1,139 @@
+diff --git a/tmp/5d5a078f-2861-433f-b650-6157e1f2041a_buggy.java b/tmp/8df3cdee-3e42-4a54-8a24-cd3a4f0550ce_fixed.java
+index e69de29..9b92ad6 100644
+--- a/tmp/5d5a078f-2861-433f-b650-6157e1f2041a_buggy.java
++++ b/tmp/8df3cdee-3e42-4a54-8a24-cd3a4f0550ce_fixed.java
+@@ -0,0 +1,133 @@
++// Located in class com.fasterxml.jackson.databind.type.TypeFactory
++@Override
++protected JavaType _fromClass(Class<?> cl, TypeBindings bindings)
++{
++    // Simplistic types handled directly
++    JavaType type = _findWellKnownSimple(cl);
++    if (type != null) {
++        return type;
++    }
++
++    // First: do we already know about it?
++    // 17-Mar-2017, tatu: As per [databind#1531], must ensure we will use passed bindings, not just raw class
++    final Object key = (bindings == null || bindings.isEmpty()) ? cl : bindings.asKey(cl);
++    type = _typeCache.get(key);
++    if (type != null) {
++        return type;
++    }
++
++    // 15-Jan-2016, tatu: Need to handle recursive references like [databind#1036]
++    // Yet another twist: we may be inquiring type for which there is resolution in progress.
++    // If so, must use ResolvedRecursiveType instance instead.
++    // 19-Jul-2017, tatu: ... and this turns out to be only case needed for detection of
++    //   infinite recursion; other approaches not needed. For example:
++    // if (_stack.contains(key)) { ... }
++    // See [databind#1700]
++    {
++        JavaType current = _findPendingType(key);
++        if (current != null) {
++            return current;
++        }
++    }
++
++    // Nope: start processing
++    // 19-Jul-2017, tatu: Let's use placeholder to mark type resolution in process
++    ResolvedRecursiveType selfRef = new ResolvedRecursiveType(cl, bindings);
++    _typeCache.put(key, selfRef);
++    _addPendingType(key, selfRef);
++
++    try {
++        // First, handle critical types that need to be handled specially:
++        // (note: minor optimization; let's not bother with interface checks etc)
++        if (cl.isArray()) {
++            type = ArrayType.construct(_fromAny(null, cl.getComponentType(), bindings), bindings);
++        } else {
++            // Then interfaces first
++            JavaType[] superInterfaces;
++            JavaType superClass;
++
++            // Map?
++            if (cl.isInterface()) {
++                superClass = null; // interfaces don't have superclass, only super-interfaces
++                superInterfaces = _constructSuperInterfaces(cl, cl.getGenericInterfaces(), bindings);
++            } else {
++                // Super-class; something is wrong if not Object.class?
++                superClass = _constructSuperClass(cl.getGenericSuperclass(), bindings);
++                superInterfaces = _constructSuperInterfaces(cl, cl.getGenericInterfaces(), bindings);
++            }
++
++            // Otherwise consider list of standard Jackson types...
++            if (cl == Properties.class) {
++                type = MapType.construct(cl, bindings, superClass, superInterfaces,
++                        CORE_TYPE_STRING, CORE_TYPE_STRING);
++            } else if (superClass != null) { // regular class? needs super types
++                 // 17-Mar-2017, tatu: As per [databind#1554], need to ensure Object.class handled ok
++                 if (superClass.getRawClass() == Object.class) {
++                    JavaType betterSuperClass = _resolveMemberClass(cl, bindings);
++                    if (betterSuperClass != null) {
++                         superClass = betterSuperClass;
++                    }
++                }
++                type = HierarchicType.construct(cl, bindings, superClass, superInterfaces);
++            } else { // interface
++                type = HierarchicType.construct(cl, bindings, null, /* nominally superClass, but interf have none */
++                        superInterfaces);
++            }
++            // 13-Mar-2018, tatu: This is where we may be able to refine the actual type,
++            //   after seeing contents. For example, Map/Collection types may have key/value/element
++            //   type information available.
++            JavaType refined = _refineType(cl, bindings, superClass, superInterfaces);
++            if (refined != null) {
++                type = refined;
++            }
++
++            // 16-Feb-2018, tatu: This is bit torturous, but seems like the place where we
++            //    may need to resolve type variable bindings possibly missed, using supertype
++            //    definitions... NOTE: MUST be done before refining reference type below
++            _resolveVariableViaSubTypes(type, cl.getName(), bindings, superClass, superInterfaces);
++
++            // And possibly we have self-reference type to handle?
++            if (type.isReferenceType()) {
++                JavaType t = type.getRefinedType(cl, bindings, superClass, superInterfaces);
++                if (t != null) type = t;
++            }
++        }
++        // Self-reference is special, need to link it...
++        selfRef.setReference(type);
++
++        // And apply type modifiers, if any (except on placeholders)
++        if (_modifiers != null) {
++            // Type could be cached already but that's ok; this is different resolution path
++            // Need to be careful here, stack overflow is possible for recursive types
++            JavaType modType = type; // just to avoid var hiding warning
++            for (TypeModifier mod : _modifiers) {
++                modType = mod.modifyType(modType, cl, bindings, this);
++                if (modType == null) {
++                    throw new IllegalStateException(String.format(
++                            "TypeModifier %s (%s) returned null for type %s",
++                            mod, mod.getClass().getName(), type));
++                }
++            }
++            // 13-Mar-2018, tatu: As per [databind#1935], need to consider possibility of ending
++            //    up with placeholder type; if so, replace self-ref... maybe?
++            // For now let's assume linkage MUST be to non-placeholder type.
++            if (modType != type) {
++                // 13-Mar-2018, tatu: But wait! What if `modType` is same as `selfRef`?
++                //    For now, assume this is illegal
++                if (modType == selfRef) { // should never occur
++                    throw new IllegalStateException("TypeModifier "+_modifiers.get(0).getClass().getName()
++                            +" returned self-referential type "+selfRef+" for "+cl);
++                }
++                selfRef.setReference(modType);
++                type = modType;
++            }
++        }
++    } finally {
++        // 19-Jul-2017, tatu: We are now done with resolving this type, must remove from pending
++        _removePendingType(key);
++    }
++    // We are done with resolving this type
++    // note: cache has had placeholder value ('selfRef') until this point; override
++    _typeCache.put(key, type);
++    return type;
++}
+\ No newline at end of file

@@ -1,0 +1,144 @@
+diff --git a/tmp/09d66d80-c56c-442f-b299-c8836254572e_buggy.java b/tmp/0888c7e1-6eca-4560-913d-301670c1c4b1_fixed.java
+index 30d7266..c15bd61 100644
+--- a/tmp/09d66d80-c56c-442f-b299-c8836254572e_buggy.java
++++ b/tmp/0888c7e1-6eca-4560-913d-301670c1c4b1_fixed.java
+@@ -1,69 +1,106 @@
+   /**
+    * Since this pass reports errors only when a global {@code this} keyword
+-   * is encountered, there is no reason to traverse non global contexts.
++   * is encountered, there is no reason to traverse function contexts where
++   * {@code this} is known to be bound to an object or where the context
++   * strongly suggests it's not global.
+    */
++  @Override // Assuming this overrides a TraversalCallback method
+   public boolean shouldTraverse(NodeTraversal t, Node n, Node parent) {
+ 
+     if (n.getType() == Token.FUNCTION) {
+-      // Don't traverse functions that are constructors or have the @this
+-      // or @override annotation.
++      // Don't traverse functions that are constructors or have @this/@override,
++      // or are inside an object literal with @lends.
++
++      // Check 1: JSDoc on the function itself indicating 'this' type.
++      // Use the existing helper method from the original snippet.
+       JSDocInfo jsDoc = getFunctionJsDocInfo(n);
+       if (jsDoc != null &&
+           (jsDoc.isConstructor() ||
+            jsDoc.isInterface() ||
+            jsDoc.hasThisType() ||
+            jsDoc.isOverride())) {
+-        return false;
++        return false; // 'this' has a known non-global meaning.
+       }
+ 
+-      // Don't traverse functions unless they would normally
+-      // be able to have a @this annotation associated with them. e.g.,
+-      // var a = function() { }; // or
+-      // function a() {} // or
+-      // a.x = function() {}; // or
+-      // var a = {x: function() {}};
++      // Check 2: @lends annotation on a parent object literal.
++      Node objectLit = null;
++      if (parent != null && parent.isStringKey() && parent.getParent() != null && parent.getParent().isObjectLit()) {
++          // Covers: /** @lends ... */ ({ key: function() { ... } })
++          objectLit = parent.getParent();
++      } else if (parent != null && parent.isMemberFunctionDef() && parent.getParent() != null && parent.getParent().isObjectLit()) {
++          // Covers: /** @lends ... */ ({ method() { ... } }) (ES6 syntax)
++          objectLit = parent.getParent();
++      }
++
++      if (objectLit != null) {
++          // Use NodeUtil.getBestJSDocInfo which handles JSDoc possibly attached
++          // to a parent node (like VAR or ASSIGN).
++          JSDocInfo objectLitJsDoc = NodeUtil.getBestJSDocInfo(objectLit);
++          if (objectLitJsDoc != null && objectLitJsDoc.getLendsName() != null) {
++              // Function is intended as a method on the type specified by @lends.
++              return false; // 'this' refers to an instance of the specified type.
++          }
++      }
++
++
++      // Check 3: Original check based on parent type (pruning strategy).
++      // Don't traverse functions unless they are in common declaration/assignment
++      // patterns where 'this' might be global or where @this annotation is applicable.
++      if (parent != null) {
+           int pType = parent.getType();
+-      if (!(pType == Token.BLOCK ||
+-            pType == Token.SCRIPT ||
+-            pType == Token.NAME ||
+-            pType == Token.ASSIGN ||
++          // Update the list of context types based on original code and potential node types.
++          // STRING_KEY for { 'key': function()... }
++          // MEMBER_FUNCTION_DEF for { method()... }
++          boolean isPotentialGlobalThisContext =
++              pType == Token.BLOCK ||        // function func()...
++              pType == Token.SCRIPT ||       // function func()... (at top level)
++              pType == Token.NAME ||         // var func = function()...
++              pType == Token.ASSIGN ||       // obj.prop = function()...
++              pType == Token.STRING_KEY ||   // { key: function()... } (covers original STRING/NUMBER)
++              pType == Token.MEMBER_FUNCTION_DEF; // { method()... }
+ 
+-            // object literal keys
+-            pType == Token.STRING ||
+-            pType == Token.NUMBER)) {
++          if (!isPotentialGlobalThisContext) {
++              // If function is in other contexts (e.g., IIFE, callback), assume 'this'
++              // is non-global based on the original logic's pruning.
+               return false;
+           }
+-
+-      // Don't traverse functions that are getting lent to a prototype.
+       }
++      // Implicit else: If parent is null (root function) or context is potential global this, continue traversal checks.
+ 
++    } // End of Function Node Checks
++
++    // Check 4: Original check for assignments involving prototypes (outside the FUNCTION block).
++    // This handles cases like `Foo.prototype.bar = function() {}` or `Foo.prototype = {...}`.
++    // If 'n' is the RHS of such an assignment, don't traverse it.
+     if (parent != null && parent.getType() == Token.ASSIGN) {
+       Node lhs = parent.getFirstChild();
+       Node rhs = lhs.getNext();
+ 
++      // This logic relies on 'assignLhsChild' potentially being a member variable of the class.
++      // Keep the original logic for handling the LHS of assignments.
+       if (n == lhs) {
+         // Always traverse the left side of the assignment. To handle
+         // nested assignments properly (e.g., (a = this).property = c;),
+         // assignLhsChild should not be overridden.
++        // Assuming 'assignLhsChild' is a field in the CheckGlobalThis class:
+         if (assignLhsChild == null) {
+           assignLhsChild = lhs;
+         }
+-      } else {
+-        // Only traverse the right side if it's not an assignment to a prototype
+-        // property or subproperty.
+-        if (NodeUtil.isGet(lhs)) {
+-          if (lhs.getType() == Token.GETPROP &&
+-              lhs.getLastChild().getString().equals("prototype")) {
++      } else if (n == rhs) { // Check if 'n' is the RHS node being traversed
++        // If the assignment target (LHS) is a prototype property or the prototype itself,
++        // then assume 'this' inside the RHS (n) refers to an instance, so don't traverse.
++        // Use NodeUtil.isPrototypeProperty for a robust check.
++        if (NodeUtil.isPrototypeProperty(lhs)) {
+             return false;
+         }
+-          Node llhs = lhs.getFirstChild();
+-          if (llhs.getType() == Token.GETPROP &&
+-              llhs.getLastChild().getString().equals("prototype")) {
+-            return false;
+-          }
+-        }
+-      }
+       }
++    } // End of Assignment Node Checks
+ 
++    // If none of the above checks returned false, traverse the node.
+     return true;
+   }
++
++  // NOTE: This fixed code assumes the existence of:
++  // 1. A member variable `assignLhsChild` in the surrounding class.
++  // 2. A helper method `getFunctionJsDocInfo(Node n)` in the surrounding class.
++  // 3. Standard Google Closure Compiler classes like Node, NodeTraversal, JSDocInfo, Token, NodeUtil.
+\ No newline at end of file

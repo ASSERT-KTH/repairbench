@@ -1,0 +1,145 @@
+diff --git a/tmp/47af123c-7b5e-4bf8-8f77-55f70f1d256b_buggy.java b/tmp/8a90bab2-203e-4655-8709-bf8ad4d70fb8_fixed.java
+index d907b39..29fc833 100644
+--- a/tmp/47af123c-7b5e-4bf8-8f77-55f70f1d256b_buggy.java
++++ b/tmp/8a90bab2-203e-4655-8709-bf8ad4d70fb8_fixed.java
+@@ -1,56 +1,118 @@
+     public int read(byte[] buffer, int start, int length) throws IOException {
+         if (closed) {
+             throw new IOException("The stream is closed");
+         }
++        // Check EOF conditions before reading
+         if (inf.finished() || current == null) {
+             return -1;
+         }
+ 
+         // avoid int overflow, check null buffer
+-        if (start <= buffer.length && length >= 0 && start >= 0
+-            && buffer.length - start >= length) {
++        // buffer.length - start >= length is checked by start + length <= buffer.length
++        if (start < 0 || length < 0 || start > buffer.length || length > buffer.length - start) {
++             throw new ArrayIndexOutOfBoundsException("offset=" + start + ", length=" + length + ", buffer size=" + buffer.length);
++        }
++        // Check for 0 length read
++        if (length == 0) {
++            return 0;
++        }
++
++        int read; // Hold bytes read in this call
++
+         if (current.getMethod() == ZipArchiveOutputStream.STORED) {
+-                int csize = (int) current.getSize();
+-                if (readBytesOfEntry >= csize) {
++            // Logic for STORED entries
++            long csize_long = current.getSize(); // Use long for checks
++            // Check if entry is already fully read
++            if (csize_long != ZipArchiveEntry.UNKNOWN_SIZE && readBytesOfEntry >= csize_long) {
+                 return -1;
+             }
++            // Cast to int for array indexing/copying, assuming size fits int is handled elsewhere or entry is invalid
++            // Note: getSize() can be -1 (UNKNOWN_SIZE).
++            int csize = (csize_long == ZipArchiveEntry.UNKNOWN_SIZE) ? Integer.MAX_VALUE : (int) csize_long;
++
++
+             if (offsetInBuffer >= lengthOfLastRead) {
++                // Need to read more from underlying stream
+                 offsetInBuffer = 0;
+-                    if ((lengthOfLastRead = in.read(buf)) == -1) {
++                lengthOfLastRead = in.read(buf); // Read fresh data
++                if (lengthOfLastRead == -1) {
++                    // Hit EOF prematurely
++                    // Throw only if size is known and we haven't reached it
++                    if (csize_long != ZipArchiveEntry.UNKNOWN_SIZE && readBytesOfEntry < csize_long) {
++                         throw new IOException("Truncated ZIP file");
++                    }
++                    // Otherwise, treat as normal EOF for the entry or stream
+                     return -1;
+                 }
+                 count(lengthOfLastRead);
+                 bytesReadFromStream += lengthOfLastRead;
+             }
+-                int toRead = length > lengthOfLastRead
+-                    ? lengthOfLastRead - offsetInBuffer
+-                    : length;
+-                if ((csize - readBytesOfEntry) < toRead) {
+-                    toRead = csize - readBytesOfEntry;
++
++            // Calculate bytes to copy from internal buffer 'buf'
++            int availableInBuffer = lengthOfLastRead - offsetInBuffer;
++            int desired = length;
++            int toRead = Math.min(desired, availableInBuffer);
++
++            // Don't read past the declared size (if known)
++            // Check against int csize, but ensure readBytesOfEntry hasn't overflowed int if csize_long was > Integer.MAX_VALUE
++            // Assuming readBytesOfEntry tracks correctly relative to csize.
++            if (csize_long != ZipArchiveEntry.UNKNOWN_SIZE) {
++                 long remainingInEntry = csize_long - readBytesOfEntry;
++                 if (remainingInEntry < toRead) {
++                     // Cast safely as remainingInEntry must be <= csize_long
++                     toRead = (int) remainingInEntry;
+                  }
+-                System.arraycopy(buf, offsetInBuffer, buffer, start, toRead);
+-                offsetInBuffer += toRead;
+-                readBytesOfEntry += toRead;
+-                crc.update(buffer, start, toRead);
+-                return toRead;
+             }
++
++            // Assign calculated amount to read variable
++            read = toRead;
++
++            if (read > 0) {
++                 System.arraycopy(buf, offsetInBuffer, buffer, start, read);
++                 offsetInBuffer += read;
++                 readBytesOfEntry += read;
++            }
++             // If read is 0 (e.g. length was 0, or remainingInEntry was 0), return 0.
++             // This happens naturally if toRead calculates to 0.
++
++        } else { // DEFLATED or other compressed methods
+             if (inf.needsInput()) {
+-                fill();
++                fill(); // Attempt to fill inflater buffer
+                 if (lengthOfLastRead > 0) {
+                     bytesReadFromStream += lengthOfLastRead;
+                 }
++                // Check for premature EOF *after* trying to fill
++                if (lengthOfLastRead == -1) {
++                    // Inflater needs input, but we have hit EOF on the underlying stream.
++                    throw new IOException("Truncated ZIP file");
+                 }
+-            int read = 0;
++            }
++
+             try {
+                 read = inf.inflate(buffer, start, length);
+             } catch (DataFormatException e) {
+-                throw new ZipException(e.getMessage());
++                 // Provide the cause exception
++                throw new ZipException("Invalid ZLIB data format: " + e.getMessage(), e);
+             }
+-            if (read == 0 && inf.finished()) {
++
++            // Check inflate result
++            if (read == 0) {
++                 if (inf.finished()) {
++                     // Normal end of compressed data for this entry
+                      return -1;
+                  }
++                 // read == 0 and !inf.finished() means inflate needs more input.
++                 // If it needs input, and last fill() returned EOF, we already threw exception.
++                 // If last fill() returned data, but inflate consumed it and needs more,
++                 // return 0, caller must call read() again.
++            }
++             // If read > 0, proceed to update CRC.
++        }
++
++        // Update CRC if any bytes were actually read into the buffer
++        if (read > 0) {
+             crc.update(buffer, start, read);
+-            return read;
+         }
+-        throw new ArrayIndexOutOfBoundsException();
++
++        return read; // Return number of bytes read (can be 0)
+     }
+\ No newline at end of file

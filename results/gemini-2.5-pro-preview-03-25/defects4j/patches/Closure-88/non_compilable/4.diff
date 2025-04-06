@@ -1,0 +1,146 @@
+diff --git a/tmp/abcba43b-5bf6-490c-8ed4-56dcc08396c8_buggy.java b/tmp/4b3e4044-9ce5-4fde-83f8-8581cf1ad893_fixed.java
+index 9353941..b4ad2cd 100644
+--- a/tmp/abcba43b-5bf6-490c-8ed4-56dcc08396c8_buggy.java
++++ b/tmp/4b3e4044-9ce5-4fde-83f8-8581cf1ad893_fixed.java
+@@ -1,30 +1,134 @@
+   /**
+    * Give an expression and a variable. It returns READ, if the first
+    * reference of that variable is a read. It returns KILL, if the first
+    * reference of that variable is an assignment. It returns MAY_LIVE otherwise.
++   * This follows left-to-right, depth-first traversal order. Special handling
++   * is needed for assignments where the write operation might occur after
++   * evaluating the right-hand side.
+    */
+   private VariableLiveness isVariableReadBeforeKill(
+       Node n, String variable) {
++
++    // Base case: If n is the variable NAME.
+     if (NodeUtil.isName(n) && variable.equals(n.getString())) {
+-      if (NodeUtil.isLhs(n, n.getParent())) {
+-        // The expression to which the assignment is made is evaluated before
+-        // the RHS is evaluated (normal left to right evaluation) but the KILL
+-        // occurs after the RHS is evaluated.
+-        return VariableLiveness.KILL;
++      Node parent = n.getParent();
++      if (NodeUtil.isLhs(n, parent)) {
++        // This is an assignment target (LHS of assign, var decl, inc/dec, etc.).
++        // A KILL operation occurs, but its timing relative to other operations
++        // in the same statement (like RHS evaluation for assign, or the read
++        // for postfix inc/dec) depends on the specific operation.
++        // For assignments, the KILL happens after the RHS. For prefix inc/dec,
++        // it happens before the result is read. For postfix inc/dec, it happens
++        // after the value is read.
++        // Returning MAYBE_LIVE forces the analysis to continue to sibling nodes
++        // (like the RHS of an assignment) or handle the operation type in the
++        // post-recursion logic below based on the parent node's type.
++        return VariableLiveness.MAYBE_LIVE;
+       } else {
++        // This is a standard read of the variable. It happens now.
+         return VariableLiveness.READ;
+       }
+     }
+ 
++    // Do not traverse into functions or other structures that start new CFGs,
++    // as liveness is typically analyzed per-CFG. Check the node itself first.
++    if (ControlFlowGraph.isEnteringNewCfgNode(n)) {
++      // If the node itself starts a new scope (like a function),
++      // we don't analyze inside it for this check.
++      return VariableLiveness.MAYBE_LIVE;
++    }
++
+     // Expressions are evaluated left-right, depth first.
++    // Check children recursively.
+     for (Node child = n.getFirstChild();
+         child != null; child = child.getNext()) {
+-      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) { // Not a FUNCTION
++      // Skip nodes that start new control flow graphs (e.g., function bodies)
++      // as done in the original code. This prevents descending into nested scopes.
++      if (!ControlFlowGraph.isEnteringNewCfgNode(child)) {
+           VariableLiveness state = isVariableReadBeforeKill(child, variable);
+           if (state != VariableLiveness.MAYBE_LIVE) {
++            // Found the first READ or KILL definitively within a child subtree.
++            // Because of the L-R traversal, this is the first overall.
+             return state;
+           }
+        }
+     }
++
++    // If no definitive READ/KILL was found in the children:
++    // Check if the current node 'n' itself represents the first operation
++    // involving the variable. This handles cases where the base case for an
++    // LHS name returned MAYBE_LIVE, requiring the parent node's type (n)
++    // to determine the outcome.
++
++    // Case 1: Assignment (var = ...)
++    if (n.isAssign()) {
++      Node lhs = n.getFirstChild();
++      // Check if the variable is the direct LHS of this assignment.
++      if (NodeUtil.isName(lhs) && variable.equals(lhs.getString())) {
++        // We reached here only if the recursive call on lhs returned MAYBE_LIVE
++        // (due to the base case logic for isLhs) AND the recursive call on the RHS
++        // also returned MAYBE_LIVE (meaning no read/kill of the variable in RHS).
++        // Therefore, this assignment's KILL operation is the first relevant operation
++        // encountered for the variable within this assignment expression.
++        return VariableLiveness.KILL;
++      }
++    }
++    // Case 2: Variable declaration with potential initializer (var x = ...)
++    // LET and CONST are similar.
++    else if (n.isVar() || n.isLet() || n.isConst()) {
++        Node nameNode = n.getFirstChild();
++        // Check if the variable is the one being declared.
++        if (nameNode != null && NodeUtil.isName(nameNode) && variable.equals(nameNode.getString())) {
++            // We reached here only if recursive calls on the nameNode (returned MAYBE_LIVE
++            // due to isLhs) and the initializer (if present, also returned MAYBE_LIVE)
++            // completed without finding an earlier read/kill.
++            // This declaration/initialization is the first relevant operation (KILL).
++            // A declaration always acts as a KILL for the scope.
++            return VariableLiveness.KILL;
++        }
++    }
++    // Case 3: Increment/Decrement (var++ or ++var)
++    else if (n.isInc() || n.isDec()) {
++        Node target = n.getFirstChild();
++        // Check if the variable is the target of this inc/dec.
++        if (target != null && NodeUtil.isName(target) && variable.equals(target.getString())) {
++            // We reached here only if the recursive call on the target NAME node
++            // returned MAYBE_LIVE (due to the base case logic for isLhs).
++            // Now we must determine if it's prefix (KILL first) or postfix (READ first).
++            // This typically depends on the node type (e.g., Token.POST_INC vs Token.INC)
++            // which might be set by normalization passes before dead assignment elimination.
++            int type = n.getType();
++            boolean isPostfix = (type == com.google.javascript.rhino.Token.POST_INC
++                                 || type == com.google.javascript.rhino.Token.POST_DEC);
++
++            if (isPostfix) {
++                 // In x++, the value of x is read *before* the increment (KILL) happens.
++                 return VariableLiveness.READ;
++            } else {
++                 // In ++x, the increment (KILL) happens *before* the expression result is read.
++                 // The first operation involving x is the KILL.
++                 // Assumes non-postfix INC/DEC nodes are prefix.
++                 return VariableLiveness.KILL;
++            }
++        }
++    }
++    // Case 4: Catch clause (catch (e))
++    else if (n.isCatch()) {
++        Node nameNode = n.getFirstChild();
++        // Check if the variable is the catch exception variable.
++        if (NodeUtil.isName(nameNode) && variable.equals(nameNode.getString())) {
++             // We reach here if the recursive call on the nameNode returned MAYBE_LIVE.
++             // The catch variable assignment is a KILL.
++             return VariableLiveness.KILL;
++        }
++    }
++    // Note: PARAM_LIST is handled implicitly. A parameter NAME node will be visited,
++    // isLhs will be true, returning MAYBE_LIVE. If no default value reads/kills
++    // the variable first, the containing FUNCTION node is skipped by isEnteringNewCfgNode,
++    // preventing incorrect analysis within the function body by this specific call.
++    // The parameter declaration itself acts like a KILL at the start of the function scope,
++    // handled by standard dataflow analysis, not specifically by this function's return.
++
++    // Default case: No first read/kill found in this subtree rooted at 'n'.
+     return VariableLiveness.MAYBE_LIVE;
+   }
+\ No newline at end of file
