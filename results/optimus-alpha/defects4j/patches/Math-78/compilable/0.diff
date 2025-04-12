@@ -1,0 +1,196 @@
+diff --git a/tmp/255b2446-1536-46b4-994f-8c80b8cb43b4_buggy.java b/tmp/565d0cd9-5e8a-4506-b158-33b895de6bdd_fixed.java
+index 032fa8e..95762c8 100644
+--- a/tmp/255b2446-1536-46b4-994f-8c80b8cb43b4_buggy.java
++++ b/tmp/565d0cd9-5e8a-4506-b158-33b895de6bdd_fixed.java
+@@ -1,108 +1,170 @@
+     /** Evaluate the impact of the proposed step on the event handler.
+      * @param interpolator step interpolator for the proposed step
+      * @return true if the event handler triggers an event before
+      * the end of the proposed step (this implies the step should be
+      * rejected)
+      * @exception DerivativeException if the interpolator fails to
+      * compute the switching function somewhere within the step
+      * @exception EventException if the switching function
+      * cannot be evaluated
+      * @exception ConvergenceException if an event cannot be located
+      */
+     public boolean evaluateStep(final StepInterpolator interpolator)
+         throws DerivativeException, EventException, ConvergenceException {
+ 
+         try {
+ 
+             forward = interpolator.isForward();
+             final double t1 = interpolator.getCurrentTime();
+             final int    n  = Math.max(1, (int) Math.ceil(Math.abs(t1 - t0) / maxCheckInterval));
+             final double h  = (t1 - t0) / n;
+ 
+             double ta = t0;
+             double ga = g0;
+-            double tb = t0 + (interpolator.isForward() ? convergence : -convergence);
++            double tb, gb;
++
+             for (int i = 0; i < n; ++i) {
+ 
+-                // evaluate handler value at the end of the substep
+-                tb += h;
++                // tb at the end of the substep
++                tb = t0 + (i + 1) * h;
++                // Don't step beyond t1 due to potential round-off
++                if (forward) {
++                    if (tb > t1) {
++                        tb = t1;
++                    }
++                } else {
++                    if (tb < t1) {
++                        tb = t1;
++                    }
++                }
++
+                 interpolator.setInterpolatedTime(tb);
+-                final double gb = handler.g(tb, interpolator.getInterpolatedState());
++                gb = handler.g(tb, interpolator.getInterpolatedState());
+ 
+                 // check events occurrence
+                 if (g0Positive ^ (gb >= 0)) {
+                     // there is a sign change: an event is expected during this step
+ 
+-                        // this is a corner case:
+-                        // - there was an event near ta,
+-                        // - there is another event between ta and tb
+-                        // - when ta was computed, convergence was reached on the "wrong side" of the interval
+-                        // this implies that the real sign of ga is the same as gb, so we need to slightly
+-                        // shift ta to make sure ga and gb get opposite signs and the solver won't complain
+-                        // about bracketing
+-                            // this should never happen
++                    // Handle corner case: ga == 0
++                    if (Math.abs(ga) < convergence) {
++                        ga = (g0Positive ? -convergence : +convergence);
++                    }
++                    // Make sure gb != ga sign due to rare corner-case of double-root at exactly boundary
++                    if (Math.abs(gb) < convergence) {
++                        gb = (g0Positive ? +convergence : -convergence);
++                    }
+ 
+                     // variation direction, with respect to the integration direction
+                     increasing = gb >= ga;
+ 
++                    final double left;
++                    final double right;
++                    final double leftG;
++                    final double rightG;
++                    if (forward) {
++                        left = ta;
++                        right = tb;
++                        leftG = ga;
++                        rightG = gb;
++                    } else {
++                        left = tb;
++                        right = ta;
++                        leftG = gb;
++                        rightG = ga;
++                    }
++
+                     final UnivariateRealFunction f = new UnivariateRealFunction() {
+                         public double value(final double t) throws FunctionEvaluationException {
+                             try {
+                                 interpolator.setInterpolatedTime(t);
+                                 return handler.g(t, interpolator.getInterpolatedState());
+                             } catch (DerivativeException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             } catch (EventException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             }
+                         }
+                     };
+                     final BrentSolver solver = new BrentSolver();
+                     solver.setAbsoluteAccuracy(convergence);
+                     solver.setMaximalIterationCount(maxIterationCount);
+-                    final double root = (ta <= tb) ? solver.solve(f, ta, tb) : solver.solve(f, tb, ta);
++
++                    // Now ensure that root-finding is always bracketed, otherwise BrentSolver will throw
++                    // If the endpoint is 0, fudge by a bit in integration direction
++                    double bracketA = left;
++                    double bracketB = right;
++
++                    // If function is zero at endpoint, nudge by a bit to avoid BrentSolver error
++                    double fa = leftG;
++                    double fb = rightG;
++
++                    if (fa == 0.0) {
++                        final double epsilon = convergence * (forward ? 1.0 : -1.0);
++                        double newA = left + epsilon;
++                        if ((forward && newA > right) || (!forward && newA < right)) {
++                            newA = right;
++                        }
++                        interpolator.setInterpolatedTime(newA);
++                        fa = handler.g(newA, interpolator.getInterpolatedState());
++                        bracketA = newA;
++                    }
++                    if (fb == 0.0) {
++                        final double epsilon = convergence * (forward ? -1.0 : 1.0);
++                        double newB = right + epsilon;
++                        if ((forward && newB < left) || (!forward && newB > left)) {
++                            newB = left;
++                        }
++                        interpolator.setInterpolatedTime(newB);
++                        fb = handler.g(newB, interpolator.getInterpolatedState());
++                        bracketB = newB;
++                    }
++
++                    // Make sure bracketA and bracketB span a sign change (else, skip false event due to FP error)
++                    if ((fa > 0 && fb > 0) || (fa < 0 && fb < 0)) {
++                        // No sign change in this interval: false positive due to round-off near root
++                        ta = tb;
++                        ga = gb;
++                        continue;
++                    }
++
++                    final double root = solver.solve(f, bracketA, bracketB);
+                     if ((Math.abs(root - ta) <= convergence) &&
+                          (Math.abs(root - previousEventTime) <= convergence)) {
+-                        // we have either found nothing or found (again ?) a past event, we simply ignore it
++                        // we have either found nothing or found a past event again, simply ignore it
+                         ta = tb;
+                         ga = gb;
+                     } else if (Double.isNaN(previousEventTime) ||
+                                (Math.abs(previousEventTime - root) > convergence)) {
+                         pendingEventTime = root;
+                         if (pendingEvent && (Math.abs(t1 - pendingEventTime) <= convergence)) {
+-                            // we were already waiting for this event which was
+-                            // found during a previous call for a step that was
+-                            // rejected, this step must now be accepted since it
+-                            // properly ends exactly at the event occurrence
++                            // we were already waiting for this event, accept step
+                             return false;
+                         }
+-                        // either we were not waiting for the event or it has
+-                        // moved in such a way the step cannot be accepted
+                         pendingEvent = true;
+                         return true;
+                     }
+ 
+                 } else {
+                     // no sign change: there is no event for now
+                     ta = tb;
+                     ga = gb;
+                 }
+ 
+             }
+ 
+             // no event during the whole step
+             pendingEvent     = false;
+             pendingEventTime = Double.NaN;
+             return false;
+ 
+         } catch (FunctionEvaluationException e) {
+             final Throwable cause = e.getCause();
+             if ((cause != null) && (cause instanceof DerivativeException)) {
+                 throw (DerivativeException) cause;
+             } else if ((cause != null) && (cause instanceof EventException)) {
+                 throw (EventException) cause;
+             }
+             throw new EventException(e);
+         }
+ 
+     }
+\ No newline at end of file

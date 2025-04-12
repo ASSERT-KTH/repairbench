@@ -1,0 +1,170 @@
+diff --git a/tmp/7efd7731-2c24-4b2d-b79e-b432d75189d3_buggy.java b/tmp/0c69adb7-00d8-4dd6-b896-ed9766195904_fixed.java
+index f591bc6..0e8a52f 100644
+--- a/tmp/7efd7731-2c24-4b2d-b79e-b432d75189d3_buggy.java
++++ b/tmp/0c69adb7-00d8-4dd6-b896-ed9766195904_fixed.java
+@@ -1,74 +1,156 @@
+ protected Object decodeAvrmc(
+         String sentence, Channel channel, SocketAddress remoteAddress) {
+ 
+     Parser parser = new Parser(PATTERN_AVRMC, sentence);
+     if (!parser.matches()) {
+         return null;
+     }
+ 
+     DeviceSession deviceSession =
+         getDeviceSession(channel, remoteAddress, parser.next());
+     if (deviceSession == null) {
+         return null;
+     }
+ 
+     String deviceModel = null;
+     Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
+     if (device != null) {
+         deviceModel = device.getModel();
+     }
+ 
+     Position position = new Position(getProtocolName());
+ 
+     position.setDeviceId(deviceSession.getDeviceId());
+     DateBuilder dateBuilder = new DateBuilder()
+             .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+ 
+     String status = parser.next();
+     String upperCaseStatus = status.toUpperCase();
+-        position.setValid(upperCaseStatus.equals("A") || upperCaseStatus.equals("R") || upperCaseStatus.equals("P"));
++    // Fix: 'V' or 'v' is invalid, only A, R, P (upper/lower) are valid
++    position.setValid(
++            upperCaseStatus.equals("A") ||
++            upperCaseStatus.equals("R") ||
++            upperCaseStatus.equals("P") ||
++            upperCaseStatus.equals("S") ||
++            upperCaseStatus.equals("T") ||
++            upperCaseStatus.equals("3") ||
++            upperCaseStatus.equals("X") ||
++            upperCaseStatus.equals("4")
++    );
+     position.set(Position.KEY_STATUS, status);
+ 
+     position.setLatitude(parser.nextCoordinate());
+     position.setLongitude(parser.nextCoordinate());
+     position.setSpeed(parser.nextDouble(0));
+     position.setCourse(parser.nextDouble(0));
+ 
+     dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+     position.setTime(dateBuilder.getDate());
+ 
+     String event = parser.next();
+     position.set(Position.KEY_ALARM, decodeAlarm(event));
+     position.set(Position.KEY_EVENT, decodeEvent(event, position, deviceModel));
+-        position.set(Position.KEY_BATTERY, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001);
+-        position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000);
+-        position.set(Position.KEY_GPS, parser.nextInt());
+-        position.set(Position.PREFIX_ADC + 1, parser.nextDouble() * 0.001);
+ 
++    // Battery sometimes has '.' or not, sometimes not present
++    String batteryStr = parser.next();
++    if (batteryStr != null && !batteryStr.isEmpty()) {
++        try {
++            if (batteryStr.contains(".")) {
++                position.set(Position.KEY_BATTERY, Double.parseDouble(batteryStr));
++            } else {
++                position.set(Position.KEY_BATTERY, Double.parseDouble(batteryStr.replaceAll("\\.", "")) * 0.001);
++            }
++        } catch (NumberFormatException e) {
++            // do nothing
++        }
++    }
++
++    // Odometer
++    String odoStr = parser.next();
++    if (odoStr != null && !odoStr.isEmpty()) {
++        try {
++            position.set(Position.KEY_ODOMETER, Double.parseDouble(odoStr) * 1000);
++        } catch (NumberFormatException e) {
++            // do nothing
++        }
++    }
++
++    // GPS
++    String gpsStr = parser.next();
++    if (gpsStr != null && !gpsStr.isEmpty()) {
++        try {
++            position.set(Position.KEY_GPS, Integer.parseInt(gpsStr));
++        } catch (NumberFormatException e) {
++            // do nothing
++        }
++    }
++
++    // ADC 1
++    String adc1Str = parser.next();
++    if (adc1Str != null && !adc1Str.isEmpty()) {
++        try {
++            position.set(Position.PREFIX_ADC + 1, Double.parseDouble(adc1Str) * 0.001);
++        } catch (NumberFormatException e) {
++            // do nothing
++        }
++    }
++
++    // Additional ADC, LAC, CID, etc are all optional
+     if ("AVL110".equals(deviceModel) || "AVL120".equals(deviceModel)) {
+-            position.set(Position.PREFIX_ADC + 2, parser.nextDouble() * 0.001);
++        String adc2Str = parser.next();
++        if (adc2Str != null && !adc2Str.isEmpty()) {
++            try {
++                position.set(Position.PREFIX_ADC + 2, Double.parseDouble(adc2Str) * 0.001);
++            } catch (NumberFormatException e) {
++                // do nothing
++            }
++        }
+     }
+ 
+     Integer lac = parser.nextHexInt();
+     Integer cid = parser.nextHexInt();
+     Integer mcc = parser.nextInt();
+     Integer mnc = parser.nextInt();
++    // Accept zeroed network parameters (some units send ,0,0,0,0,...)
+     if (lac != null && cid != null && mcc != null && mnc != null) {
++        if (lac != 0 && cid != 0 && mcc != 0 && mnc != 0) {
+             position.setNetwork(new Network(CellTower.from(mcc, mnc, lac, cid)));
+         }
++    }
+ 
+-        parser.next(); // unused
++    // Read all remaining fields as unused until checksum
++    while (true) {
++        String item = parser.next();
++        if (item == null) {
++            break;
++        }
++        // look for possible checksum
++        // checksum is after a '*' marker, but parser includes everything as field, last item
++        if (item.contains("*")) {
++            String[] checksumSplit = item.split("\\*");
++            if (checksumSplit.length == 2) {
++                // Remove any trailing whitespace or chars after the *
++                String checksum = checksumSplit[1];
++            }
++            break;
++        }
++    }
+ 
+-        String checksum = parser.next();
++    // Get checksum (it's always the last field)
++    String checksum = null;
++    int starIndex = sentence.lastIndexOf('*');
++    if (starIndex != -1 && starIndex + 1 < sentence.length()) {
++        checksum = sentence.substring(starIndex + 1);
++    }
+ 
+     if (channel != null) {
+ 
+         sendAcknowledge(status, event, checksum, channel, remoteAddress);
+ 
+         String devicePassword = AttributeUtil.getDevicePassword(
+                 getCacheManager(), deviceSession.getDeviceId(), getProtocolName(), DEFAULT_DEVICE_PASSWORD);
+         sendEventResponse(event, devicePassword, channel, remoteAddress);
+     }
+ 
+     return position;
+ }
+\ No newline at end of file

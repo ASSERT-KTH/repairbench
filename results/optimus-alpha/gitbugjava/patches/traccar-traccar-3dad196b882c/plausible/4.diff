@@ -1,0 +1,212 @@
+diff --git a/tmp/2715448c-682d-406b-b5ec-16dc690a099d_buggy.java b/tmp/0a6845b1-be88-4a37-9df6-16d90bc8d138_fixed.java
+index c6164f1..cdc6f5b 100644
+--- a/tmp/2715448c-682d-406b-b5ec-16dc690a099d_buggy.java
++++ b/tmp/0a6845b1-be88-4a37-9df6-16d90bc8d138_fixed.java
+@@ -1,116 +1,197 @@
+ private Position decodePosition(
+         Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+     DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+     if (deviceSession == null) {
+         return null;
+     }
+ 
+     Position position = new Position(getProtocolName());
+     position.setDeviceId(deviceSession.getDeviceId());
+ 
+     int status = buf.readUnsignedShort();
+ 
+     position.setValid(BitUtil.check(status, 15));
+ 
+     position.set(Position.KEY_STATUS, status);
+     position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+     int event = buf.readUnsignedShort();
+     position.set(Position.KEY_ALARM, decodeAlarm(event));
+     position.set(Position.KEY_EVENT, event);
+ 
+     String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
+     DateBuilder dateBuilder = new DateBuilder()
+-                .setYear(Integer.parseInt(time.substring(0, 2)))
++            .setYear(Integer.parseInt(time.substring(0, 2)) + 2000)
+             .setMonth(Integer.parseInt(time.substring(2, 4)))
+             .setDay(Integer.parseInt(time.substring(4, 6)))
+             .setHour(Integer.parseInt(time.substring(6, 8)))
+             .setMinute(Integer.parseInt(time.substring(8, 10)))
+             .setSecond(Integer.parseInt(time.substring(10, 12)));
+     position.setTime(dateBuilder.getDate());
+ 
+     position.setLongitude(buf.readInt() * 0.00001);
+     position.setLatitude(buf.readInt() * 0.00001);
+ 
+     position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+     position.setCourse(buf.readUnsignedShort());
+     position.setAltitude(buf.readUnsignedShort());
+ 
+     position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
+ 
+     Network network = new Network();
+ 
+-        while (buf.readableBytes() > 4) {
++    // Fix: only try parsing more sub-records if enough bytes remain for header
++    while (buf.readableBytes() >= 4) {
+         int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
++        int length = buf.readUnsignedShort();
++
++        // Defensive: If declared length is less than 4, cannot contain data (invalid record)
++        if (length < 4) {
++            break;
++        }
++        int dataLength = length - 4;
++
++        // Defensive: check if enough bytes remain before reading data.
++        if (buf.readableBytes() < dataLength) {
++            buf.skipBytes(buf.readableBytes()); // Skip to end to avoid loop lock
++            break;
++        }
+         switch (subtype) {
+             case 0x0001:
++                if (dataLength >= 18) {
+                     int coolantTemperature = buf.readUnsignedByte() - 40;
+                     if (coolantTemperature <= 215) {
+                         position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                     }
+                     int rpm = buf.readUnsignedShort();
+                     if (rpm <= 65535) {
+                         position.set(Position.KEY_RPM, rpm);
+                     }
+                     position.set("averageSpeed", buf.readUnsignedByte());
+                     buf.readUnsignedShort(); // interval fuel consumption
+                     position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
+                     position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+                     buf.readUnsignedInt(); // trip id
++                } else {
++                    buf.skipBytes(dataLength);
++                }
+                 break;
+             case 0x0005:
++                if (dataLength >= 6) {
+                     position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                     position.set(Position.KEY_HDOP, buf.readUnsignedByte());
+                     buf.readUnsignedInt(); // run time
++                } else {
++                    buf.skipBytes(dataLength);
++                }
+                 break;
+             case 0x0009:
++                if (dataLength > 0 && buf.readableBytes() >= dataLength) {
+                     position.set(
+-                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
++                            Position.KEY_VIN, buf.readCharSequence(dataLength, StandardCharsets.US_ASCII).toString());
++                } else {
++                    buf.skipBytes(dataLength);
++                }
+                 break;
+             case 0x0011:
++                if (dataLength >= 4) {
+                     position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
++                } else {
++                    buf.skipBytes(dataLength);
++                }
++                break;
++            case 0x0013:
++                // DTCs
++                if (dataLength > 0 && dataLength % 2 == 0) {
++                    StringBuilder dtcs = new StringBuilder();
++                    for (int i = 0; i < dataLength / 2; i++) {
++                        int code = buf.readUnsignedShort();
++                        char type;
++                        switch ((code >> 14) & 0x3) {
++                            case 0: type = 'P'; break;
++                            case 1: type = 'C'; break;
++                            case 2: type = 'B'; break;
++                            case 3: type = 'U'; break;
++                            default: type = '?'; break;
++                        }
++                        int main = (code >> 12) & 0x3;
++                        int sub = (code >> 8) & 0xF;
++                        int val = code & 0xFF;
++                        dtcs.append(type)
++                            .append(main)
++                            .append(String.format("%01X", sub))
++                            .append(String.format("%02X", val));
++                        if (i < dataLength / 2 - 1) {
++                            dtcs.append(" ");
++                        }
++                    }
++                    position.set(Position.KEY_DTCS, dtcs.toString());
++                } else {
++                    buf.skipBytes(dataLength);
++                }
+                 break;
+             case 0x0014:
++                if (dataLength >= 6) {
+                     position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
+                     position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+                     position.set("airTemp", buf.readUnsignedByte() - 40);
+                     position.set("airFlow", buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
++                } else {
++                    buf.skipBytes(dataLength);
++                }
+                 break;
+             case 0x0020:
++                if (dataLength > 0 && buf.readableBytes() >= dataLength) {
+                     String[] cells = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                            dataLength, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String cell : cells) {
+                         String[] values = cell.split("@");
++                        if (values.length == 4) {
++                            try {
+                                 network.addCellTower(CellTower.from(
+                                     Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                     Integer.parseInt(values[2], 16), Integer.parseInt(values[3], 16)));
++                            } catch (Exception ignore) {}
++                        }
++                    }
++                } else {
++                    buf.skipBytes(dataLength);
+                 }
+                 break;
+             case 0x0021:
++                if (dataLength > 0 && buf.readableBytes() >= dataLength) {
+                     String[] points = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                            dataLength, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String point : points) {
+                         String[] values = point.split("@");
+-                        network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
++                        if (values.length == 2) {
++                            try {
++                                network.addWifiAccessPoint(WifiAccessPoint.from(
++                                    values[0], Integer.parseInt(values[1])));
++                            } catch (Exception ignore) {}
++                        }
++                    }
++                } else {
++                    buf.skipBytes(dataLength);
+                 }
+                 break;
+             default:
+-                    buf.skipBytes(length);
++                buf.skipBytes(dataLength);
+                 break;
+         }
+     }
+ 
+-        if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
++    if ((network.getCellTowers() != null && !network.getCellTowers().isEmpty())
++            || (network.getWifiAccessPoints() != null && !network.getWifiAccessPoints().isEmpty())) {
+         position.setNetwork(network);
+     }
+ 
+     sendResponse(channel, MSG_POSITION_RSP, index, null);
+ 
+     return position;
+ }
+\ No newline at end of file

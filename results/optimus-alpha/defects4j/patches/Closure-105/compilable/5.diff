@@ -1,0 +1,163 @@
+diff --git a/tmp/53a7984f-46f3-4986-9e9b-962bf3d303a4_buggy.java b/tmp/cafead5c-1b73-4205-b7ac-99064f54f395_fixed.java
+index ef65dd9..a6a3e45 100644
+--- a/tmp/53a7984f-46f3-4986-9e9b-962bf3d303a4_buggy.java
++++ b/tmp/cafead5c-1b73-4205-b7ac-99064f54f395_fixed.java
+@@ -1,92 +1,142 @@
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
+     if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
+       return;
+     }
+ 
+     Node arrayNode = left.getFirstChild();
+     Node functionName = arrayNode.getNext();
+ 
+     if ((arrayNode.getType() != Token.ARRAYLIT) ||
+         !functionName.getString().equals("join")) {
+       return;
+     }
+ 
+     String joinString = NodeUtil.getStringValue(right);
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+     StringBuilder sb = new StringBuilder();
+     int foldedSize = 0;
+     Node elem = arrayNode.getFirstChild();
+-    // Merges adjacent String nodes.
++
++    // Consume nodes, merging adjacent string/immutable nodes,
++    // splitting at non-immutable elements, as per JavaScript .join()
+     while (elem != null) {
+       if (NodeUtil.isImmutableValue(elem)) {
+         if (sb.length() > 0) {
+           sb.append(joinString);
+         }
+         sb.append(NodeUtil.getStringValue(elem));
+       } else {
+         if (sb.length() > 0) {
+           // + 2 for the quotes.
+           foldedSize += sb.length() + 2;
+           arrayFoldedChildren.add(Node.newString(sb.toString()));
+           sb = new StringBuilder();
+         }
+         foldedSize += InlineCostEstimator.getCost(elem);
+         arrayFoldedChildren.add(elem);
+       }
+       elem = elem.getNext();
+     }
+ 
+     if (sb.length() > 0) {
+       // + 2 for the quotes.
+       foldedSize += sb.length() + 2;
+       arrayFoldedChildren.add(Node.newString(sb.toString()));
+     }
+     // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
++    foldedSize += Math.max(arrayFoldedChildren.size() - 1, 0);
+ 
+     int originalSize = InlineCostEstimator.getCost(n);
++
++    // (***** FIXED BEGIN *****)
++    // For optimal folding, merge adjacent immutable values and preserve runs of non-immutable values,
++    // so folding cases like ['', '', foo, ''].join(',') to [',', foo, ''].join(',')
++    // will work. The difference to original is that in the run of immutable elements, 
++    // even empty '' elements, we build a concatenated string joined with the delimiter,
++    // and then only insert a non-immutable node or merged string node when switching groups.
++
++    // But the above already works as coded. The bug is that after merging, we compare size,
++    // but if foldedSize > originalSize, we fallback and return without changing node.
++    // The problem seen in the test is also that we count the overhead for "[].join()",
++    // but actually in the final output, if the result is a literal string, we can emit it directly 
++    // and there is no .join overhead.
++    // The algorithm is mostly correct, but currently: for ['a', 'b', 'c'].join(',') -> ["a,b,c"].join(",")
++    // we should fold to 'a,b,c', not to an array + join if all elements are mergeable!
++
++    // So change: If all are merged into a single string, fold to string not array + .join().
++    // Similarly, always replace [arr].join(X) with the string if arrayFoldedChildren.size==1 and it is STRING node.
++
++    // (***** FIXED END *****)
++
+     switch (arrayFoldedChildren.size()) {
+       case 0:
+         Node emptyStringNode = Node.newString("");
+         parent.replaceChild(n, emptyStringNode);
++        t.getCompiler().reportCodeChange();
+         break;
+ 
+       case 1:
+         Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
+-          return;
+-        }
+-        arrayNode.detachChildren();
+-        if (foldedStringNode.getType() != Token.STRING) {
+-          // If the Node is not a string literal, ensure that
+-          // it is coerced to a string.
+-          Node replacement = new Node(Token.ADD,
+-              Node.newString(""), foldedStringNode);
+-          foldedStringNode = replacement;
+-        }
++        // Only fold if it's a STRING literal, or folding cost is no worse.
++        // But in modern Closure let's just allow folding to string always if it's a string node.
++        if (foldedStringNode.getType() == Token.STRING) {
+           parent.replaceChild(n, foldedStringNode);
++          t.getCompiler().reportCodeChange();
++        } else {
++          // If the Node is not a string literal, ensure that
++          // it is coerced to a string (with ""+value)
++          if (foldedSize > originalSize) {
++            return;
++          }
++          arrayNode.detachChildren();
++          Node replacement = new Node(Token.ADD, Node.newString(""), foldedStringNode);
++          parent.replaceChild(n, replacement);
++          t.getCompiler().reportCodeChange();
++        }
+         break;
+ 
+       default:
++        // If only string elements remain, merge them into a literal and replace.
++        boolean allStrings = true;
++        for (Node c : arrayFoldedChildren) {
++          if (c.getType() != Token.STRING) {
++            allStrings = false;
++            break;
++          }
++        }
++        // Join all string children and fold to a string if possible.
++        if (allStrings) {
++          // Reconstruct .join result.
++          StringBuilder mergedSb = new StringBuilder();
++          for (int i = 0; i < arrayFoldedChildren.size(); i++) {
++            if (i > 0) mergedSb.append(joinString);
++            mergedSb.append(arrayFoldedChildren.get(i).getString());
++          }
++          Node newStringNode = Node.newString(mergedSb.toString());
++          parent.replaceChild(n, newStringNode);
++          t.getCompiler().reportCodeChange();
++          break;
++        }
++
+         // No folding could actually be performed.
+         if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+           return;
+         }
+         int kJoinOverhead = "[].join()".length();
+         foldedSize += kJoinOverhead;
+         foldedSize += InlineCostEstimator.getCost(right);
+         if (foldedSize > originalSize) {
+           return;
+         }
+         arrayNode.detachChildren();
+         for (Node node : arrayFoldedChildren) {
+           arrayNode.addChildToBack(node);
+         }
+-        break;
+-    }
+         t.getCompiler().reportCodeChange();
++        break;
++    }
+   }
+\ No newline at end of file
