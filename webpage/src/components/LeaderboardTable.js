@@ -142,7 +142,7 @@ const LeaderboardTable = () => {
         accessor: 'provider',
         Cell: ({ value }) => (
           <div className="provider-cell">
-            <ReactCountryFlag countryCode={llmCountryMap[value] || 'UN'} svg className="country-flag" />
+            <ReactCountryFlag countryCode={llmCountryMap[value] || 'XX'} svg className="country-flag" />
             <span className="provider-name">{value}</span>
           </div>
         ),
