@@ -1,0 +1,246 @@
+You are an automatic program repair tool. Your task is to fix the provided buggy code.
+
+The following code contains a buggy function:
+```java
+    @Override
+    public JsonToken nextToken() throws IOException
+    {
+        _binaryValue = null;
+        if (_nextToken != null) {
+            JsonToken t = _nextToken;
+            _currToken = t;
+            _nextToken = null;
+            switch (t) {
+            case START_OBJECT:
+                _parsingContext = _parsingContext.createChildObjectContext(-1, -1);
+                break;
+            case START_ARRAY:
+                _parsingContext = _parsingContext.createChildArrayContext(-1, -1);
+                break;
+            case END_OBJECT:
+            case END_ARRAY:
+                _parsingContext = _parsingContext.getParent();
+                _namesToWrap = _parsingContext.getNamesToWrap();
+                break;
+            case FIELD_NAME:
+                _parsingContext.setCurrentName(_xmlTokens.getLocalName());
+                break;
+            default: // VALUE_STRING, VALUE_NULL
+                // should be fine as is?
+            }
+            return t;
+        }
+        int token = _xmlTokens.next();
+
+        // Need to have a loop just because we may have to eat/convert
+        // a start-element that indicates an array element.
+        while (token == XmlTokenStream.XML_START_ELEMENT) {
+            // If we thought we might get leaf, no such luck
+            if (_mayBeLeaf) {
+                // leave _mayBeLeaf set, as we start a new context
+                _nextToken = JsonToken.FIELD_NAME;
+                _parsingContext = _parsingContext.createChildObjectContext(-1, -1);
+                return (_currToken = JsonToken.START_OBJECT);
+            }
+            if (_parsingContext.inArray()) {
+                // Yup: in array, so this element could be verified; but it won't be
+                // reported anyway, and we need to process following event.
+                token = _xmlTokens.next();
+                _mayBeLeaf = true;
+                continue;
+            }
+            String name = _xmlTokens.getLocalName();
+            _parsingContext.setCurrentName(name);
+
+            // Ok: virtual wrapping can be done by simply repeating current START_ELEMENT.
+            // Couple of ways to do it; but start by making _xmlTokens replay the thing...
+            if (_namesToWrap != null && _namesToWrap.contains(name)) {
+                _xmlTokens.repeatStartElement();
+            }
+
+            _mayBeLeaf = true;
+            // Ok: in array context we need to skip reporting field names.
+            // But what's the best way to find next token?
+            return (_currToken = JsonToken.FIELD_NAME);
+        }
+
+        // Ok; beyond start element, what do we get?
+        switch (token) {
+        case XmlTokenStream.XML_END_ELEMENT:
+            // Simple, except that if this is a leaf, need to suppress end:
+            if (_mayBeLeaf) {
+                _mayBeLeaf = false;
+                    // 06-Jan-2015, tatu: as per [dataformat-xml#180], need to
+                    //    expose as empty Object, not null
+                return (_currToken = JsonToken.VALUE_NULL);
+            }
+            _currToken = _parsingContext.inArray() ? JsonToken.END_ARRAY : JsonToken.END_OBJECT;
+            _parsingContext = _parsingContext.getParent();
+            _namesToWrap = _parsingContext.getNamesToWrap();
+            return _currToken;
+            
+        case XmlTokenStream.XML_ATTRIBUTE_NAME:
+            // If there was a chance of leaf node, no more...
+            if (_mayBeLeaf) {
+                _mayBeLeaf = false;
+                _nextToken = JsonToken.FIELD_NAME;
+                _currText = _xmlTokens.getText();
+                _parsingContext = _parsingContext.createChildObjectContext(-1, -1);
+                return (_currToken = JsonToken.START_OBJECT);
+            }
+            _parsingContext.setCurrentName(_xmlTokens.getLocalName());
+            return (_currToken = JsonToken.FIELD_NAME);
+        case XmlTokenStream.XML_ATTRIBUTE_VALUE:
+            _currText = _xmlTokens.getText();
+            return (_currToken = JsonToken.VALUE_STRING);
+        case XmlTokenStream.XML_TEXT:
+            _currText = _xmlTokens.getText();
+            if (_mayBeLeaf) {
+                _mayBeLeaf = false;
+                /* One more refinement (pronunced like "hack") is that if
+                 * we had an empty String (or all white space), and we are
+                 * deserializing an array, we better hide the empty text.
+                 */
+                // Also: must skip following END_ELEMENT
+                _xmlTokens.skipEndElement();
+                if (_parsingContext.inArray()) {
+                    if (_isEmpty(_currText)) {
+                        // 06-Jan-2015, tatu: as per [dataformat-xml#180], need to
+                        //    expose as empty Object, not null (or, worse, as used to
+                        //    be done, by swallowing the token)
+                        _currToken = JsonToken.END_ARRAY;
+                        _parsingContext = _parsingContext.getParent();
+                        _namesToWrap = _parsingContext.getNamesToWrap();
+                        return _currToken;
+                    }
+                }
+                return (_currToken = JsonToken.VALUE_STRING);
+            } else {
+                // [dataformat-xml#177]: empty text may also need to be skipped
+                if (_parsingContext.inObject()
+                        && (_currToken != JsonToken.FIELD_NAME) && _isEmpty(_currText)) {
+                    _currToken = JsonToken.END_OBJECT;
+                    _parsingContext = _parsingContext.getParent();
+                    _namesToWrap = _parsingContext.getNamesToWrap();
+                    return _currToken;
+                }
+            }
+            // If not a leaf (or otherwise ignorable), need to transform into property...
+            _parsingContext.setCurrentName(_cfgNameForTextElement);
+            _nextToken = JsonToken.VALUE_STRING;
+            return (_currToken = JsonToken.FIELD_NAME);
+        case XmlTokenStream.XML_END:
+            return (_currToken = null);
+        }
+        
+        // should never get here
+        _throwInternal();
+        return null;
+    }
+
+```
+
+The code fails the following tests.
+
+Test `com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedLists180Test::testNestedUnwrappedLists180`:
+```java
+    public void testNestedUnwrappedLists180() throws Exception
+    {
+        /*
+        Records recs = new Records();
+        recs.records.add(new Record());
+        recs.records.add(new Record());
+        recs.records.add(new Record());
+        recs.records.get(0).fields.add(new Field("a"));
+        recs.records.get(2).fields.add(new Field("b"));
+
+        String xml = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(recs);
+        */
+
+        String xml =
+"<Records>\n"
+// Important: it's the empty CDATA here that causes breakage -- empty element alone would be fine
+//+"<records>\n</records>\n"
++"<records></records>\n"
++"  <records>\n"
++"   <fields name='b'/>\n"
++"  </records>\n"
++"</Records>\n"
+;
+        
+//System.out.println("XML: "+xml);
+
+        Records result = MAPPER.readValue(xml, Records.class);
+        assertNotNull(result.records);
+        assertEquals(2, result.records.size());
+        assertNotNull(result.records.get(1));
+        assertEquals(1, result.records.get(1).fields.size());
+        assertEquals("b", result.records.get(1).fields.get(0).name);
+
+        // also, first one ought not be null should it? Ideally not...
+        assertNotNull(result.records.get(0));
+    }
+
+```
+Test `com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedLists180Test::testNestedUnwrappedLists180` error:
+```
+junit.framework.AssertionFailedError: expected:<1> but was:<0>;com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedListsTest::testNestedWithEmpty
+```
+
+Test `com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedListsTest::testNestedWithEmpty2`:
+```java
+    public void testNestedWithEmpty2() throws Exception
+    {
+        final String XML =
+"<ServiceDelivery>\n"
++"  <ResponseTimestamp>2012-09-12T09:28:17.213-04:00</ResponseTimestamp>\n"
++"  <VehicleMonitoringDelivery>\n"
++"    <VehicleActivity>\n"
++"    </VehicleActivity>\n"
++"  </VehicleMonitoringDelivery>\n"
++"</ServiceDelivery>\n"
+                ;
+        
+        ServiceDelivery svc = _xmlMapper.readValue(XML, ServiceDelivery.class);
+        assertNotNull(svc);
+        assertNotNull(svc.vehicleMonitoringDelivery);
+        assertEquals(1, svc.vehicleMonitoringDelivery.size());
+        VehicleMonitoringDelivery del = svc.vehicleMonitoringDelivery.get(0);
+        assertNotNull(del.vehicleActivity);
+        // 06-Jan-2015, tatu: Really should have one empty entry, not 0
+        assertEquals(1, del.vehicleActivity.size());
+    }
+
+```
+Test `com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedListsTest::testNestedWithEmpty2` error:
+```
+junit.framework.AssertionFailedError: expected:<1> but was:<0>
+```
+
+Test `com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedListsTest::testNestedWithEmpty`:
+```java
+    public void testNestedWithEmpty() throws Exception
+    {
+        final String XML =
+"<ServiceDelivery>\n"
++"  <ResponseTimestamp>2012-09-12T09:28:17.213-04:00</ResponseTimestamp>\n"
++"  <VehicleMonitoringDelivery>\n"
++"  </VehicleMonitoringDelivery>\n"
++"</ServiceDelivery>\n"
+                ;
+        
+        ServiceDelivery svc = _xmlMapper.readValue(XML, ServiceDelivery.class);
+        assertNotNull(svc);
+        assertNotNull(svc.vehicleMonitoringDelivery);
+        // 06-Jan-2015, tatu: Really should have one empty entry, not 0
+        assertEquals(1, svc.vehicleMonitoringDelivery.size());
+    }
+
+```
+Test `com.fasterxml.jackson.dataformat.xml.lists.NestedUnwrappedListsTest::testNestedWithEmpty` error:
+```
+junit.framework.AssertionFailedError: expected:<1> but was:<0>
+```
+
+
+Please provide a fixed version of the buggy function, and only that function, inside a code block.

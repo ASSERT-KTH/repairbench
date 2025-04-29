@@ -1,0 +1,246 @@
+diff --git a/tmp/4d044c85-081b-4aae-af1f-78abcf0ac5a6_buggy.java b/tmp/54f8d64b-5593-46ce-ab6a-1d8574652007_fixed.java
+index f591bc6..f1ff5df 100644
+--- a/tmp/4d044c85-081b-4aae-af1f-78abcf0ac5a6_buggy.java
++++ b/tmp/54f8d64b-5593-46ce-ab6a-1d8574652007_fixed.java
+@@ -1,74 +1,203 @@
++    @Override
+     protected Object decodeAvrmc(
+             String sentence, Channel channel, SocketAddress remoteAddress) {
+ 
+-        Parser parser = new Parser(PATTERN_AVRMC, sentence);
+-        if (!parser.matches()) {
++        // Only handle AVRMC sentences
++        if (!sentence.startsWith("$AVRMC,")) {
+             return null;
+         }
+ 
+-        DeviceSession deviceSession =
+-            getDeviceSession(channel, remoteAddress, parser.next());
++        // Separate data part and checksum
++        int asteriskIndex = sentence.indexOf('*');
++        String data = sentence;
++        String checksum = null;
++        if (asteriskIndex >= 0) {
++            data = sentence.substring(0, asteriskIndex);
++            checksum = sentence.substring(asteriskIndex + 1);
++        }
++
++        // Split fields by comma
++        String[] parts = data.split(",");
++        // We need at least 16 fields to parse a position
++        if (parts.length < 16) {
++            return null;
++        }
++
++        // Device session
++        String uniqueId = parts[1];
++        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, uniqueId);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
++        // Determine device model (for ADC2 handling)
+         String deviceModel = null;
+         Device device = getCacheManager().getObject(Device.class, deviceSession.getDeviceId());
+         if (device != null) {
+             deviceModel = device.getModel();
+         }
+ 
++        // Create position
+         Position position = new Position(getProtocolName());
+-
+         position.setDeviceId(deviceSession.getDeviceId());
++
++        //
++        // 1. Date and Time
++        //
++        // Time is hhmmss
++        String timeStr = parts[2];
++        int hour = 0, minute = 0, second = 0;
++        if (timeStr.length() >= 6) {
++            hour = Integer.parseInt(timeStr.substring(0, 2));
++            minute = Integer.parseInt(timeStr.substring(2, 4));
++            second = Integer.parseInt(timeStr.substring(4, 6));
++        }
++        // Date is ddmmyy
++        String dateStr = parts[10];
++        int day = 0, month = 0, year = 0;
++        if (dateStr.length() >= 6) {
++            day = Integer.parseInt(dateStr.substring(0, 2));
++            month = Integer.parseInt(dateStr.substring(2, 4));
++            year = Integer.parseInt(dateStr.substring(4, 6));
++        }
+         DateBuilder dateBuilder = new DateBuilder()
+-                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+-
+-        String status = parser.next();
+-        String upperCaseStatus = status.toUpperCase();
+-        position.setValid(upperCaseStatus.equals("A") || upperCaseStatus.equals("R") || upperCaseStatus.equals("P"));
+-        position.set(Position.KEY_STATUS, status);
+-
+-        position.setLatitude(parser.nextCoordinate());
+-        position.setLongitude(parser.nextCoordinate());
+-        position.setSpeed(parser.nextDouble(0));
+-        position.setCourse(parser.nextDouble(0));
+-
+-        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
++                .setTime(hour, minute, second)
++                .setDateReverse(day, month, year);
+         position.setTime(dateBuilder.getDate());
+ 
+-        String event = parser.next();
++        //
++        // 2. Status
++        //
++        String status = parts[3];
++        String upperStatus = status.toUpperCase();
++        boolean valid = upperStatus.equals("A")
++                || upperStatus.equals("R")
++                || upperStatus.equals("P");
++        position.setValid(valid);
++        position.set(Position.KEY_STATUS, status);
++
++        //
++        // 3. Coordinates
++        //
++        double latitude = 0.0;
++        try {
++            double rawLat = Double.parseDouble(parts[4]);
++            int latDeg = (int) (rawLat / 100);
++            double latMin = rawLat - latDeg * 100;
++            latitude = latDeg + latMin / 60;
++            if ("S".equals(parts[5])) {
++                latitude = -latitude;
++            }
++        } catch (Exception ignore) {
++        }
++        position.setLatitude(latitude);
++
++        double longitude = 0.0;
++        try {
++            double rawLon = Double.parseDouble(parts[6]);
++            int lonDeg = (int) (rawLon / 100);
++            double lonMin = rawLon - lonDeg * 100;
++            longitude = lonDeg + lonMin / 60;
++            if ("W".equals(parts[7])) {
++                longitude = -longitude;
++            }
++        } catch (Exception ignore) {
++        }
++        position.setLongitude(longitude);
++
++        //
++        // 4. Speed & Course
++        //
++        try {
++            position.setSpeed(Double.parseDouble(parts[8]));
++        } catch (Exception ignore) {
++        }
++        try {
++            position.setCourse(Double.parseDouble(parts[9]));
++        } catch (Exception ignore) {
++        }
++
++        //
++        // 5. Event
++        //
++        String event = parts[11];
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, decodeEvent(event, position, deviceModel));
+-        position.set(Position.KEY_BATTERY, Double.parseDouble(parser.next().replaceAll("\\.", "")) * 0.001);
+-        position.set(Position.KEY_ODOMETER, parser.nextDouble() * 1000);
+-        position.set(Position.KEY_GPS, parser.nextInt());
+-        position.set(Position.PREFIX_ADC + 1, parser.nextDouble() * 0.001);
+ 
++        //
++        // 6. Battery
++        //
++        try {
++            String batt = parts[12].replaceAll("\\.", "");
++            position.set(Position.KEY_BATTERY, Double.parseDouble(batt) * 0.001);
++        } catch (Exception ignore) {
++        }
++
++        //
++        // 7. Odometer
++        //
++        try {
++            position.set(Position.KEY_ODOMETER, Double.parseDouble(parts[13]) * 1000);
++        } catch (Exception ignore) {
++        }
++
++        //
++        // 8. GPS satellites
++        //
++        try {
++            position.set(Position.KEY_GPS, Integer.parseInt(parts[14]));
++        } catch (Exception ignore) {
++        }
++
++        //
++        // 9. ADC1
++        //
++        try {
++            position.set(Position.PREFIX_ADC + 1, Double.parseDouble(parts[15]) * 0.001);
++        } catch (Exception ignore) {
++        }
++
++        //
++        // 10. ADC2 for specific models
++        //
++        int index = 16;
+         if ("AVL110".equals(deviceModel) || "AVL120".equals(deviceModel)) {
+-            position.set(Position.PREFIX_ADC + 2, parser.nextDouble() * 0.001);
++            if (parts.length > index) {
++                try {
++                    position.set(Position.PREFIX_ADC + 2, Double.parseDouble(parts[index]) * 0.001);
++                } catch (Exception ignore) {
+                 }
+-
+-        Integer lac = parser.nextHexInt();
+-        Integer cid = parser.nextHexInt();
+-        Integer mcc = parser.nextInt();
+-        Integer mnc = parser.nextInt();
+-        if (lac != null && cid != null && mcc != null && mnc != null) {
+-            position.setNetwork(new Network(CellTower.from(mcc, mnc, lac, cid)));
++            }
++            index++;
+         }
+ 
+-        parser.next(); // unused
+-
+-        String checksum = parser.next();
++        //
++        // 11. Network (lac, cid, mcc, mnc) if present and non-zero
++        //
++        if (parts.length >= index + 4) {
++            try {
++                int lac = Integer.parseInt(parts[index], 16);
++                int cid = Integer.parseInt(parts[index + 1], 16);
++                int mcc = Integer.parseInt(parts[index + 2]);
++                int mnc = Integer.parseInt(parts[index + 3]);
++                if (lac != 0 && cid != 0) {
++                    position.setNetwork(new Network(
++                            CellTower.from(mcc, mnc, lac, cid)));
++                }
++            } catch (Exception ignore) {
++            }
++        }
+ 
++        //
++        // 12. Acknowledge & Event response
++        //
+         if (channel != null) {
+-
+             sendAcknowledge(status, event, checksum, channel, remoteAddress);
+-
+             String devicePassword = AttributeUtil.getDevicePassword(
+-                    getCacheManager(), deviceSession.getDeviceId(), getProtocolName(), DEFAULT_DEVICE_PASSWORD);
++                    getCacheManager(), deviceSession.getDeviceId(),
++                    getProtocolName(), DEFAULT_DEVICE_PASSWORD);
+             sendEventResponse(event, devicePassword, channel, remoteAddress);
+         }
+ 
+         return position;
+     }
+\ No newline at end of file

@@ -1,0 +1,166 @@
+diff --git a/tmp/06289ecc-0898-4d31-9b97-5e54de89bea3_buggy.java b/tmp/31303334-3694-4223-9952-fd7755510ed3_fixed.java
+index 6f24eb6..f928532 100644
+--- a/tmp/06289ecc-0898-4d31-9b97-5e54de89bea3_buggy.java
++++ b/tmp/31303334-3694-4223-9952-fd7755510ed3_fixed.java
+@@ -1,99 +1,113 @@
+-  /**
+-   * Determines whether the given property is visible in the current context.
+-   * @param t The current traversal.
+-   * @param getprop The getprop node.
+-   */
+ private void checkPropertyVisibility(NodeTraversal t,
+     Node getprop, Node parent) {
+   ObjectType objectType =
+       ObjectType.cast(dereference(getprop.getFirstChild().getJSType()));
+   String propertyName = getprop.getLastChild().getString();
+ 
+   if (objectType != null) {
+-      // Is this a normal property access, or are we trying to override
+-      // an existing property?
+-      boolean isOverride = t.inGlobalScope() &&
+-          parent.getType() == Token.ASSIGN &&
+-          parent.getFirstChild() == getprop;
++    // Detect prototype‐based overrides vs. instance‐based overrides.
++    boolean isAssign = parent.getType() == Token.ASSIGN
++        && parent.getFirstChild() == getprop;
++    boolean isProtoGet = getprop.getFirstChild().isGetProp()
++        && "prototype".equals(
++            getprop.getFirstChild().getLastChild().getString());
++    boolean isProtoOverride = isAssign && t.inGlobalScope() && isProtoGet;
++    boolean isInstanceOverride = isAssign
++        && getprop.getFirstChild().getType() == Token.THIS
++        && currentClass != null;
++    boolean isOverride = isProtoOverride || isInstanceOverride;
+ 
+-      // Find the lowest property defined on a class with visibility
+-      // information.
+-      if (isOverride) {
+-        objectType = objectType.getImplicitPrototype();
++    // Find the lowest property on the prototype chain with a visibility
++    // annotation.
++    ObjectType scanType = objectType;
++    if (isProtoOverride) {
++      // Skip the subclass prototype when overriding a prototype property.
++      scanType = scanType.getImplicitPrototype();
+     }
+     JSDocInfo docInfo = null;
+-      for (; objectType != null;
+-           objectType = objectType.getImplicitPrototype()) {
+-        docInfo = objectType.getOwnPropertyJSDocInfo(propertyName);
++    ObjectType docOwnerType = null;
++    for (ObjectType cur = scanType; cur != null;
++         cur = cur.getImplicitPrototype()) {
++      docInfo = cur.getOwnPropertyJSDocInfo(propertyName);
+       if (docInfo != null &&
+           docInfo.getVisibility() != Visibility.INHERITED) {
++        docOwnerType = cur;
+         break;
+       }
+     }
+-
+-      if (objectType == null) {
+-        // We couldn't find a visibility modifier; assume it's public.
++    if (docOwnerType == null) {
++      // No @private/@protected annotation found ⇒ public.
+       return;
+     }
+ 
+     boolean sameInput =
+         t.getInput().getName().equals(docInfo.getSourceName());
+     Visibility visibility = docInfo.getVisibility();
+-      JSType ownerType = normalizeClassType(objectType);
++    JSType ownerType = normalizeClassType(docOwnerType);
++
+     if (isOverride) {
+-        // Check an ASSIGN statement that's trying to override a property
+-        // on a superclass.
++      // We're in an ASSIGN that's trying to override a superclass property.
+       JSDocInfo overridingInfo = parent.getJSDocInfo();
+-        Visibility overridingVisibility = overridingInfo == null ?
+-            Visibility.INHERITED : overridingInfo.getVisibility();
++      Visibility overridingVisibility = overridingInfo == null
++          ? Visibility.INHERITED
++          : overridingInfo.getVisibility();
+ 
+-        // Check that (a) the property *can* be overridden, and
+-        // (b) that the visibility of the override is the same as the
+-        // visibility of the original property.
++      // (a) Private properties cannot be overridden across files.
+       if (visibility == Visibility.PRIVATE && !sameInput) {
++        if (overridingVisibility == Visibility.INHERITED) {
++          // No @private on the override ⇒ treat as illegal access.
+           compiler.report(
+-              t.makeError(getprop, PRIVATE_OVERRIDE,
+-                  objectType.toString()));
+-        } else if (overridingVisibility != Visibility.INHERITED &&
+-            overridingVisibility != visibility) {
++              t.makeError(getprop,
++                  BAD_PRIVATE_PROPERTY_ACCESS,
++                  propertyName,
++                  validator.getReadableJSTypeName(
++                      getprop.getFirstChild(), true)));
++        } else {
++          // @private was specified on the override ⇒ wrong override.
++          compiler.report(
++              t.makeError(getprop,
++                  PRIVATE_OVERRIDE,
++                  docOwnerType.toString()));
++        }
++      }
++      // (b) If the override declares a visibility, it must match.
++      else if (overridingVisibility != Visibility.INHERITED
++          && overridingVisibility != visibility) {
+         compiler.report(
+             t.makeError(getprop, VISIBILITY_MISMATCH,
+-                  visibility.name(), objectType.toString(),
++                visibility.name(), docOwnerType.toString(),
+                 overridingVisibility.name()));
+       }
+     } else {
++      // Normal property access.
+       if (sameInput) {
+         // private access is always allowed in the same file.
+         return;
+-        } else if (visibility == Visibility.PRIVATE &&
+-            (currentClass == null || ownerType.differsFrom(currentClass))) {
+-          if (docInfo.isConstructor() &&
+-              isValidPrivateConstructorAccess(parent)) {
++      } else if (visibility == Visibility.PRIVATE
++          && (currentClass == null
++              || ownerType.differsFrom(currentClass))) {
++        if (docInfo.isConstructor()
++            && isValidPrivateConstructorAccess(parent)) {
+           return;
+         }
+-
+-          // private access is not allowed outside the file from a different
+-          // enclosing class.
+         compiler.report(
+             t.makeError(getprop,
+                 BAD_PRIVATE_PROPERTY_ACCESS,
+                 propertyName,
+                 validator.getReadableJSTypeName(
+                     getprop.getFirstChild(), true)));
+       } else if (visibility == Visibility.PROTECTED) {
+-          // There are 3 types of legal accesses of a protected property:
+-          // 1) Accesses in the same file
+-          // 2) Overriding the property in a subclass
+-          // 3) Accessing the property from inside a subclass
+-          // The first two have already been checked for.
+-          if (currentClass == null || !currentClass.isSubtype(ownerType)) {
++        // Protected is allowed: (1) same file, (2) override, (3) inside subclass.
++        if (currentClass == null
++            || !currentClass.isSubtype(ownerType)) {
+           compiler.report(
+-                t.makeError(getprop,  BAD_PROTECTED_PROPERTY_ACCESS,
++              t.makeError(getprop,
++                  BAD_PROTECTED_PROPERTY_ACCESS,
+                   propertyName,
+                   validator.getReadableJSTypeName(
+                       getprop.getFirstChild(), true)));
+         }
+       }
+     }
+   }
+ }
+\ No newline at end of file

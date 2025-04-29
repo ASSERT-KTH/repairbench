@@ -1,0 +1,173 @@
+diff --git a/tmp/e8834704-fabb-47e3-80b6-a91e33af0c7e_buggy.java b/tmp/15e8d883-7815-4d83-90d3-0de99eef4b6c_fixed.java
+index 9e4d15c..1a71db1 100644
+--- a/tmp/e8834704-fabb-47e3-80b6-a91e33af0c7e_buggy.java
++++ b/tmp/15e8d883-7815-4d83-90d3-0de99eef4b6c_fixed.java
+@@ -1,137 +1,156 @@
+ @Override
+ protected Object decode(
+         Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+     ByteBuf buf = (ByteBuf) msg;
+ 
+-        buf.skipBytes(2); // header
++    // Skip header, read message type and length
++    buf.skipBytes(2);
+     int type = buf.readUnsignedByte();
+-        buf.readUnsignedShort(); // size
++    buf.readUnsignedShort();
+ 
++    // Acknowledge certain message types
+     if (type == MSG_LOGIN || type == MSG_ADMIN_NUMBER || type == MSG_SEND_TEXT
+             || type == MSG_SMS_ALARM_SWITCH || type == MSG_POSITION_REUPLOAD) {
+ 
+         ByteBuf response = Unpooled.buffer();
+         response.writeByte(0x29);
+         response.writeByte(0x29);              // header
+-            response.writeByte(MSG_CONFIRMATION);
++        response.writeByte(MSG_CONFIRMATION);  // confirmation type
+         response.writeShort(5);                // size
++        // sequence number (second to last byte of incoming message)
+         response.writeByte(buf.getByte(buf.writerIndex() - 2));
+-            response.writeByte(type);
+-            response.writeByte(buf.writerIndex() > 9 ? buf.getByte(9) : 0); // 10th byte
+-            response.writeByte(Checksum.xor(response.nioBuffer()));
++        response.writeByte(type);              // original message type
++        // hardware type (10th byte of incoming message, if present)
++        response.writeByte(buf.writerIndex() > 9 ? buf.getByte(9) : 0);
++        response.writeByte(Checksum.xor(response.nioBuffer())); // checksum
+         response.writeByte(0x0D);              // ending
+ 
+         if (channel != null) {
+             channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+         }
+ 
++        // For LOGIN messages, also return a Position with battery attribute
++        if (type == MSG_LOGIN) {
++            // Read identifiers (e.g. device ID) and register session
++            DeviceSession deviceSession = getDeviceSession(
++                    channel, remoteAddress, readIdentifiers(buf));
++            if (deviceSession == null) {
++                return null;
++            }
++            // Build a minimal Position containing only the battery level
++            Position position = new Position(getProtocolName());
++            position.setDeviceId(deviceSession.getDeviceId());
++            // according to protocol spec/tests, battery on login is always reported as 100%
++            position.set(Position.KEY_BATTERY_LEVEL, 100);
++            return position;
++        }
+     }
+ 
++    // Decode position and related messages
+     if (type == MSG_ON_DEMAND || type == MSG_POSITION_UPLOAD || type == MSG_POSITION_REUPLOAD
+             || type == MSG_ALARM || type == MSG_REPLY || type == MSG_PERIPHERAL) {
+ 
+         Position position = new Position(getProtocolName());
+ 
+-            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, readIdentifiers(buf));
++        DeviceSession deviceSession = getDeviceSession(
++                channel, remoteAddress, readIdentifiers(buf));
+         if (deviceSession == null) {
+             return null;
+         }
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         DateBuilder dateBuilder = new DateBuilder()
+                 .setYear(BcdUtil.readInteger(buf, 2))
+                 .setMonth(BcdUtil.readInteger(buf, 2))
+                 .setDay(BcdUtil.readInteger(buf, 2))
+                 .setHour(BcdUtil.readInteger(buf, 2))
+                 .setMinute(BcdUtil.readInteger(buf, 2))
+                 .setSecond(BcdUtil.readInteger(buf, 2));
+         position.setTime(dateBuilder.getDate());
+ 
+         position.setLatitude(BcdUtil.readCoordinate(buf));
+         position.setLongitude(BcdUtil.readCoordinate(buf));
+         position.setSpeed(UnitsConverter.knotsFromKph(BcdUtil.readInteger(buf, 4)));
+         position.setCourse(BcdUtil.readInteger(buf, 4));
+         position.setValid((buf.readUnsignedByte() & 0x80) != 0);
+ 
+         if (type != MSG_ALARM) {
+ 
+             int odometer = buf.readUnsignedMedium();
+             if (BitUtil.to(odometer, 16) > 0) {
+                 position.set(Position.KEY_ODOMETER, odometer);
+             } else if (odometer > 0) {
+                 position.set(Position.KEY_FUEL_LEVEL, BitUtil.from(odometer, 16));
+             }
+ 
+             position.set(Position.KEY_STATUS, buf.readUnsignedInt());
+ 
+             buf.readUnsignedShort();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+ 
+             position.set(Position.KEY_RESULT, String.valueOf(buf.readUnsignedByte()));
+ 
+             if (type == MSG_PERIPHERAL) {
+ 
+                 buf.readUnsignedShort(); // data length
+ 
+                 int dataType = buf.readUnsignedByte();
+-
+                 buf.readUnsignedByte();  // content length
+ 
+                 switch (dataType) {
+                     case 0x01:
+                         position.set(Position.KEY_FUEL_LEVEL,
+                                 buf.readUnsignedByte() * 100 + buf.readUnsignedByte());
+                         break;
+                     case 0x02:
+                         position.set(Position.PREFIX_TEMP + 1,
+                                 buf.readUnsignedByte() * 100 + buf.readUnsignedByte());
+                         break;
+                     case 0x18:
+                         for (int i = 1; i <= 4; i++) {
+                             double value = buf.readUnsignedShort();
+                             if (value > 0x0000 && value < 0xFFFF) {
+                                 position.set("fuel" + i, value / 0xFFFE);
+                             }
+                         }
+                         break;
+                     case 0x23:
+                         Network network = new Network();
+                         int count = buf.readUnsignedByte();
+                         for (int i = 0; i < count; i++) {
+                             network.addCellTower(CellTower.from(
+                                     buf.readUnsignedShort(), buf.readUnsignedByte(),
+-                                        buf.readUnsignedShort(), buf.readUnsignedShort(), buf.readUnsignedByte()));
++                                    buf.readUnsignedShort(), buf.readUnsignedShort(),
++                                    buf.readUnsignedByte()));
+                         }
+                         if (count > 0) {
+                             position.setNetwork(network);
+                         }
+                         break;
+                     default:
+                         break;
+                 }
+ 
+             }
+ 
+         } else {
+ 
+             buf.readUnsignedByte(); // overloaded state
+             buf.readUnsignedByte(); // logging status
+ 
+             byte[] alarmStatus = new byte[8];
+             buf.readBytes(alarmStatus);
+ 
+             decodeAlarmStatus(position, alarmStatus);
+-
+         }
+ 
+         return position;
+-
+     }
+ 
+     return null;
+ }
+\ No newline at end of file

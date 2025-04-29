@@ -1,0 +1,155 @@
+diff --git a/tmp/f8f782f4-60f9-4a96-afda-2808712c6670_buggy.java b/tmp/941b4c83-0791-4d10-a30f-54b6002a4b37_fixed.java
+index 233a867..4d49549 100644
+--- a/tmp/f8f782f4-60f9-4a96-afda-2808712c6670_buggy.java
++++ b/tmp/941b4c83-0791-4d10-a30f-54b6002a4b37_fixed.java
+@@ -1,73 +1,119 @@
+-  /**
+-   * Determines whether a function can be inlined at a particular call site.
+-   * There are several criteria that the function and reference must hold in
+-   * order for the functions to be inlined:
+-   * 1) If a call's arguments have side effects,
+-   * the corresponding argument in the function must only be referenced once.
+-   * For instance, this will not be inlined:
+-   * <pre>
+-   *     function foo(a) { return a + a }
+-   *     x = foo(i++);
+-   * </pre>
+-   */
+ private CanInlineResult canInlineReferenceDirectly(
+     Node callNode, Node fnNode) {
+   if (!isDirectCallNodeReplacementPossible(fnNode)) {
+     return CanInlineResult.NO;
+   }
+ 
++  // The function body block.
+   Node block = fnNode.getLastChild();
+ 
++  // 1) Collect the function's parameter names.
++  java.util.List<String> paramNames = new java.util.ArrayList<String>();
++  for (Node p = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
++       p != null; p = p.getNext()) {
++    paramNames.add(p.getString());
++  }
+ 
+-    // CALL NODE: [ NAME, ARG1, ARG2, ... ]
++  // 2) Compute how many actual arguments are passed (skipping the "this"
++  //    if it's a .call invocation).
++  Node firstChild = callNode.getFirstChild();
++  Node argCursor = firstChild.getNext();
++  if (!firstChild.isName() && NodeUtil.isFunctionObjectCall(callNode)) {
++    // Must have a "this" as the first parameter.
++    if (argCursor == null || !argCursor.isThis()) {
++      return CanInlineResult.NO;
++    }
++    argCursor = argCursor.getNext();
++  }
++  int callArgsCount = 0;
++  for (Node a = argCursor; a != null; a = a.getNext()) {
++    callArgsCount++;
++  }
++
++  // 3) The original checks: multiple mutable-state effects,
++  //    side-effects in the argument expressions, etc.
+   Node cArg = callNode.getFirstChild().getNext();
+-
+-    // Functions called via 'call' and 'apply' have a this-object as
+-    // the first parameter, but this is not part of the called function's
+-    // parameter list.
+   if (!callNode.getFirstChild().isName()) {
+     if (NodeUtil.isFunctionObjectCall(callNode)) {
+-        // TODO(johnlenz): Support replace this with a value.
+       if (cArg == null || !cArg.isThis()) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
+     } else {
+-        // ".apply" call should be filtered before this.
++      // ".apply" should have been filtered out already.
+       Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+     }
+   }
+ 
+-    // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+   Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+   while (cArg != null || fnParam != null) {
+-      // For each named parameter check if a mutable argument use more than one.
+     if (fnParam != null) {
+       if (cArg != null) {
+-
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+         if (NodeUtil.mayEffectMutableState(cArg, compiler)
+             && NodeUtil.getNameReferenceCount(
+                 block, fnParam.getString()) > 1) {
+           return CanInlineResult.NO;
+         }
+       }
+-
+-        // Move to the next name.
+       fnParam = fnParam.getNext();
+     }
+-
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
+     if (cArg != null) {
+       if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+         return CanInlineResult.NO;
+       }
+       cArg = cArg.getNext();
+     }
+   }
+ 
++  // 4) NEW CHECK: make sure no parameter is *used* after a side-effect
++  //    in the function body.  Otherwise we would change evaluation order
++  //    of that parameter relative to the body.
++  final java.util.Set<String> unsafeParams =
++      new java.util.HashSet<String>();
++  class Detector {
++    boolean sideEffectOccurred = false;
++    void traverse(Node n) {
++      if (n == null) {
++        return;
++      }
++      // If this is a reference to one of our parameters and we've already
++      // seen a side-effect, mark it unsafe.
++      if (n.isName()) {
++        String nm = n.getString();
++        if (paramNames.contains(nm) && sideEffectOccurred) {
++          unsafeParams.add(nm);
++        }
++      }
++      // Do not recurse into nested function declarations.
++      if (n.isFunction()) {
++        return;
++      }
++      // Recurse in evaluation order (child order).
++      for (Node c = n.getFirstChild(); c != null; c = c.getNext()) {
++        traverse(c);
++      }
++      // After visiting children, record if *this* node has a side-effect.
++      // (calls, news, assignments, increments/decrements)
++      if (n.isCall()
++          || n.isNew()
++          || NodeUtil.isAssignmentOp(n)
++          || n.isInc()
++          || n.isDec()) {
++        sideEffectOccurred = true;
++      }
++    }
++  }
++  Detector det = new Detector();
++  for (Node stmt = block.getFirstChild(); stmt != null; stmt = stmt.getNext()) {
++    det.traverse(stmt);
++  }
++  // If any parameter that we actually passed an argument for was used
++  // unsafely, decline to inline.
++  for (int i = 0; i < callArgsCount && i < paramNames.size(); i++) {
++    if (unsafeParams.contains(paramNames.get(i))) {
++      return CanInlineResult.NO;
++    }
++  }
++
+   return CanInlineResult.YES;
+ }
+\ No newline at end of file
