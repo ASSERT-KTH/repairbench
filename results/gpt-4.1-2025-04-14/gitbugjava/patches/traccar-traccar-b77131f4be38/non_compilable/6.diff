@@ -1,0 +1,253 @@
+diff --git a/tmp/2bbf63e0-ee0c-43b8-8af3-d578b05e2019_buggy.java b/tmp/60993b0a-9fff-4ce4-9cb5-172f2f5470e1_fixed.java
+index 7b8ee38..43e6662 100644
+--- a/tmp/2bbf63e0-ee0c-43b8-8af3-d578b05e2019_buggy.java
++++ b/tmp/60993b0a-9fff-4ce4-9cb5-172f2f5470e1_fixed.java
+@@ -1,179 +1,229 @@
+ @Override
+ protected Object decode(
+         Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+     ByteBuf buf = (ByteBuf) msg;
+ 
+     buf.skipBytes(1); // '[' header
+-        manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
++    String manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
+     buf.skipBytes(1); // '*' delimiter
+ 
+     int idIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++    if (idIndex == -1) {
++        return null; // Malformed packet
++    }
+     String id = buf.readSlice(idIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++
+     DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, id);
+     if (deviceSession == null) {
+         return null;
+     }
+ 
+     buf.skipBytes(1); // '*' delimiter
+ 
+     String index = null;
+-        int contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        if (contentIndex + 5 < buf.writerIndex() && buf.getByte(contentIndex + 5) == '*'
+-                && buf.toString(contentIndex + 1, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
+-            int indexLength = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*') - buf.readerIndex();
++    boolean hasIndex = false;
++
++    // index: content between * (id) and * (length or index). If extra * found, it's index, otherwise it's length.
++    int possibleIndexStar = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++    int readerOnIndexStart = buf.readerIndex();
++    int available = possibleIndexStar != -1 ? (possibleIndexStar - buf.readerIndex()) : -1;
++
++    // Try to detect index field of hex digits length 4 after this delimiter
++    if (possibleIndexStar != -1 && possibleIndexStar + 5 < buf.writerIndex()) {
++        // [*id*index*len*body]
++        // Check if after current star, next 4 chars are hex and next delimiter follows
++        String maybeIndex = buf.toString(possibleIndexStar + 1, 4, StandardCharsets.US_ASCII);
++        byte maybeNextStar = buf.getByte(possibleIndexStar + 5);
++        if (maybeNextStar == '*' && maybeIndex.matches("\\p{XDigit}+")) {
++            // read index
+             hasIndex = true;
++            int indexLength = possibleIndexStar - buf.readerIndex();
+             index = buf.readSlice(indexLength).toString(StandardCharsets.US_ASCII);
+             buf.skipBytes(1); // '*' delimiter
++            possibleIndexStar = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++            available = possibleIndexStar != -1 ? (possibleIndexStar - buf.readerIndex()) : -1;
+         }
++    }
++
++    // read length (always 4 chars)
++    buf.skipBytes(4);
+ 
+-        buf.skipBytes(4); // length
+     buf.skipBytes(1); // '*' delimiter
+ 
+-        buf.writerIndex(buf.writerIndex() - 1); // ']' ignore ending
++    // Remove trailing ']' (set writable limit to exclude last byte)
++    if (buf.writerIndex() > buf.readerIndex() && buf.getByte(buf.writerIndex() - 1) == ']') {
++        buf.writerIndex(buf.writerIndex() - 1);
++    }
+ 
+-        contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
++    int contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+     if (contentIndex < 0) {
+         contentIndex = buf.writerIndex();
+     }
+-
+     String type = buf.readSlice(contentIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
+ 
+     if (contentIndex < buf.writerIndex()) {
+         buf.readerIndex(contentIndex + 1);
+     }
+ 
+     if (type.equals("INIT")) {
+ 
+         sendResponse(channel, id, index, "INIT,1");
+ 
+     } else if (type.equals("LK")) {
+ 
+         sendResponse(channel, id, index, "LK");
+ 
+         if (buf.isReadable()) {
+             String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+             if (values.length >= 3) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+ 
+                 getLastLocation(position, null);
+ 
+                 position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2]));
+                 position.set(Position.KEY_STEPS, Integer.parseInt(values[0]));
+ 
+                 return position;
+             }
+         }
+ 
+     } else if (type.startsWith("UD") || type.startsWith("AL") || type.startsWith("WT")) {
+ 
+         Position position = decodePosition(deviceSession, buf.toString(StandardCharsets.US_ASCII));
+ 
+         if (type.startsWith("AL")) {
+             if (position != null) {
++                // Try to set a more specific alarm if possible
++                if (position.getAttributes() != null && position.getAttributes().containsKey(Position.KEY_ALARM)) {
++                    // already present
++                } else if (buf.toString(StandardCharsets.US_ASCII).contains(",1,")) {
++                    position.set(Position.KEY_ALARM, Position.ALARM_REMOVING);
++                } else {
+                     position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+                 }
++            }
+             sendResponse(channel, id, index, "AL");
+         }
+ 
+         return position;
+ 
+     } else if (type.equals("TKQ") || type.equals("TKQ2")) {
+ 
+         sendResponse(channel, id, index, type);
+ 
+     } else if (type.equalsIgnoreCase("PULSE")
+             || type.equalsIgnoreCase("HEART")
+             || type.equalsIgnoreCase("BLOOD")
+             || type.equalsIgnoreCase("BPHRT")
+-                || type.equalsIgnoreCase("btemp2")) {
++            || type.equalsIgnoreCase("btemp2")
++            || type.equalsIgnoreCase("TEMP")) {
+ 
+         if (buf.isReadable()) {
+ 
+             Position position = new Position(getProtocolName());
+             position.setDeviceId(deviceSession.getDeviceId());
+ 
+             getLastLocation(position, new Date());
+ 
+             String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+             int valueIndex = 0;
+ 
+-                if (type.equalsIgnoreCase("btemp2")) {
+-                    if (Integer.parseInt(values[valueIndex++]) > 0) {
++            if (type.equalsIgnoreCase("btemp2") || type.equalsIgnoreCase("TEMP")) {
++                if (values.length > valueIndex + 1 && Integer.parseInt(values[valueIndex++]) > 0) {
+                     position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[valueIndex]));
++                } else if (values.length > valueIndex + 1 && type.equalsIgnoreCase("TEMP")) {
++                    // Allow TEMP,xx.x format (no leading flag)
++                    try {
++                        position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[1]));
++                    } catch (Exception ignore) {}
+                 }
+             } else {
+                 if (type.equalsIgnoreCase("BPHRT") || type.equalsIgnoreCase("BLOOD")) {
+-                        position.set("pressureHigh", values[valueIndex++]);
+-                        position.set("pressureLow", values[valueIndex++]);
++                    if (values.length > valueIndex) position.set("pressureHigh", values[valueIndex++]);
++                    if (values.length > valueIndex) position.set("pressureLow", values[valueIndex++]);
+                 }
+-                    if (valueIndex <= values.length - 1) {
+-                        position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex]));
++                if (values.length > valueIndex) {
++                    String key = type.equalsIgnoreCase("HEART") ? Position.KEY_HEART_RATE : Position.KEY_HEART_RATE;
++                    try {
++                        if (!values[valueIndex].isEmpty()) {
++                            position.set(key, Integer.parseInt(values[valueIndex]));
++                        }
++                    } catch (Exception ignore) {}
+                 }
+             }
+ 
+             return position;
+ 
+         }
+ 
+     } else if (type.equals("img")) {
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         getLastLocation(position, null);
+ 
+         int timeIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
++        if (timeIndex != -1) {
++            // Next 12 (timestamp), comma, content
+             buf.readerIndex(timeIndex + 12 + 2);
++        }
+         position.set(Position.KEY_IMAGE, writeMediaFile(id, buf, "jpg"));
+ 
+         return position;
+ 
+     } else if (type.equals("JXTK")) {
+ 
+         int dataIndex = BufferUtil.indexOf(buf, buf.readerIndex(), buf.writerIndex(), (byte) ',', 4) + 1;
++        if (dataIndex < 1) {
++            return null;
++        }
+         String[] values = buf.readCharSequence(
+                 dataIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString().split(",");
+ 
++        if (values.length < 4) {
++            return null;
++        }
++
+         int current = Integer.parseInt(values[2]);
+         int total = Integer.parseInt(values[3]);
+ 
+         if (audio == null) {
+             audio = Unpooled.buffer();
+         }
+         audio.writeBytes(buf);
+ 
+         sendResponse(channel, id, index, "JXTKR,1");
+ 
+         if (current < total) {
+             return null;
+         } else {
+             Position position = new Position(getProtocolName());
+             position.setDeviceId(deviceSession.getDeviceId());
+             getLastLocation(position, null);
+             position.set(Position.KEY_AUDIO, writeMediaFile(id, audio, "amr"));
+             audio.release();
+             audio = null;
+             return position;
+         }
+ 
+     } else if (type.equals("TK")) {
+ 
+-            if (buf.readableBytes() == 1) {
++        if (buf.readableBytes() <= 1) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         getLastLocation(position, null);
+ 
+         position.set(Position.KEY_AUDIO, writeMediaFile(id, buf, "amr"));
+ 
+         return position;
+-
+     }
+ 
+     return null;
+ }
+\ No newline at end of file

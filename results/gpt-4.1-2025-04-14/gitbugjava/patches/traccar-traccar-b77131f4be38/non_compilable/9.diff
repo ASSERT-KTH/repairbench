@@ -1,0 +1,298 @@
+diff --git a/tmp/26e5dea4-165e-47ce-9523-e7dc9dc55c39_buggy.java b/tmp/b546d584-9434-4344-b79e-78b5b52eba01_fixed.java
+index 7b8ee38..0935264 100644
+--- a/tmp/26e5dea4-165e-47ce-9523-e7dc9dc55c39_buggy.java
++++ b/tmp/b546d584-9434-4344-b79e-78b5b52eba01_fixed.java
+@@ -1,179 +1,253 @@
+ @Override
+ protected Object decode(
+         Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+     ByteBuf buf = (ByteBuf) msg;
+ 
+     buf.skipBytes(1); // '[' header
+-        manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
++    String manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
+     buf.skipBytes(1); // '*' delimiter
+ 
+-        int idIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        String id = buf.readSlice(idIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++    int nextAsteriskIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++    if (nextAsteriskIndex < 0) {
++        return null;
++    }
++    String id = buf.readSlice(nextAsteriskIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
+     DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, id);
+     if (deviceSession == null) {
+         return null;
+     }
+ 
+     buf.skipBytes(1); // '*' delimiter
+ 
+     String index = null;
+-        int contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        if (contentIndex + 5 < buf.writerIndex() && buf.getByte(contentIndex + 5) == '*'
+-                && buf.toString(contentIndex + 1, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
+-            int indexLength = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*') - buf.readerIndex();
++    boolean hasIndex = false;
++
++    // Save readerIndex for checking index presence
++    int indexFieldStart = buf.readerIndex();
++
++    int nextAsteriskIndex2 = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++    if (nextAsteriskIndex2 >= 0) {
++        // Check for possible index by content after asterisk (length = 4 = 0001, typically hex, then another asterisk)
++        int afterLen = nextAsteriskIndex2 + 5; // 4 for length, 1 for *
++        if (afterLen < buf.writerIndex()
++                && buf.getByte(nextAsteriskIndex2 + 5) == '*' // There is another '*' after 4 chars after index
++                && buf.toString(nextAsteriskIndex2 + 1, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
++            // Index is present
++            index = buf.readSlice(nextAsteriskIndex2 - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++            buf.skipBytes(1); // '*' delimiter
+             hasIndex = true;
+-            index = buf.readSlice(indexLength).toString(StandardCharsets.US_ASCII);
+-            buf.skipBytes(1); // '*' delimiter
++        }
+     }
+ 
++    // Now at length field (always fixed 4 chars), followed by '*'
+     buf.skipBytes(4); // length
+     buf.skipBytes(1); // '*' delimiter
+ 
+-        buf.writerIndex(buf.writerIndex() - 1); // ']' ignore ending
+-
+-        contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-        if (contentIndex < 0) {
+-            contentIndex = buf.writerIndex();
++    // Remove the trailing ']' for further processing, but only if present
++    int endBracket = buf.writerIndex() - 1;
++    if (buf.getByte(endBracket) == ']') {
++        buf.writerIndex(endBracket);
+     }
+ 
+-        String type = buf.readSlice(contentIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++    int commaIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
++    int typeEndIndex = commaIndex >= 0 ? commaIndex : buf.writerIndex();
++    String type = buf.readSlice(typeEndIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++
++    if (commaIndex >= 0 && buf.readerIndex() < buf.writerIndex()) {
++        buf.readerIndex(commaIndex + 1);
++    }
+ 
+-        if (contentIndex < buf.writerIndex()) {
+-            buf.readerIndex(contentIndex + 1);
++    // Remove any potential trailing \r or \n
++    int finalDataEnd = buf.writerIndex();
++    while (finalDataEnd > buf.readerIndex() && (
++            buf.getByte(finalDataEnd - 1) == '\r' || buf.getByte(finalDataEnd - 1) == '\n')) {
++        finalDataEnd--;
+     }
++    buf.writerIndex(finalDataEnd);
+ 
+     if (type.equals("INIT")) {
+ 
+         sendResponse(channel, id, index, "INIT,1");
+ 
+     } else if (type.equals("LK")) {
+ 
+         sendResponse(channel, id, index, "LK");
+ 
+         if (buf.isReadable()) {
+             String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+             if (values.length >= 3) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+ 
+                 getLastLocation(position, null);
+ 
+-                    position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2]));
+-                    position.set(Position.KEY_STEPS, Integer.parseInt(values[0]));
++                position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2].trim()));
++                position.set(Position.KEY_STEPS, Integer.parseInt(values[0].trim()));
+ 
+                 return position;
+             }
+         }
+ 
+     } else if (type.startsWith("UD") || type.startsWith("AL") || type.startsWith("WT")) {
+ 
+-            Position position = decodePosition(deviceSession, buf.toString(StandardCharsets.US_ASCII));
++        String contentString = buf.toString(StandardCharsets.US_ASCII);
++        Position position = decodePosition(deviceSession, contentString);
+ 
+         if (type.startsWith("AL")) {
+             if (position != null) {
++                // Try to detect specific alarm type by defaulting to removing alarm if the alarm bit is set in content.
++                String upperContent = contentString.toUpperCase();
++                // Extract 17-th element (alarm flags) for removing alarm (common for watch)
++                // Find alarm field (commonly after 17 commas)
++                int alarmFlagIndex = 0;
++                int countCommas = 0;
++                for (int i = 0; i < contentString.length(); i++) {
++                    if (contentString.charAt(i) == ',') {
++                        countCommas++;
++                        if (countCommas == 17) {
++                            alarmFlagIndex = i + 1;
++                            break;
++                        }
++                    }
++                }
++                boolean alarmRemoving = false;
++                if (alarmFlagIndex > 0 && alarmFlagIndex < contentString.length()) {
++                    int end = contentString.indexOf(',', alarmFlagIndex);
++                    if (end == -1) end = contentString.length();
++                    String alarmFlag = contentString.substring(alarmFlagIndex, end);
++                    if (alarmFlag.length() >= 3 && alarmFlag.charAt(alarmFlag.length() - 3) == '1') {
++                        // Common logic: 3rd from end
++                        alarmRemoving = true;
++                    }
++                }
++                if (alarmRemoving) {
++                    position.set(Position.KEY_ALARM, Position.ALARM_REMOVING);
++                } else {
+                     position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+                 }
++            }
+             sendResponse(channel, id, index, "AL");
+         }
+ 
+         return position;
+ 
+     } else if (type.equals("TKQ") || type.equals("TKQ2")) {
+ 
+         sendResponse(channel, id, index, type);
+ 
+     } else if (type.equalsIgnoreCase("PULSE")
+             || type.equalsIgnoreCase("HEART")
+             || type.equalsIgnoreCase("BLOOD")
+             || type.equalsIgnoreCase("BPHRT")
+-                || type.equalsIgnoreCase("btemp2")) {
++            || type.equalsIgnoreCase("btemp2")
++            || type.equalsIgnoreCase("TEMP")) {
+ 
+         if (buf.isReadable()) {
+-
+-                Position position = new Position(getProtocolName());
+-                position.setDeviceId(deviceSession.getDeviceId());
+-
+-                getLastLocation(position, new Date());
+-
+             String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+             int valueIndex = 0;
++            Position position = new Position(getProtocolName());
++            position.setDeviceId(deviceSession.getDeviceId());
+ 
+-                if (type.equalsIgnoreCase("btemp2")) {
+-                    if (Integer.parseInt(values[valueIndex++]) > 0) {
+-                        position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[valueIndex]));
++            getLastLocation(position, new Date());
++
++            if (type.equalsIgnoreCase("btemp2") || type.equalsIgnoreCase("TEMP")) {
++                // Covers both TEMP and btemp2
++                if (values.length > valueIndex + 1 && Double.parseDouble(values[valueIndex + 1].trim()) > 0) {
++                    position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[valueIndex + 1].trim()));
++                }
++            } else if (type.equalsIgnoreCase("BPHRT") || type.equalsIgnoreCase("BLOOD")) {
++                if (values.length > valueIndex) {
++                    position.set("pressureHigh", values[valueIndex++].trim());
++                }
++                if (values.length > valueIndex) {
++                    position.set("pressureLow", values[valueIndex++].trim());
++                }
++                // May be heart rate next
++                if (values.length > valueIndex && !values[valueIndex].trim().isEmpty()) {
++                    position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex].trim()));
+                 }
+             } else {
+-                    if (type.equalsIgnoreCase("BPHRT") || type.equalsIgnoreCase("BLOOD")) {
+-                        position.set("pressureHigh", values[valueIndex++]);
+-                        position.set("pressureLow", values[valueIndex++]);
++                // PULSE, HEART, etc., commonly just heart rate and maybe steps
++                if (values.length > valueIndex && !values[valueIndex].trim().isEmpty()) {
++                    position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex].trim()));
+                 }
+-                    if (valueIndex <= values.length - 1) {
+-                        position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex]));
++                if (values.length > valueIndex + 1 && !values[valueIndex + 1].trim().isEmpty()) {
++                    position.set(Position.KEY_STEPS, Integer.parseInt(values[valueIndex + 1].trim()));
+                 }
+             }
+ 
+             return position;
+-
+         }
+ 
+     } else if (type.equals("img")) {
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         getLastLocation(position, null);
+ 
++        // Move readerIndex to after ',<YYYYMMDDHHMM>,'
+         int timeIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-            buf.readerIndex(timeIndex + 12 + 2);
++        if (timeIndex >= 0 && timeIndex + 12 + 2 <= buf.writerIndex()) {
++            buf.readerIndex(timeIndex + 12 + 2); // skip ',' + time(12) + ','
++        }
+         position.set(Position.KEY_IMAGE, writeMediaFile(id, buf, "jpg"));
+ 
+         return position;
+ 
+     } else if (type.equals("JXTK")) {
+ 
+-            int dataIndex = BufferUtil.indexOf(buf, buf.readerIndex(), buf.writerIndex(), (byte) ',', 4) + 1;
++        // Find fourth comma (after 'JXTK,0,...')
++        int dataIndex = BufferUtil.indexOf(buf, buf.readerIndex(), buf.writerIndex(), (byte) ',', 4);
++        if (dataIndex < 0) {
++            return null;
++        }
++        dataIndex += 1;
++
+         String[] values = buf.readCharSequence(
+                 dataIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString().split(",");
+ 
++        if (values.length <= 3) return null;
+         int current = Integer.parseInt(values[2]);
+         int total = Integer.parseInt(values[3]);
+ 
+         if (audio == null) {
+             audio = Unpooled.buffer();
+         }
++        buf.readerIndex(dataIndex); // Move readerIndex to data
+         audio.writeBytes(buf);
+ 
+         sendResponse(channel, id, index, "JXTKR,1");
+ 
+         if (current < total) {
+             return null;
+         } else {
+             Position position = new Position(getProtocolName());
+             position.setDeviceId(deviceSession.getDeviceId());
+             getLastLocation(position, null);
+             position.set(Position.KEY_AUDIO, writeMediaFile(id, audio, "amr"));
+             audio.release();
+             audio = null;
+             return position;
+         }
+ 
+     } else if (type.equals("TK")) {
+ 
+-            if (buf.readableBytes() == 1) {
++        if (buf.readableBytes() <= 1) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         getLastLocation(position, null);
+ 
+         position.set(Position.KEY_AUDIO, writeMediaFile(id, buf, "amr"));
+ 
+         return position;
+ 
+     }
+ 
+     return null;
+ }
+\ No newline at end of file

@@ -1,0 +1,197 @@
+diff --git a/tmp/f75fba82-2ed0-4679-8c0f-56da3fa7364f_buggy.java b/tmp/0bc73180-ce1b-44fb-9bd8-97d5fd3c8168_fixed.java
+index cd412d2..fc761a3 100644
+--- a/tmp/f75fba82-2ed0-4679-8c0f-56da3fa7364f_buggy.java
++++ b/tmp/0bc73180-ce1b-44fb-9bd8-97d5fd3c8168_fixed.java
+@@ -1,76 +1,169 @@
+ protected Date parseAsISO8601(String dateStr, ParsePosition pos)
+ {
+-        /* 21-May-2009, tatu: DateFormat has very strict handling of
+-         * timezone  modifiers for ISO-8601. So we need to do some scrubbing.
+-         */
+-
+-        /* First: do we have "zulu" format ('Z' == "GMT")? If yes, that's
+-         * quite simple because we already set date format timezone to be
+-         * GMT, and hence can just strip out 'Z' altogether
+-         */
+     int len = dateStr.length();
+     char c = dateStr.charAt(len-1);
+     DateFormat df;
+ 
+     // [JACKSON-200]: need to support "plain" date...
+     if (len <= 10 && Character.isDigit(c)) {
+         df = _formatPlain;
+         if (df == null) {
+             df = _formatPlain = _cloneFormat(DATE_FORMAT_PLAIN, DATE_FORMAT_STR_PLAIN, _timezone, _locale);
+         }
+     } else if (c == 'Z') {
+         df = _formatISO8601_z;
+         if (df == null) {
+             df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, DATE_FORMAT_STR_ISO8601_Z, _timezone, _locale);
+         }
+         // [JACKSON-334]: may be missing milliseconds... if so, add
+         if (dateStr.charAt(len-4) == ':') {
+             StringBuilder sb = new StringBuilder(dateStr);
+             sb.insert(len-1, ".000");
+             dateStr = sb.toString();
+         }
++        // Patch in missing or partial milliseconds (e.g. .6 -> .600 or .61 -> .610)
++        dateStr = _fixupMilliseconds(dateStr, len - 1);
+     } else {
+         // Let's see if we have timezone indicator or not...
+         if (hasTimeZone(dateStr)) {
+-                c = dateStr.charAt(len-3);
+-                if (c == ':') { // remove optional colon
+-                    // remove colon
++            // Find start of timezone part (last + or -)
++            int tzIndex = Math.max(dateStr.lastIndexOf('+'), dateStr.lastIndexOf('-'));
++            if (tzIndex > 0) {
++                // Colon in timezone, remove it
++                if (dateStr.length() > tzIndex + 2 && dateStr.charAt(tzIndex + 3) == ':') {
+                     StringBuilder sb = new StringBuilder(dateStr);
+-                    sb.delete(len-3, len-2);
++                    sb.delete(tzIndex + 3, tzIndex + 4);
+                     dateStr = sb.toString();
+-                } else if (c == '+' || c == '-') { // missing minutes
+-                    // let's just append '00'
++                } else if (dateStr.length() == tzIndex + 3) {
++                    // Only hour in offset, e.g. +01, add minutes
+                     dateStr += "00";
+                 }
+-                // Milliseconds partial or missing; and even seconds are optional
+-                len = dateStr.length();
+-                // remove 'T', '+'/'-' and 4-digit timezone-offset
+-                c = dateStr.charAt(len-9);
+-                if (Character.isDigit(c)) {
++            }
++            // Now, look for milliseconds fraction
++            // Find the '.' in the seconds component (if present, before timezone)
++            int millisStart = -1;
++            int tIndex = dateStr.lastIndexOf('T');
++            int cut = (tzIndex > -1) ? tzIndex : dateStr.length();
++            for (int i = tIndex; i < cut; ++i) {
++                if (dateStr.charAt(i) == '.') {
++                    millisStart = i;
++                    break;
++                }
++            }
++            // Add missing seconds, if needed ("yyyy-MM-ddTHH:mm+01:00")
++            if (tIndex >= 0) {
++                int afterT = tIndex + 1;
++                // count ':' after 'T'
++                int colonCount = 0;
++                for (int i = afterT; i < dateStr.length(); ++i) {
++                    c = dateStr.charAt(i);
++                    if (c == ':') {
++                        colonCount++;
++                    } else if (c == '+' || c == '-') {
++                        break;
++                    }
++                }
++                if (colonCount == 1) {
++                    // after hour, so missing seconds, insert ":00" before offset or end
++                    int insertAt = (tzIndex > -1) ? tzIndex : dateStr.length();
+                     StringBuilder sb = new StringBuilder(dateStr);
+-                    sb.insert(len-5, ".000");
++                    sb.insert(insertAt, ":00");
+                     dateStr = sb.toString();
++                    // push tzIndex for later
++                    tzIndex = Math.max(dateStr.lastIndexOf('+'), dateStr.lastIndexOf('-'));
++                    // recompute cut
++                    cut = (tzIndex > -1) ? tzIndex : dateStr.length();
++                }
++            }
++            // Patch in missing or partial milliseconds
++            if (millisStart < 0) {
++                // No '.', so insert ".000" before offset or end
++                int insertAt = (tzIndex > -1) ? tzIndex : dateStr.length();
++                StringBuilder sb = new StringBuilder(dateStr);
++                sb.insert(insertAt, ".000");
++                dateStr = sb.toString();
++            } else {
++                // Fix number of digits after '.'
++                dateStr = _fixupMilliseconds(dateStr, millisStart);
+             }
+             df = _formatISO8601;
+             if (_formatISO8601 == null) {
+                 df = _formatISO8601 = _cloneFormat(DATE_FORMAT_ISO8601, DATE_FORMAT_STR_ISO8601, _timezone, _locale);
+             }
+         } else {
+             // If not, plain date. Easiest to just patch 'Z' in the end?
+             StringBuilder sb = new StringBuilder(dateStr);
+             // And possible also millisecond part if missing
+-                int timeLen = len - dateStr.lastIndexOf('T') - 1;
+-                if (timeLen <= 8) {
++            int ti = dateStr.lastIndexOf('T');
++            if (ti >= 0) {
++                int timeLen = len - ti - 1;
++                boolean hasSecs = (timeLen >= 5);
++                boolean hasMillis = false;
++                for (int i = ti + 1; i < len; ++i) {
++                    if (dateStr.charAt(i) == '.') {
++                        hasMillis = true;
++                        int fracLen = len - i - 1;
++                        if (fracLen < 3) {
++                            // fix partial milliseconds
++                            StringBuilder millisSb = new StringBuilder(dateStr);
++                            for (int j = fracLen; j < 3; ++j) {
++                                millisSb.append('0');
++                            }
++                            dateStr = millisSb.toString();
++                            sb = new StringBuilder(dateStr); // refresh
++                        }
++                        break;
++                    }
++                }
++                if (!hasMillis && hasSecs) {
+                     sb.append(".000");
+                 }
++                else if (!hasMillis && !hasSecs) {
++                    sb.append(":00.000");
++                }
++            }
+             sb.append('Z');
+             dateStr = sb.toString();
+             df = _formatISO8601_z;
+             if (df == null) {
+                 df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, DATE_FORMAT_STR_ISO8601_Z,
+                         _timezone, _locale);
+             }
+         }
+     }
+     return df.parse(dateStr, pos);
+ }
++
++/**
++ * Utility method to fix (make sure there are exactly three digits) the milliseconds
++ * part of an ISO8601 timestamp. Expects the '.' position.
++ */
++private String _fixupMilliseconds(String dateStr, int millisStart) {
++    int len = dateStr.length();
++    int millisEnd = millisStart + 1;
++    while (millisEnd < len) {
++        char ch = dateStr.charAt(millisEnd);
++        if (!Character.isDigit(ch)) {
++            break;
++        }
++        ++millisEnd;
++    }
++    int digits = millisEnd - (millisStart + 1);
++    if (digits == 0) {
++        StringBuilder sb = new StringBuilder(dateStr);
++        sb.insert(millisEnd, "000");
++        return sb.toString();
++    } else if (digits < 3) {
++        StringBuilder sb = new StringBuilder(dateStr);
++        for (int i = 0; i < 3 - digits; ++i) {
++            sb.insert(millisEnd, '0');
++        }
++        return sb.toString();
++    } else if (digits > 3) {
++        // truncate extra digits
++        StringBuilder sb = new StringBuilder(dateStr);
++        sb.delete(millisStart + 4, millisEnd);
++        return sb.toString();
++    }
++    return dateStr;
++}
+\ No newline at end of file

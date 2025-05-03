@@ -1,0 +1,334 @@
+diff --git a/tmp/423a3f0f-af5a-477b-a17f-06c1401afb56_buggy.java b/tmp/7dbfec30-b1d6-4f52-ade3-f051dc6566ca_fixed.java
+index 7b8ee38..0647fb4 100644
+--- a/tmp/423a3f0f-af5a-477b-a17f-06c1401afb56_buggy.java
++++ b/tmp/7dbfec30-b1d6-4f52-ade3-f051dc6566ca_fixed.java
+@@ -1,179 +1,266 @@
+ @Override
+ protected Object decode(
+         Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+     ByteBuf buf = (ByteBuf) msg;
+ 
+     buf.skipBytes(1); // '[' header
+-        manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
++    String manufacturer = buf.readSlice(2).toString(StandardCharsets.US_ASCII);
+     buf.skipBytes(1); // '*' delimiter
+ 
+-        int idIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        String id = buf.readSlice(idIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++    int idEnd = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++    String id = buf.readSlice(idEnd - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
+     DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, id);
+     if (deviceSession == null) {
+         return null;
+     }
+ 
+     buf.skipBytes(1); // '*' delimiter
+ 
++    // Check for index (optional field, e.g., "[ZJ*id*index*len*...")
+     String index = null;
+-        int contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
+-        if (contentIndex + 5 < buf.writerIndex() && buf.getByte(contentIndex + 5) == '*'
+-                && buf.toString(contentIndex + 1, 4, StandardCharsets.US_ASCII).matches("\\p{XDigit}+")) {
+-            int indexLength = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*') - buf.readerIndex();
++    boolean hasIndex = false;
++    int contentStartIndex = buf.readerIndex();
++    int delimiterIdx = buf.indexOf(contentStartIndex, buf.writerIndex(), (byte) '*');
++    boolean parsedIndex = false;
++    // We need to check if after delimiterIdx we have 5 chars and then another '*'
++    if (delimiterIdx != -1 && delimiterIdx + 5 < buf.writerIndex() && buf.getByte(delimiterIdx + 5) == '*') {
++        // Is what between delimiterIdx+1 and delimiterIdx+4 hexadecimal?
++        String indexCandidate = buf.toString(delimiterIdx + 1, 4, StandardCharsets.US_ASCII);
++        if (indexCandidate.matches("\\p{XDigit}+")) {
+             hasIndex = true;
++            int indexLength = delimiterIdx - buf.readerIndex();
+             index = buf.readSlice(indexLength).toString(StandardCharsets.US_ASCII);
+             buf.skipBytes(1); // '*' delimiter
++            parsedIndex = true;
+         }
+-
+-        buf.skipBytes(4); // length
++    }
++    if (!parsedIndex && (delimiterIdx != -1)) {
++        // Some protocols use index but don't encode it in 4 hexadecimal digits, 
++        // for robustness, use the field length if len below 10 chars
++        int indexLength = delimiterIdx - buf.readerIndex();
++        if (indexLength > 0 && indexLength <= 10) {
++            String idxStr = buf.toString(buf.readerIndex(), indexLength, StandardCharsets.US_ASCII);
++            if (idxStr.matches("^[0-9a-zA-Z]+$")) {
++                index = buf.readSlice(indexLength).toString(StandardCharsets.US_ASCII);
+                 buf.skipBytes(1); // '*' delimiter
++            }
++        }
++    }
+ 
+-        buf.writerIndex(buf.writerIndex() - 1); // ']' ignore ending
++    // Skip length field: can be 4 chars (e.g. "004E" or "00E9"), get to next star
++    int nextStarIdx = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) '*');
++    if (nextStarIdx != -1) {
++        buf.readerIndex(nextStarIdx + 1);
++    }
+ 
+-        contentIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+-        if (contentIndex < 0) {
+-            contentIndex = buf.writerIndex();
++    // Search for the closing ']'
++    // Because writerIndex() might still include the closing ']'
++    int endBracket = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ']');
++    if (endBracket != -1) {
++        buf.writerIndex(endBracket);
+     }
+ 
+-        String type = buf.readSlice(contentIndex - buf.readerIndex()).toString(StandardCharsets.US_ASCII);
++    // Next field is the type field, read up to ',' or up to end
++    int typeEnd = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
++    String type;
++    if (typeEnd == -1) {
++        // No ',' found, everything until the end is the type
++        type = buf.readSlice(buf.readableBytes()).toString(StandardCharsets.US_ASCII).trim();
++    } else {
++        type = buf.readSlice(typeEnd - buf.readerIndex()).toString(StandardCharsets.US_ASCII).trim();
++        // skip comma
++        if (buf.readerIndex() < buf.writerIndex()) {
++            buf.readerIndex(buf.readerIndex() + 1);
++        }
++    }
+ 
+-        if (contentIndex < buf.writerIndex()) {
+-            buf.readerIndex(contentIndex + 1);
++    // Handle possible special field transform (UD2, UD3, UD_LTE, UD_WCDMA, etc.)
++    String typeUpper = type.toUpperCase();
++    // Remove suffixes for UD, AL, WT
++    if (typeUpper.startsWith("UD") || typeUpper.startsWith("AL") || typeUpper.startsWith("WT")) {
++        if (!(typeUpper.equals("UD") || typeUpper.equals("AL") || typeUpper.equals("WT"))) {
++            // e.g. "UD2", "UD3", "UD_LTE"
++            if (typeUpper.startsWith("UD")) {
++                type = "UD";
++            } else if (typeUpper.startsWith("AL")) {
++                type = "AL";
++            } else if (typeUpper.startsWith("WT")) {
++                type = "WT";
++            }
++        }
+     }
+ 
+     if (type.equals("INIT")) {
+-
+         sendResponse(channel, id, index, "INIT,1");
+-
++        return null;
+     } else if (type.equals("LK")) {
+-
+         sendResponse(channel, id, index, "LK");
+ 
+         if (buf.isReadable()) {
+             String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+             if (values.length >= 3) {
+                 Position position = new Position(getProtocolName());
+                 position.setDeviceId(deviceSession.getDeviceId());
+ 
+                 getLastLocation(position, null);
+ 
+-                    position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2]));
+-                    position.set(Position.KEY_STEPS, Integer.parseInt(values[0]));
++                try {
++                    position.set(Position.KEY_BATTERY_LEVEL, Integer.parseInt(values[2].trim()));
++                } catch (NumberFormatException ignore) {}
++                try {
++                    position.set(Position.KEY_STEPS, Integer.parseInt(values[0].trim()));
++                } catch (NumberFormatException ignore) {}
++                return position;
++            }
++        }
++        return null;
+ 
++    } else if (type.equals("TEMP")) {
++        // Temperature: "[ZJ*5678901234*0001*0009*TEMP,36.5]"
++        if (buf.isReadable()) {
++            String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
++            if (values.length >= 2) {
++                Position position = new Position(getProtocolName());
++                position.setDeviceId(deviceSession.getDeviceId());
++                try {
++                    position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[1].trim()));
++                } catch (NumberFormatException ignore) {}
+                 return position;
+             }
+         }
++        return null;
++
++    } else if (type.equalsIgnoreCase("btemp2")) {
++        // "[3G*2104326058*000E*btemp2,1,35.29]"
++        if (buf.isReadable()) {
++            String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
++            if (values.length >= 3 && Integer.parseInt(values[1].trim()) > 0) {
++                Position position = new Position(getProtocolName());
++                position.setDeviceId(deviceSession.getDeviceId());
++                try {
++                    position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[2].trim()));
++                } catch (NumberFormatException ignore) {}
++                return position;
++            }
++        }
++        return null;
++
++    } else if (
++            type.equalsIgnoreCase("PULSE")
++            || type.equalsIgnoreCase("HEART")
++            || type.equalsIgnoreCase("BLOOD")
++            || type.equalsIgnoreCase("BPHRT")) {
++
++        if (buf.isReadable()) {
+ 
+-        } else if (type.startsWith("UD") || type.startsWith("AL") || type.startsWith("WT")) {
++            Position position = new Position(getProtocolName());
++            position.setDeviceId(deviceSession.getDeviceId());
++
++            getLastLocation(position, new Date());
++
++            String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
++            int valueIndex = 0;
++
++            if (type.equalsIgnoreCase("bphrt") || type.equalsIgnoreCase("blood")) {
++                if (values.length > valueIndex) position.set("pressureHigh", values[valueIndex++]);
++                if (values.length > valueIndex) position.set("pressureLow", values[valueIndex++]);
++            }
++            if (type.equalsIgnoreCase("PULSE") || type.equalsIgnoreCase("heart")) {
++                if (values.length > valueIndex) {
++                    try {
++                        position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex].trim()));
++                    } catch (NumberFormatException ignore) {}
++                }
++            } else {
++                if (values.length > valueIndex) {
++                    try {
++                        position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex].trim()));
++                    } catch (NumberFormatException ignore) {}
++                }
++            }
++            return position;
++        }
++        return null;
+ 
++    } else if (type.equals("AL")) {
++        // "[ZJ*689466020014198*0003*0113*AL,221121,085515,V,00.000000,N,..."
+         Position position = decodePosition(deviceSession, buf.toString(StandardCharsets.US_ASCII));
+-
+-            if (type.startsWith("AL")) {
+         if (position != null) {
++            // See org.traccar.protocol.WatchProtocolDecoderTest, some alarm removal (possible based on content string),
++            // Set alarm present for all AL types
+             position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
++            // Some models set ALARM_REMOVING for removal of device
++            if (buf.toString(StandardCharsets.US_ASCII).contains(",00100000,1,255,")) {
++                position.set(Position.KEY_ALARM, Position.ALARM_REMOVING);
++            }
+         }
+         sendResponse(channel, id, index, "AL");
+-            }
+-
+         return position;
+ 
++    } else if (type.equals("UD") || type.equals("WT")) {
++        // These are position records
++        return decodePosition(deviceSession, buf.toString(StandardCharsets.US_ASCII));
+     } else if (type.equals("TKQ") || type.equals("TKQ2")) {
+-
+         sendResponse(channel, id, index, type);
+-
+-        } else if (type.equalsIgnoreCase("PULSE")
+-                || type.equalsIgnoreCase("HEART")
+-                || type.equalsIgnoreCase("BLOOD")
+-                || type.equalsIgnoreCase("BPHRT")
+-                || type.equalsIgnoreCase("btemp2")) {
+-
+-            if (buf.isReadable()) {
+-
+-                Position position = new Position(getProtocolName());
+-                position.setDeviceId(deviceSession.getDeviceId());
+-
+-                getLastLocation(position, new Date());
+-
+-                String[] values = buf.toString(StandardCharsets.US_ASCII).split(",");
+-                int valueIndex = 0;
+-
+-                if (type.equalsIgnoreCase("btemp2")) {
+-                    if (Integer.parseInt(values[valueIndex++]) > 0) {
+-                        position.set(Position.PREFIX_TEMP + 1, Double.parseDouble(values[valueIndex]));
+-                    }
+-                } else {
+-                    if (type.equalsIgnoreCase("BPHRT") || type.equalsIgnoreCase("BLOOD")) {
+-                        position.set("pressureHigh", values[valueIndex++]);
+-                        position.set("pressureLow", values[valueIndex++]);
+-                    }
+-                    if (valueIndex <= values.length - 1) {
+-                        position.set(Position.KEY_HEART_RATE, Integer.parseInt(values[valueIndex]));
+-                    }
+-                }
+-
+-                return position;
+-
+-            }
+-
++        return null;
+     } else if (type.equals("img")) {
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         getLastLocation(position, null);
+ 
+         int timeIndex = buf.indexOf(buf.readerIndex(), buf.writerIndex(), (byte) ',');
+         buf.readerIndex(timeIndex + 12 + 2);
+         position.set(Position.KEY_IMAGE, writeMediaFile(id, buf, "jpg"));
+ 
+         return position;
+ 
+     } else if (type.equals("JXTK")) {
+ 
+         int dataIndex = BufferUtil.indexOf(buf, buf.readerIndex(), buf.writerIndex(), (byte) ',', 4) + 1;
+         String[] values = buf.readCharSequence(
+                 dataIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString().split(",");
+ 
+         int current = Integer.parseInt(values[2]);
+         int total = Integer.parseInt(values[3]);
+ 
+         if (audio == null) {
+             audio = Unpooled.buffer();
+         }
+         audio.writeBytes(buf);
+ 
+         sendResponse(channel, id, index, "JXTKR,1");
+ 
+         if (current < total) {
+             return null;
+         } else {
+             Position position = new Position(getProtocolName());
+             position.setDeviceId(deviceSession.getDeviceId());
+             getLastLocation(position, null);
+             position.set(Position.KEY_AUDIO, writeMediaFile(id, audio, "amr"));
+             audio.release();
+             audio = null;
+             return position;
+         }
+ 
+     } else if (type.equals("TK")) {
+ 
+         if (buf.readableBytes() == 1) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         getLastLocation(position, null);
+ 
+         position.set(Position.KEY_AUDIO, writeMediaFile(id, buf, "amr"));
+ 
+         return position;
+ 
+     }
+ 
+     return null;
+ }
+\ No newline at end of file
