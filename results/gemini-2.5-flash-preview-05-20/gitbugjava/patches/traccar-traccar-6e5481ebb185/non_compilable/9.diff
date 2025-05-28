@@ -1,0 +1,170 @@
+diff --git a/tmp/83f79e53-15da-43f1-b494-aa1b82b89474_buggy.java b/tmp/049726de-d5bb-4750-a57b-fb276716fe8d_fixed.java
+index ee599aa..3896ce8 100644
+--- a/tmp/83f79e53-15da-43f1-b494-aa1b82b89474_buggy.java
++++ b/tmp/049726de-d5bb-4750-a57b-fb276716fe8d_fixed.java
+@@ -1,50 +1,137 @@
++import io.netty.buffer.ByteBuf;
++import org.traccar.helper.BitUtil;
++import org.traccar.model.CellTower;
++import org.traccar.model.Network;
++import org.traccar.model.Position;
++
++import static org.traccar.protocol.Gt06ProtocolDecoder.MSG_GPS_LBS_6;
++import static org.traccar.protocol.Gt06ProtocolDecoder.MSG_GPS_LBS_7;
++import static org.traccar.protocol.Gt06ProtocolDecoder.MSG_LBS_ALARM;
++
++public class Gt06ProtocolDecoder { // Class context for helper methods and constants
++    // Assuming BitUtil, MSG_GPS_LBS_6, MSG_GPS_LBS_7, MSG_LBS_ALARM are defined elsewhere in the actual class.
++    // This is a dummy for compilation.
++    // Dummy classes/methods for compilation
++    private static class BitUtil {
++        public static boolean check(int value, int bit) { return (value & (1 << bit)) != 0; }
++        public static int to(int value, int bit) { return value & ~(1 << bit); } // Example, might need actual implementation
++    }
++
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
++        int initialReaderIndex = buf.readerIndex(); // This is the index *before* the length byte (if hasLength) or LBS data.
++
++        int declaredLength = 0; // Length specified in the protocol (0 if hasLength is false)
++        int lbsDataStartRelativeIndex = 0; // Relative to initialReaderIndex, where LBS data starts.
+ 
+-        int length = 0;
+         if (hasLength) {
+-            length = buf.readUnsignedByte();
+-            if (length == 0) {
+-                boolean zeroedData = true;
+-                for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
+-                    if (buf.getByte(i) != 0) {
+-                        zeroedData = false;
+-                        break;
++            // Check if there's at least one byte for the length itself.
++            if (buf.readableBytes() < 1) {
++                return false;
+             }
++            declaredLength = buf.readUnsignedByte(); // Read the length of the LBS data block
++            lbsDataStartRelativeIndex = 1; // Length byte consumed
++            
++            if (declaredLength == 0) {
++                // If declared length is 0, no LBS data to parse.
++                // The buffer's reader index is now after the length byte.
++                // Subsequent protocol fields follow immediately.
++                return false;
+             }
+-                if (zeroedData) {
+-                    buf.skipBytes(Math.min(buf.readableBytes(), 45));
+         }
++
++        // Calculate the expected end index of the LBS data block in the main buffer.
++        int expectedLbsDataEndIndex = initialReaderIndex + lbsDataStartRelativeIndex + declaredLength;
++
++        // If hasLength is true, check if the main buffer actually contains enough data
++        // for the declared LBS block. If not, it's a malformed packet.
++        if (hasLength && buf.writerIndex() < expectedLbsDataEndIndex) {
++            // The buffer does not contain enough data even for the declaredLength.
++            // This is a malformed packet. Advance buffer reader index to consume all readable bytes
++            // up to where the declared LBS block should have ended, then return false.
++            // Note: This relies on the caller wrapping this method with an exception handler if it throws IndexOutOfBoundsException.
++            // If the buffer is truly short, skipBytes might still go beyond writerIndex.
++            // To be safe, skip only what's readable.
++            buf.skipBytes(buf.readableBytes()); 
+             return false;
+         }
++
++        // Create a temporary readable buffer slice to strictly respect the declared length.
++        // All subsequent LBS field reads will be from this `lbsBuf` slice.
++        ByteBuf lbsBuf;
++        if (hasLength) {
++            // This advances the main `buf`'s reader index by `declaredLength`.
++            lbsBuf = buf.readSlice(declaredLength); 
++        } else {
++            // If no length is declared, assume LBS data is at the current buffer position
++            // and consumes data until the end of the packet or a fixed known length.
++            // The checks below will ensure enough bytes are available.
++            lbsBuf = buf; 
+         }
+ 
+-        int mcc = buf.readUnsignedShort();
++        int mcc;
+         int mnc;
+-        if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
+-            mnc = buf.readUnsignedShort();
+-        } else {
+-            mnc = buf.readUnsignedByte();
+-        }
+         int lac;
+-        if (type == MSG_LBS_ALARM) {
+-            lac = buf.readInt();
+-        } else {
+-            lac = buf.readUnsignedShort();
+-        }
+         long cid;
++
++        // Read MCC (2 bytes)
++        if (lbsBuf.readableBytes() < 2) {
++            return false;
++        }
++        mcc = lbsBuf.readUnsignedShort();
++
++        // Read MNC (1 or 2 bytes)
++        int mncExpectedBytes = (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) ? 2 : 1;
++        if (lbsBuf.readableBytes() < mncExpectedBytes) {
++            return false;
++        }
++        if (mncExpectedBytes == 2) {
++            mnc = lbsBuf.readUnsignedShort();
++        } else {
++            mnc = lbsBuf.readUnsignedByte();
++        }
++
++        // Read LAC (2 or 4 bytes)
++        int lacExpectedBytes = (type == MSG_LBS_ALARM) ? 4 : 2;
++        if (lbsBuf.readableBytes() < lacExpectedBytes) {
++            return false;
++        }
++        if (lacExpectedBytes == 4) {
++            lac = lbsBuf.readInt();
++        } else {
++            lac = lbsBuf.readUnsignedShort();
++        }
++
++        // Read CID (3, 4, or 8 bytes)
++        int cidExpectedBytes;
+         if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
+-            cid = buf.readLong();
++            cidExpectedBytes = 8;
+         } else if (type == MSG_GPS_LBS_6) {
+-            cid = buf.readUnsignedInt();
++            cidExpectedBytes = 4;
+         } else {
+-            cid = buf.readUnsignedMedium();
++            cidExpectedBytes = 3;
++        }
++        if (lbsBuf.readableBytes() < cidExpectedBytes) {
++            return false;
++        }
++        if (cidExpectedBytes == 8) {
++            cid = lbsBuf.readLong();
++        } else if (cidExpectedBytes == 4) {
++            cid = lbsBuf.readUnsignedInt();
++        } else { // 3 bytes
++            cid = lbsBuf.readUnsignedMedium();
+         }
+ 
++        // If all fields were read successfully
+         position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
+-        }
++        // If `hasLength` is true, `lbsBuf` is a slice. Its reader index indicates how many bytes were consumed
++        // from the slice. The main `buf`'s reader index was advanced by `declaredLength` when `readSlice` was called.
++        // This implicitly handles any remaining bytes within the declared length.
++        // No explicit `skipBytes` is needed here for `hasLength=true` as the slice already consumed the correct amount.
++
++        // If `hasLength` is false, `lbsBuf` is the original `buf`. Any remaining bytes in `lbsBuf` (original `buf`)
++        // are part of the next protocol fields, not to be skipped by this LBS decoder.
+ 
+         return true;
+     }
++}
+\ No newline at end of file

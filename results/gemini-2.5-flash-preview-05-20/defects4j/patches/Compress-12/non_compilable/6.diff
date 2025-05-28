@@ -1,0 +1,124 @@
+diff --git a/tmp/83f5d318-17a1-4344-9a70-1b39303b4955_buggy.java b/tmp/7e84b9ee-8054-448c-b7c1-f68c46715c23_fixed.java
+index b5a206b..e29c6ed 100644
+--- a/tmp/83f5d318-17a1-4344-9a70-1b39303b4955_buggy.java
++++ b/tmp/7e84b9ee-8054-448c-b7c1-f68c46715c23_fixed.java
+@@ -1,80 +1,104 @@
+     /**
+      * Get the next entry in this tar archive. This will skip
+      * over any remaining data in the current entry, if there
+      * is one, and place the input stream at the header of the
+      * next entry, and read the header and instantiate a new
+      * TarEntry from the header bytes and return that entry.
+      * If there are no more entries in the archive, null will
+      * be returned to indicate that the end of the archive has
+      * been reached.
+      *
+      * @return The next TarEntry in the archive, or null.
+      * @throws IOException on error
+      */
+     public TarArchiveEntry getNextTarEntry() throws IOException {
+         if (hasHitEOF) {
+             return null;
+         }
+ 
+         if (currEntry != null) {
++            // First, skip any remaining data of the *current* entry
++            // entryOffset tracks how much data has been read from currEntry.
++            // entrySize is the total size of currEntry's data.
+             long numToSkip = entrySize - entryOffset;
+ 
+             while (numToSkip > 0) {
+                 long skipped = skip(numToSkip);
+                 if (skipped <= 0) {
+                     throw new RuntimeException("failed to skip current tar entry");
+                 }
+                 numToSkip -= skipped;
+             }
+ 
+-            readBuf = null;
++            // Second, skip the padding bytes to align to the next 512-byte block boundary.
++            // Tar entries are always padded to a multiple of 512 bytes.
++            // This is crucial to ensure that the next call to getRecord() reads a correctly aligned header.
++            long padding = TarUtils.calculatePadding(entrySize);
++            if (padding > 0) {
++                long skippedPadding = skip(padding);
++                if (skippedPadding < padding) {
++                    // This indicates that we couldn't skip all required padding,
++                    // which might mean unexpected EOF or a corrupted archive.
++                    throw new IOException("failed to skip padding bytes (" + skippedPadding + " instead of " + padding + ")");
++                }
++            }
++            
++            readBuf = null; // Clear the read buffer as we are moving to a new entry
+         }
+ 
+         byte[] headerBuf = getRecord();
+ 
+         if (hasHitEOF) {
+             currEntry = null;
+             return null;
+         }
+ 
+         currEntry = new TarArchiveEntry(headerBuf);
+-        entryOffset = 0;
+-        entrySize = currEntry.getSize();
++        entryOffset = 0; // Reset offset for the new current entry
++        entrySize = currEntry.getSize(); // Set size for the new current entry
+ 
+         if (currEntry.isGNULongNameEntry()) {
+-            // read in the name
++            // This entry is a GNU long name entry, its data is the actual long file name.
+             StringBuffer longName = new StringBuffer();
+             byte[] buf = new byte[SMALL_BUFFER_SIZE];
+             int length = 0;
++            
++            // Read the long name from the current entry's data stream.
++            // The read() method itself ensures entryOffset is updated and respects entrySize.
+             while ((length = read(buf)) >= 0) {
+                 longName.append(new String(buf, 0, length));
+             }
+-            getNextEntry();
+-            if (currEntry == null) {
+-                // Bugzilla: 40334
+-                // Malformed tar file - long entry name not followed by entry
++            
++            // After reading the long name data, we must get the *actual* entry that this long name refers to.
++            // This is a recursive call to getNextTarEntry, which will handle skipping the
++            // long name entry's remaining data (which should be zero) and its padding,
++            // then read the header of the next entry (the actual file/directory entry).
++            TarArchiveEntry actualEntry = getNextTarEntry();
++            if (actualEntry == null) {
++                // Bugzilla: 40334 - Malformed tar file - long entry name not followed by entry
++                currEntry = null; // Ensure currEntry is null if actual entry not found
+                 return null;
+             }
+-            // remove trailing null terminator
++            currEntry = actualEntry; // The "current" entry is now the actual entry
++
++            // Remove trailing null terminator if present in the long name.
+             if (longName.length() > 0
+                 && longName.charAt(longName.length() - 1) == 0) {
+                 longName.deleteCharAt(longName.length() - 1);
+             }
+-            currEntry.setName(longName.toString());
++            currEntry.setName(longName.toString()); // Set the long name on the actual entry
+         }
+ 
+         if (currEntry.isPaxHeader()){ // Process Pax headers
+             paxHeaders();
+         }
+ 
+         if (currEntry.isGNUSparse()){ // Process sparse files
+             readGNUSparse();
+         }
+ 
+-        // If the size of the next element in the archive has changed
+-        // due to a new size being reported in the posix header
+-        // information, we update entrySize here so that it contains
+-        // the correct value.
++        // If the size of the current entry has been modified by Pax headers or sparse file processing,
++        // we update entrySize here so it contains the correct value for subsequent data reads.
+         entrySize = currEntry.getSize();
+         return currEntry;
+     }
+\ No newline at end of file

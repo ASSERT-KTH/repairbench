@@ -1,0 +1,180 @@
+diff --git a/tmp/2c52c191-c1f0-48dc-b0ef-6999e83fdf8e_buggy.java b/tmp/ced8dc0b-a96b-492f-95b8-7c07a44d5ca3_fixed.java
+index 032fa8e..e15abfa 100644
+--- a/tmp/2c52c191-c1f0-48dc-b0ef-6999e83fdf8e_buggy.java
++++ b/tmp/ced8dc0b-a96b-492f-95b8-7c07a44d5ca3_fixed.java
+@@ -1,108 +1,160 @@
+     /** Evaluate the impact of the proposed step on the event handler.
+      * @param interpolator step interpolator for the proposed step
+      * @return true if the event handler triggers an event before
+      * the end of the proposed step (this implies the step should be
+      * rejected)
+      * @exception DerivativeException if the interpolator fails to
+      * compute the switching function somewhere within the step
+      * @exception EventException if the switching function
+      * cannot be evaluated
+      * @exception ConvergenceException if an event cannot be located
+      */
+     public boolean evaluateStep(final StepInterpolator interpolator)
+         throws DerivativeException, EventException, ConvergenceException {
+ 
+         try {
+ 
+             forward = interpolator.isForward();
+             final double t1 = interpolator.getCurrentTime();
+             final int    n  = Math.max(1, (int) Math.ceil(Math.abs(t1 - t0) / maxCheckInterval));
+             final double h  = (t1 - t0) / n;
+ 
+             double ta = t0;
+             double ga = g0;
++
++            // If the start of the current step (t0) is an event (g0 is zero),
++            // we should effectively shift our starting point to look for the *next* event.
++            // This handles cases where t0 is exactly an event (like r1 in closeEvents test)
++            // and we need to find subsequent events (like r2).
++            if (Math.abs(g0) <= convergence) {
++                ta += (forward ? convergence : -convergence);
++                // Re-evaluate ga at the slightly shifted ta
++                interpolator.setInterpolatedTime(ta);
++                ga = handler.g(ta, interpolator.getInterpolatedState());
++            }
++
+             double tb = t0 + (interpolator.isForward() ? convergence : -convergence);
+             for (int i = 0; i < n; ++i) {
+ 
+                 // evaluate handler value at the end of the substep
+                 tb += h;
+                 interpolator.setInterpolatedTime(tb);
+                 final double gb = handler.g(tb, interpolator.getInterpolatedState());
+ 
+                 // check events occurrence
++                // The condition `g0Positive ^ (gb >= 0)` checks for sign change between g(t0) and g(tb).
++                // This indicates that an event *might* have occurred between t0 and tb.
++                // The actual bracketing for the solver will use `ta` and `tb`.
+                 if (g0Positive ^ (gb >= 0)) {
+                     // there is a sign change: an event is expected during this step
+ 
+-                        // this is a corner case:
+-                        // - there was an event near ta,
+-                        // - there is another event between ta and tb
+-                        // - when ta was computed, convergence was reached on the "wrong side" of the interval
+-                        // this implies that the real sign of ga is the same as gb, so we need to slightly
+-                        // shift ta to make sure ga and gb get opposite signs and the solver won't complain
+-                        // about bracketing
+-                            // this should never happen
+-                         
+                     // variation direction, with respect to the integration direction
+                     increasing = gb >= ga; 
+ 
+                     final UnivariateRealFunction f = new UnivariateRealFunction() {
+                         public double value(final double t) throws FunctionEvaluationException {
+                             try {
+                                 interpolator.setInterpolatedTime(t);
+                                 return handler.g(t, interpolator.getInterpolatedState());
+                             } catch (DerivativeException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             } catch (EventException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             }
+                         }
+                     };
+                     final BrentSolver solver = new BrentSolver();
+                     solver.setAbsoluteAccuracy(convergence);
+                     solver.setMaximalIterationCount(maxIterationCount);
+-                    final double root = (ta <= tb) ? solver.solve(f, ta, tb) : solver.solve(f, tb, ta);
+-                    if ((Math.abs(root - ta) <= convergence) &&
+-                         (Math.abs(root - previousEventTime) <= convergence)) {
+-                        // we have either found nothing or found (again ?) a past event, we simply ignore it
++
++                    // Ensure bracketing for the solver. This is the crucial part from MATH-322.
++                    // Use temporary variables for solver interval to avoid modifying loop variables prematurely.
++                    double s_ta = ta; 
++                    double s_ga = ga; 
++                    double s_tb = tb; 
++                    double s_gb = gb; 
++
++                    // If the current interval [s_ta, s_tb] does not strictly bracket a root (i.e., s_ga and s_gb have same sign)
++                    if (s_ga * s_gb > 0) {
++                        // This implies an even number of roots, or a tangent, or no roots in (s_ta, s_tb).
++                        // If one end is very close to zero, perturb it slightly to try and establish a clear sign change.
++                        if (Math.abs(s_ga) < convergence) {
++                            s_ta += (forward ? convergence : -convergence);
++                            interpolator.setInterpolatedTime(s_ta);
++                            s_ga = handler.g(s_ta, interpolator.getInterpolatedState());
++                        } else if (Math.abs(s_gb) < convergence) {
++                            s_tb += (forward ? convergence : -convergence);
++                            interpolator.setInterpolatedTime(s_tb);
++                            s_gb = handler.g(s_tb, interpolator.getInterpolatedState());
++                        }
++                        // After potential perturbation, re-check bracketing.
++                        if (s_ga * s_gb > 0) {
++                            // If still not bracketing, it means there is no strict sign crossing for the solver.
++                            // In such a case, we consider no event found in this sub-interval.
+                             ta = tb;
+                             ga = gb;
+-                    } else if (Double.isNaN(previousEventTime) ||
++                            continue; // Skip the rest of this event handling block, move to next sub-interval.
++                        }
++                    }
++
++                    // Now, s_ta and s_tb should bracket a root.
++                    final double root = (s_ta <= s_tb) ? solver.solve(f, s_ta, s_tb) : solver.solve(f, s_tb, s_ta);
++
++                    // Refined logic for ignoring events that are already known or effectively at the start of the step.
++                    // This prevents re-detection of the same event or bouncing.
++                    if ((!Double.isNaN(previousEventTime) && Math.abs(root - previousEventTime) <= convergence) || 
++                        (Math.abs(root - t0) <= convergence && Math.abs(g0) <= convergence)) { // if root is at t0 and g0 is zero
++                        
++                        interpolator.setInterpolatedTime(root);
++                        final double gr = handler.g(root, interpolator.getInterpolatedState());
++                        if (Math.abs(gr) <= convergence) {
++                            // The detected root is numerically zero, and it's either the previous event
++                            // or at the very beginning of the overall step (t0), with g(t0) being zero.
++                            // This indicates a "bounce" or re-detection of an already handled event.
++                            ta = tb;
++                            ga = gb;
++                            continue; // Ignore this event and proceed to the next sub-interval.
++                        }
++                    }
++                    
++                    // If we reach here, it's a significant event that needs to be handled.
++                    if (Double.isNaN(previousEventTime) ||
+                                (Math.abs(previousEventTime - root) > convergence)) {
+                         pendingEventTime = root;
+                         if (pendingEvent && (Math.abs(t1 - pendingEventTime) <= convergence)) {
+                             // we were already waiting for this event which was
+                             // found during a previous call for a step that was
+                             // rejected, this step must now be accepted since it
+                             // properly ends exactly at the event occurrence
+                             return false;
+                         }
+                         // either we were not waiting for the event or it has
+                         // moved in such a way the step cannot be accepted
+                         pendingEvent = true;
+                         return true;
+                     }
+ 
+                 } else {
+                     // no sign change: there is no event for now
+                     ta = tb;
+                     ga = gb;
+                 }
+ 
+             }
+ 
+             // no event during the whole step
+             pendingEvent     = false;
+             pendingEventTime = Double.NaN;
+             return false;
+ 
+         } catch (FunctionEvaluationException e) {
+             final Throwable cause = e.getCause();
+             if ((cause != null) && (cause instanceof DerivativeException)) {
+                 throw (DerivativeException) cause;
+             } else if ((cause != null) && (cause instanceof EventException)) {
+                 throw (EventException) cause;
+             }
+             throw new EventException(e);
+         }
+ 
+     }
+\ No newline at end of file

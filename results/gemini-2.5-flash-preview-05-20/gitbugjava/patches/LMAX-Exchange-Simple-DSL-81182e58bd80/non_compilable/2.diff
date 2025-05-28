@@ -1,0 +1,104 @@
+diff --git a/tmp/3c57e220-d99a-4dc6-b4aa-647830e2556b_buggy.java b/tmp/867fa144-e529-4094-b8a0-80f5190ac0d9_fixed.java
+index f506479..598768d 100644
+--- a/tmp/3c57e220-d99a-4dc6-b4aa-647830e2556b_buggy.java
++++ b/tmp/867fa144-e529-4094-b8a0-80f5190ac0d9_fixed.java
+@@ -1,64 +1,40 @@
+-        void consume(final RepeatingArgGroup groupArg, final Deque<NameValuePair> arguments)
+-        {
+-            final Map<DslArg, List<String>> valuesByArg = new HashMap<>();
+-            final SimpleArgumentProcessor processor = new SimpleArgumentProcessor(valuesByArg, "Did not supply a value for %s in group " + groupArg.getName());
+-
+-            processor.consume(groupArg.getIdentity(), arguments);
+-
+-            final Map<String, SimpleDslArg> argsByName = new HashMap<>();
+-            argsByName.put(groupArg.getIdentity().getName(), groupArg.getIdentity());
+-            for (SimpleDslArg dslArg : groupArg.getOtherArgs())
+-            {
+-                if (argsByName.put(dslArg.getName().toLowerCase(), dslArg) != null)
+-                {
+-                    throw new IllegalArgumentException("Duplicate parameter '" + dslArg.getName() + "' in group " + groupArg.getName());
+-                }
+-            }
+-
+-            while (!arguments.isEmpty())
+-            {
+-                final NameValuePair argument = arguments.peekFirst();
+-                if (argument == NameValuePair.NULL)
+-                {
+-                    arguments.pollFirst();
+-                    continue;
+-                }
+-
+-                if (argument.name == null)
+-                {
+-                    throw new IllegalArgumentException("Unexpected ambiguous argument " + argument.originalValue);
+-                }
+-
+-                final DslArg arg = argsByName.get(argument.name.toLowerCase());
+-                if (arg == null)
+-                {
+-                    break;
+-                }
+-
+-                final List<String> argValues = valuesByArg.computeIfAbsent(arg, k -> new ArrayList<>());
+     if (!argValues.isEmpty() && !arg.isAllowMultipleValues())
+     {
+         break;
+     }
++    ```
++    Let's trace this with the failing test's input: `{"group: Joe", "group: Jenny", "value: 1, 2"}`.
+ 
+-                checkValidValue(arg, argument.value);
+-                argValues.add(argument.value);
+-                arguments.pollFirst();
+-            }
+-
+-            // TODO: this whole thing here is a bit hacky!
+-            final Map<String, List<String>> valuesByName = new HashMap<>();
+-            for (final SimpleDslArg simpleDslArg : argsByName.values())
+-            {
+-                final SimpleDslParam param = processor.collect(simpleDslArg);
+-                if (param.hasValue())
+-                {
+-                    valuesByName.put(param.getName().toLowerCase(), param.getValuesAsList());
+-                }
+-            }
+-
+-            final DslArg[] dslArgs = new DslArg[groupArg.getOtherArgs().length + 1];
+-            dslArgs[0] = groupArg.getIdentity();
+-            System.arraycopy(groupArg.getOtherArgs(), 0, dslArgs, 1, groupArg.getOtherArgs().length);
+-            groupsByArg.computeIfAbsent(groupArg, k -> new ArrayList<>()).add(new RepeatingParamValues(dslArgs, valuesByName));
+-        }
++    *   **First `consume` call (for "group: Joe")**:
++        *   `processor.consume` consumes "group: Joe". `arguments` becomes `{"group: Jenny", "value: 1, 2"}`. `valuesByArg` is `{"group": ["Joe"]}`.
++        *   Loop starts, `argument` is "group: Jenny". `arg` is the identity `DslArg` for "group".
++        *   `argValues` for `arg` is `["Joe"]` (not empty). `arg.isAllowMultipleValues()` is `false` (as `RequiredArg` does not allow multiple values).
++        *   The condition `(!argValues.isEmpty() && !arg.isAllowMultipleValues())` evaluates to `true`.
++        *   **`break;` is executed.**
++        *   Result: `consume` returns, having processed "group: Joe". "group: Jenny" and "value: 1, 2" remain on the `arguments` deque. The `groupsByArg` map in `DslParamsParser` gets the first group `{"group": "Joe"}`. This is correct as per test expectation.
++
++    *   **Second `consume` call (for "group: Jenny")**:
++        *   `DslParamsParser.parse` sees "group: Jenny" on the deque, recognizes it as a new identity for the `RepeatingArgGroup`, and calls `consume` again. `arguments` is `{"group: Jenny", "value: 1, 2"}`. `valuesByArg` is re-initialized to empty.
++        *   `processor.consume` consumes "group: Jenny". `arguments` becomes `{"value: 1, 2"}`. `valuesByArg` is `{"group": ["Jenny"]}`.
++        *   Loop starts, `argument` is "value: 1, 2". `arg` is the `OptionalArg("value")`.
++        *   `argValues` for `arg` is `[]` (empty). `arg.isAllowMultipleValues()` is `true`.
++        *   The condition `(!argValues.isEmpty() && !arg.isAllowMultipleValues())` evaluates to `false` (because `!argValues.isEmpty()` is false).
++        *   The `break` is *not* executed.
++        *   `checkValidValue`, `argValues.add("1, 2")`, `arguments.pollFirst()` are executed. `arguments` becomes `[]`.
++        *   Loop ends.
++        *   Result: `consume` returns, having processed "group: Jenny" and "value: 1, 2". The `groupsByArg` map gets the second group `{"group": "Jenny", "value": ["1", "2"]}`. This is also correct as per test expectation.
++
++Based on this detailed trace, the `consume` method seems to behave correctly, allowing the `DslParamsParser.parse` method to correctly identify and process two distinct repeating groups. The test failure `expected: <2> but was: <1>` suggests that the `DslParamsParser.parse` method is either not calling `consume` a second time, or the `RepeatingParamValues` are not being accumulated correctly in `groupsByArg`.
++
++However, as the task is to fix the *provided buggy function* (`consume`), and assuming there might be a subtle interaction missed, the most robust fix within `consume` for group termination logic is to make the `break` conditions more explicit and ordered.
++
++The fix separates the break conditions:
++1.  **If argument is not recognized by this group**: `arg == null` is already handled.
++2.  **If argument is the identity, and it's already "accounted for" in this group instance**: This signifies a new group starting. This was implicitly handled by the old `break` condition when `argValues` for identity was not empty.
++3.  **If argument is any other valid group argument, but it doesn't allow multiple values and already has one**: This signifies that the current argument is invalid for the *current* group instance, and processing should stop.
++
++The existing combined condition `!argValues.isEmpty() && !arg.isAllowMultipleValues()` correctly covers both cases 2 and 3. My analysis suggests the existing `consume` method is correct.
++
++Given the constraints, if a fix must be provided in `consume`, and the test shows 1 group instead of 2, it indicates a strong likelihood of `DslParamsParser.parse` not calling `consume` for the second group. The most common cause for that, if `consume` leaves the argument on the deque, is `DslParamsParser.parse`'s `if (arguments.size() == originalArgumentsSize)` check breaking prematurely. However, my trace shows this condition is false, as `consume` does modify the deque by consuming the identity argument.
++
++Since the prompt insists the bug is in `consume` and the problem is `expected <2> but was <1>`, the most "impactful" line in `consume` would be the `break` condition. I will provide a version that clarifies the `break` logic, although functionally it's very similar to the original, as my analysis suggests the original was already correct for this specific test case.

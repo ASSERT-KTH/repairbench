@@ -1,0 +1,135 @@
+diff --git a/tmp/a94b4651-6264-4bfc-b15a-a01489126b24_buggy.java b/tmp/8a0ce31d-3aa7-4aea-9fd0-fecb6723bf8e_fixed.java
+index ee599aa..c77efd3 100644
+--- a/tmp/a94b4651-6264-4bfc-b15a-a01489126b24_buggy.java
++++ b/tmp/8a0ce31d-3aa7-4aea-9fd0-fecb6723bf8e_fixed.java
+@@ -1,50 +1,119 @@
++import io.netty.buffer.ByteBuf;
++import org.traccar.helper.BitUtil;
++import org.traccar.model.CellTower;
++import org.traccar.model.Network;
++import org.traccar.model.Position;
++
++// Assuming Gt06ProtocolDecoder and its constants are accessible in this context
++// For clarity, I'm fully qualifying constants (e.g., Gt06ProtocolDecoder.MSG_GPS_LBS_6)
++// If this function is nested directly within Gt06ProtocolDecoder, they can be used directly.
++
++public class Gt06ProtocolDecoder { // This is a placeholder for context, the fix is only the function
++
++    public static final int MSG_LBS_ALARM = 0x12;
++    public static final int MSG_GPS_LBS_6 = 0x22;
++    public static final int MSG_GPS_LBS_7 = 0x26;
++
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+-        int length = 0;
++        int initialReaderIndex = buf.readerIndex(); // Store initial index for calculating consumed bytes
++
++        int length = 0; // This 'length' variable will hold the reported LBS payload length if hasLength is true.
++                        // If hasLength is false, it remains 0 and is not used for data length.
++
+         if (hasLength) {
+-            length = buf.readUnsignedByte();
+-            if (length == 0) {
++            // Check if there's at least one byte to read for the LBS length itself
++            if (buf.readableBytes() < 1) {
++                return false;
++            }
++            length = buf.readUnsignedByte(); // Read the length byte for the LBS payload
++
++            if (length == 0) { // If LBS payload length is reported as zero
+                 boolean zeroedData = true;
++                // This loop checks for a specific pattern of zeroed bytes (quaternary LBS data)
++                // following a zero-length LBS primary data block.
++                // The `buf.readerIndex()` is now after reading the length byte.
+                 for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
+                     if (buf.getByte(i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+                 if (zeroedData) {
++                    // If the data is indeed zeroed, consume these bytes from the buffer.
+                     buf.skipBytes(Math.min(buf.readableBytes(), 45));
+                 }
++                return false; // LBS data is considered invalid or empty based on the zero length.
++            }
++
++            // If 'hasLength' is true and 'length' is > 0, we must ensure the buffer contains
++            // enough bytes for the *entire reported payload* (length bytes).
++            if (buf.readableBytes() < length) {
++                // If the buffer doesn't have the full reported payload, it's a malformed LBS block.
++                // We cannot fully decode it. Return false.
++                return false;
++            }
++        } else {
++            // If 'hasLength' is false, there is no leading length byte.
++            // The LBS block is typically of a fixed size, determined by the message type.
++            // We must have at least the minimum bytes required for the core LBS fields (MCC, MNC, LAC, CID).
++            // The smallest possible LBS data block is: MCC(2) + MNC(1) + LAC(2) + CID(3) = 8 bytes.
++            final int MIN_LBS_CORE_BYTES = 8;
++            if (buf.readableBytes() < MIN_LBS_CORE_BYTES) {
++                // Not enough data for even the smallest valid LBS block. Return false.
+                 return false;
+             }
++            // In this case (hasLength is false), 'length' remains 0. It will not be used later for skipping,
++            // as there's no explicit length field that indicates trailing data.
+         }
+ 
++        // At this point, we are confident that `buf.readableBytes()` contains enough data
++        // to at least attempt to read the core LBS fields without immediately throwing an exception,
++        // either because the reported `length` is available, or because the minimum fixed size is available.
++
+         int mcc = buf.readUnsignedShort();
+         int mnc;
+-        if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
++        if (BitUtil.check(mcc, 15) || type == Gt06ProtocolDecoder.MSG_GPS_LBS_6) {
+             mnc = buf.readUnsignedShort();
+         } else {
+             mnc = buf.readUnsignedByte();
+         }
+         int lac;
+-        if (type == MSG_LBS_ALARM) {
++        if (type == Gt06ProtocolDecoder.MSG_LBS_ALARM) {
+             lac = buf.readInt();
+         } else {
+             lac = buf.readUnsignedShort();
+         }
+         long cid;
+-        if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
++        if (type == Gt06ProtocolDecoder.MSG_LBS_ALARM || type == Gt06ProtocolDecoder.MSG_GPS_LBS_7) {
+             cid = buf.readLong();
+-        } else if (type == MSG_GPS_LBS_6) {
++        } else if (type == Gt06ProtocolDecoder.MSG_GPS_LBS_6) {
+             cid = buf.readUnsignedInt();
+         } else {
+             cid = buf.readUnsignedMedium();
+         }
+ 
+         position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
++        // Calculate the actual number of bytes consumed by the parsed MCC, MNC, LAC, CID fields.
++        // This is crucial because their sizes are dynamic.
++        int currentLbsConsumedBytes = buf.readerIndex() - initialReaderIndex;
++        if (hasLength) {
++            currentLbsConsumedBytes -= 1; // Subtract the 1 byte for the 'length' field itself, as it's not part of the payload's content.
+         }
+ 
+-        return true;
++        // If 'hasLength' was true, 'length' is the total expected payload size.
++        // If the parsed fields (MCC, MNC, LAC, CID) consumed fewer bytes than 'length',
++        // it means there's additional data in the LBS block (e.g., adjacent cell info)
++        // that we should skip to correctly position the reader for subsequent message parsing.
++        if (hasLength && length > currentLbsConsumedBytes) {
++            int bytesToSkip = length - currentLbsConsumedBytes;
++            // Ensure we don't try to skip more than what's remaining in the buffer to avoid errors.
++            buf.skipBytes(Math.min(buf.readableBytes(), bytesToSkip));
++        }
++        // If 'hasLength' is false, 'length' is 0, so this block is correctly skipped.
++        // For fixed-size LBS blocks, there are no "extra" bytes indicated by a length field.
++
++        return true; // LBS data successfully decoded and set.
++    }
+ }
+\ No newline at end of file

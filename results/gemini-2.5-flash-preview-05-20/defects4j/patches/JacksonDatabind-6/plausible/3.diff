@@ -1,0 +1,200 @@
+diff --git a/tmp/31d5a61e-f713-4b5b-8ed7-a3f7ba821b25_buggy.java b/tmp/4a592606-e2b9-46da-8bab-b607cba5c986_fixed.java
+index cd412d2..bac230d 100644
+--- a/tmp/31d5a61e-f713-4b5b-8ed7-a3f7ba821b25_buggy.java
++++ b/tmp/4a592606-e2b9-46da-8bab-b607cba5c986_fixed.java
+@@ -1,76 +1,167 @@
+     protected Date parseAsISO8601(String dateStr, ParsePosition pos)
+     {
+         /* 21-May-2009, tatu: DateFormat has very strict handling of
+          * timezone  modifiers for ISO-8601. So we need to do some scrubbing.
+          */
+ 
+         /* First: do we have "zulu" format ('Z' == "GMT")? If yes, that's
+          * quite simple because we already set date format timezone to be
+          * GMT, and hence can just strip out 'Z' altogether
+          */
+         int len = dateStr.length();
+         char c = dateStr.charAt(len-1);
+         DateFormat df;
+ 
+         // [JACKSON-200]: need to support "plain" date...
+-        if (len <= 10 && Character.isDigit(c)) {
++        // Use a more robust check for plain date (no 'T' character)
++        if (len <= 10 && dateStr.indexOf('T') == -1) {
+             df = _formatPlain;
+             if (df == null) {
+                 df = _formatPlain = _cloneFormat(DATE_FORMAT_PLAIN, DATE_FORMAT_STR_PLAIN, _timezone, _locale);
+             }
+         } else if (c == 'Z') {
++            // Handle 'Z' (Zulu time)
++            StringBuilder sb = new StringBuilder(dateStr);
++            int tIndex = dateStr.indexOf('T');
++            int zIndex = len - 1; // index of 'Z'
++
++            // If 'T' is missing, the string is likely malformed for this format.
++            // However, assuming 'T' is present for standard ISO8601 with 'Z'.
++            if (tIndex != -1) {
++                // Check if seconds are missing (e.g. "HH:MMZ" -> "HH:MM:00Z")
++                // This is typically indicated by the string length after 'T' before 'Z' being 5 characters (HH:MM)
++                if (zIndex - (tIndex + 1) == 5) { // `dateStr.substring(tIndex+1, zIndex)` is "HH:MM"
++                    sb.insert(zIndex, ":00.000"); // Add seconds and milliseconds
++                    dateStr = sb.toString();
++                } else {
++                    // Has seconds, now check milliseconds
++                    int dotIndex = dateStr.lastIndexOf('.', zIndex); // Search for dot before 'Z'
++                    // If dot is found and it's after the last colon in time (implies HH:MM:SS.f)
++                    if (dotIndex != -1 && dotIndex > dateStr.lastIndexOf(':', zIndex)) {
++                        int msLength = zIndex - (dotIndex + 1); // Length of 'f' part
++                        if (msLength < 3) {
++                            for (int i = 0; i < (3 - msLength); ++i) {
++                                sb.insert(zIndex, '0'); // Pad milliseconds with trailing zeros
++                            }
++                            dateStr = sb.toString();
++                        }
++                    } else { // Has seconds but no milliseconds (e.g. HH:MM:SSZ)
++                        // This applies if the last part before 'Z' is like "SS" (2 digits) preceded by ':'.
++                        // Check if the character before 'SSZ' is a colon.
++                        if (len >= 4 && dateStr.charAt(len - 4) == ':') { // Original JACKSON-334 check was for this.
++                             sb.insert(len - 1, ".000"); // Add .000 before 'Z'
++                             dateStr = sb.toString();
++                        }
++                    }
++                }
++            }
+             df = _formatISO8601_z;
+             if (df == null) {
+                 df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, DATE_FORMAT_STR_ISO8601_Z, _timezone, _locale);
+             }
+-            // [JACKSON-334]: may be missing milliseconds... if so, add
+-            if (dateStr.charAt(len-4) == ':') {
+-                StringBuilder sb = new StringBuilder(dateStr);
+-                sb.insert(len-1, ".000");
+-                dateStr = sb.toString();
+-            }
+         } else {
+             // Let's see if we have timezone indicator or not...
+             if (hasTimeZone(dateStr)) {
+-                c = dateStr.charAt(len-3);
+-                if (c == ':') { // remove optional colon
+-                    // remove colon
++                // Normalize timezone part first (remove colon, ensure +HHMM or -HHMM)
++                // Need to re-calculate len if string modified by these ops
++                int currentLen = dateStr.length();
++                char charBeforeTZDigits = dateStr.charAt(currentLen - 3); // character before +HH:MM / -HH:MM or +HHMM / -HHMM
+                 StringBuilder sb = new StringBuilder(dateStr);
+-                    sb.delete(len-3, len-2);
++
++                if (charBeforeTZDigits == ':') { // remove optional colon, e.g., +01:00 -> +0100
++                    sb.delete(currentLen - 3, currentLen - 2);
++                    dateStr = sb.toString();
++                } else if (charBeforeTZDigits == '+' || charBeforeTZDigits == '-') { // missing minutes, e.g., +HH -> +HH00
++                    sb.append("00");
+                     dateStr = sb.toString();
+-                } else if (c == '+' || c == '-') { // missing minutes
+-                    // let's just append '00'
+-                    dateStr += "00";
+                 }
+-                // Milliseconds partial or missing; and even seconds are optional
+-                len = dateStr.length();
+-                // remove 'T', '+'/'-' and 4-digit timezone-offset
+-                c = dateStr.charAt(len-9);
+-                if (Character.isDigit(c)) {
+-                    StringBuilder sb = new StringBuilder(dateStr);
+-                    sb.insert(len-5, ".000");
++                currentLen = dateStr.length(); // Update len after timezone modification
++                
++                // Now, normalize the time part (seconds/milliseconds)
++                sb = new StringBuilder(dateStr); // Re-initialize StringBuilder for new string
++                int tIndex = dateStr.indexOf('T');
++                int tzOffsetStart = dateStr.lastIndexOf('+');
++                if (tzOffsetStart == -1) tzOffsetStart = dateStr.lastIndexOf('-');
++
++                // This should be the index just before the timezone offset (e.g., before '+0100')
++                int endOfTimePart = tzOffsetStart; 
++
++                // Case 1: Missing seconds (e.g. "HH:MM")
++                // Length of HH:MM is 5. `endOfTimePart - (tIndex + 1)`
++                if (tIndex != -1 && (endOfTimePart - (tIndex + 1)) == 5) { 
++                    sb.insert(endOfTimePart, ":00.000");
++                    dateStr = sb.toString();
++                } else {
++                    // Case 2: Has seconds, check milliseconds
++                    // Find dot before TZ offset. Search limit is `endOfTimePart`
++                    int dotIndex = dateStr.lastIndexOf('.', endOfTimePart); 
++                    // If dot is found and it's after the last colon in time (implies HH:MM:SS.f)
++                    if (dotIndex != -1 && dotIndex > dateStr.lastIndexOf(':', endOfTimePart)) {
++                        // Extract milliseconds string (part between dot and TZ offset)
++                        String msStr = dateStr.substring(dotIndex + 1, endOfTimePart);
++                        int msLength = msStr.length();
++                        if (msLength < 3) {
++                            for (int i = 0; i < (3 - msLength); ++i) {
++                                sb.insert(dotIndex + 1 + msLength, '0'); // Pad milliseconds with trailing zeros
++                            }
+                             dateStr = sb.toString();
+                         }
++                    } else {
++                        // Case 3: Has seconds, but no milliseconds (e.g. HH:MM:SS)
++                        // This applies if the last part before TZ offset is like "SS" (2 digits) preceded by ':'.
++                        if (endOfTimePart >= 3 && dateStr.charAt(endOfTimePart - 3) == ':') {
++                            sb.insert(endOfTimePart, ".000");
++                            dateStr = sb.toString();
++                        }
++                    }
++                }
+                 df = _formatISO8601;
+                 if (_formatISO8601 == null) {
+                     df = _formatISO8601 = _cloneFormat(DATE_FORMAT_ISO8601, DATE_FORMAT_STR_ISO8601, _timezone, _locale);
+                 }
+-            } else {
+-                // If not, plain date. Easiest to just patch 'Z' in the end?
++            } else { // No timezone indicator (e.g., "YYYY-MM-DDTHH:MM")
+                 StringBuilder sb = new StringBuilder(dateStr);
+-                // And possible also millisecond part if missing
+-                int timeLen = len - dateStr.lastIndexOf('T') - 1;
+-                if (timeLen <= 8) {
+-                        sb.append(".000");
++                int tIndex = dateStr.indexOf('T');
++                // The end of the time part is the end of the current string
++                int endOfTimePart = dateStr.length(); 
++
++                // Case 1: Missing seconds (e.g. "HH:MM")
++                if (tIndex != -1 && (endOfTimePart - (tIndex + 1)) == 5) { 
++                    sb.insert(endOfTimePart, ":00.000");
++                    dateStr = sb.toString();
++                } else {
++                    // Case 2: Has seconds, check milliseconds
++                    int dotIndex = dateStr.lastIndexOf('.', endOfTimePart);
++                    if (dotIndex != -1 && dotIndex > dateStr.lastIndexOf(':', endOfTimePart)) {
++                        String msStr = dateStr.substring(dotIndex + 1, endOfTimePart);
++                        int msLength = msStr.length();
++                        if (msLength < 3) {
++                            for (int i = 0; i < (3 - msLength); ++i) {
++                                sb.insert(dotIndex + 1 + msLength, '0');
+                             }
++                            dateStr = sb.toString();
++                        }
++                    } else {
++                        // Case 3: Has seconds, but no milliseconds (e.g. HH:MM:SS)
++                        // This applies if the last part before end is like "SS" (2 digits) preceded by ':'.
++                        if (endOfTimePart >= 3 && dateStr.charAt(endOfTimePart - 3) == ':') {
++                            sb.insert(endOfTimePart, ".000");
++                            dateStr = sb.toString();
++                        }
++                    }
++                }
++                // Finally, append 'Z' as per the logic for dates without explicit timezone.
++                // Rebuild StringBuilder if dateStr was modified
++                sb = new StringBuilder(dateStr); 
+                 sb.append('Z');
+                 dateStr = sb.toString();
++
+                 df = _formatISO8601_z;
+                 if (df == null) {
+                     df = _formatISO8601_z = _cloneFormat(DATE_FORMAT_ISO8601_Z, DATE_FORMAT_STR_ISO8601_Z,
+                             _timezone, _locale);
+                 }
+             }
+         }
+         return df.parse(dateStr, pos);
+     }
+\ No newline at end of file

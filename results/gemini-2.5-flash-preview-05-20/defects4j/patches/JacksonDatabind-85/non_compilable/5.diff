@@ -1,0 +1,144 @@
+diff --git a/tmp/c51c3c97-2a17-4c22-8630-74d404718d25_buggy.java b/tmp/ea38a502-7af4-4482-8b9f-1c4693e7994f_fixed.java
+index d926eea..c17df34 100644
+--- a/tmp/c51c3c97-2a17-4c22-8630-74d404718d25_buggy.java
++++ b/tmp/ea38a502-7af4-4482-8b9f-1c4693e7994f_fixed.java
+@@ -1,48 +1,112 @@
+     @Override
+     public JsonSerializer<?> createContextual(SerializerProvider serializers,
+             BeanProperty property) throws JsonMappingException
+     {
+         if (property == null) {
+             return this;
+         }
++
++        // 1. Find explicit @JsonFormat overrides for this property
+         JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+-        if (format == null) {
+-            return this;
+-        }
+-        // Simple case first: serialize as numeric timestamp?
+-        JsonFormat.Shape shape = format.getShape();
+-        if (shape.isNumeric()) {
++        
++        // 2. Check for numeric timestamp serialization preference from @JsonFormat
++        if (format != null && format.getShape().isNumeric()) {
+             return withFormat(Boolean.TRUE, null);
+         }
+ 
+-        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+-        // First: custom pattern will override things
+-                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+-                                || format.hasLocale() || format.hasTimeZone()) {
+-                    TimeZone tz = format.getTimeZone();
+-                    final String pattern = format.hasPattern()
+-                                    ? format.getPattern()
+-                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+-            final Locale loc = format.hasLocale()
+-                            ? format.getLocale()
+-                            : serializers.getLocale();
+-                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
++        // 3. Prepare properties for building a SimpleDateFormat (if needed)
++        // These will be sourced from @JsonFormat, or from ObjectMapper's defaults, or hardcoded fallbacks.
++        String pattern = null;
++        Locale loc = null;
++        TimeZone tz = null;
++        
++        // Flags to determine if a SimpleDateFormat is explicitly requested
++        boolean explicitFormatRequestsSimpleDateFormat = false;
++
++        if (format != null) {
++            // Extract properties from @JsonFormat
++            if (format.hasPattern()) {
++                pattern = format.getPattern();
++            }
++            if (format.hasLocale()) {
++                loc = format.getLocale();
++            }
++            if (format.hasTimeZone()) {
++                tz = format.getTimeZone();
++            }
++            // If @JsonFormat specifies STRING shape, it implicitly means a date format string
++            if (format.getShape() == JsonFormat.Shape.STRING) {
++                explicitFormatRequestsSimpleDateFormat = true;
++                // If shape is STRING but no pattern specified, use ISO8601 default
++                if (pattern == null) {
++                    pattern = StdDateFormat.DATE_FORMAT_STR_ISO8601;
++                }
++            } else if (pattern != null || loc != null || tz != null) {
++                // Any specific pattern, locale, or timezone implies a SimpleDateFormat
++                explicitFormatRequestsSimpleDateFormat = true;
++            }
++        }
++
++        // Get default format related settings from the serializer provider (ObjectMapper's configuration)
++        Locale defaultLocale = serializers.getLocale();
++        TimeZone defaultTimeZone = serializers.getTimeZone();
++        DateFormat defaultDateFormat = serializers.getDateFormat();
++
++        // Case A: Explicit @JsonFormat annotation provided enough details to build a SimpleDateFormat
++        if (explicitFormatRequestsSimpleDateFormat) {
++            // Ensure all required components are available, falling back to defaults
++            if (pattern == null) {
++                // This case should ideally not be hit if `explicitFormatRequestsSimpleDateFormat` is true
++                // and pattern was derived from `format.getShape() == JsonFormat.Shape.STRING`
++                // But for safety, if pattern is still null, try from default DateFormat or fallback
++                if (defaultDateFormat instanceof SimpleDateFormat) {
++                    pattern = ((SimpleDateFormat) defaultDateFormat).toPattern();
++                } else {
++                    pattern = StdDateFormat.DATE_FORMAT_STR_ISO8601;
++                }
++            }
++            if (loc == null) {
++                loc = defaultLocale;
++            }
+             if (tz == null) {
+-                        tz = serializers.getTimeZone();
++                tz = defaultTimeZone;
+             }
++            
++            SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
++            if (tz != null) {
+                 df.setTimeZone(tz);
++            }
+             return withFormat(Boolean.FALSE, df);
+         }
+ 
+-        // Otherwise, need one of these changes:
++        // Case B: No explicit @JsonFormat details, but ObjectMapper has a custom SimpleDateFormat set
++        // (This is crucial for [databind#1648] and testFormatWithoutPattern)
++        if (defaultDateFormat instanceof SimpleDateFormat) {
++            SimpleDateFormat sdf = (SimpleDateFormat) defaultDateFormat;
+             
++            // Reconstruct SimpleDateFormat using its original pattern, and contextual locale/timezone.
++            // This ensures thread-safety and applies contextual overrides.
++            String actualPattern = sdf.toPattern();
++            Locale actualLocale = defaultLocale; // Use contextual locale
++            TimeZone actualTimeZone = defaultTimeZone; // Use contextual timezone from serializers
+ 
+-        // Jackson's own `StdDateFormat` is quite easy to deal with...
++            SimpleDateFormat newSdf = new SimpleDateFormat(actualPattern, actualLocale);
+             
+-        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+-        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+-        //    So: require it be `SimpleDateFormat`; can't config other types
+-//            serializers.reportBadDefinition(handledType(), String.format(
+-            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
++            // Set timezone explicitly if one was determined (contextual or from sdf itself)
++            if (actualTimeZone != null) {
++                newSdf.setTimeZone(actualTimeZone);
++            } else {
++                // If no contextual timezone, use the one from the default SimpleDateFormat itself
++                // (it might have been set explicitly when ObjectMapper's DateFormat was created)
++                newSdf.setTimeZone(sdf.getTimeZone());
++            }
++            return withFormat(Boolean.FALSE, newSdf);
++        }
++
++        // Case C: Fallback to default serialization
++        // This happens if:
++        // - `format` was null, and `defaultDateFormat` is not a `SimpleDateFormat` (e.g., `StdDateFormat`).
++        // - `format` was present but did not specify numeric, or sufficient string-based details.
++        // In this case, `this` serializer (often using `StdDateFormat` internally) is appropriate.
+         return this;
+     }
+\ No newline at end of file

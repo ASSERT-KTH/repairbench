@@ -1,0 +1,90 @@
+diff --git a/tmp/b7d3f44e-e8aa-429e-937c-7662d52ffa68_buggy.java b/tmp/56e777f4-236d-475f-93b5-6d2794065baf_fixed.java
+index 1b07d98..6da296b 100644
+--- a/tmp/b7d3f44e-e8aa-429e-937c-7662d52ffa68_buggy.java
++++ b/tmp/56e777f4-236d-475f-93b5-6d2794065baf_fixed.java
+@@ -1,76 +1,15 @@
+-    @Override
+-    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+-            BeanProperty property) throws JsonMappingException
+-    {
+-        // Note! Should not skip if `property` null since that'd skip check
+-        // for config overrides, in case of root value
+-        if (property == null) {
+-            return this;
+-        }
+-        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+-        if (format == null) {
+-            return this;
+-        }
+-        // Simple case first: serialize as numeric timestamp?
+             JsonFormat.Shape shape = format.getShape();
+-        if (shape.isNumeric()) {
++            if (shape.isNumeric()) { // (A) This check comes first
+                 return withFormat(Boolean.TRUE, null);
+             }
+-
+-        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+-        // First: custom pattern will override things
+-        if (format.hasPattern()) {
+-            final Locale loc = format.hasLocale()
+-                            ? format.getLocale()
+-                            : serializers.getLocale();
+-            SimpleDateFormat df = new SimpleDateFormat(format.getPattern(), loc);
+-            TimeZone tz = format.hasTimeZone() ? format.getTimeZone()
+-                    : serializers.getTimeZone();
+-            df.setTimeZone(tz);
+-            return withFormat(Boolean.FALSE, df);
++            // ...
++            if (format.hasPattern()) { // (B) This check comes second
++                // ... create SimpleDateFormat and return withFormat(Boolean.FALSE, df);
+             }
++    ```
++    If `JsonFormat.Value` from `configOverride` has `_shape = ANY` (because `forPattern` doesn't set it to `STRING`) but implicitly resolves to `NUMBER` due to internal merging with `java.sql.Date`'s default numeric behavior, then `shape.isNumeric()` (A) evaluates to `true`. This leads to the serializer being configured to output a numeric timestamp (`Boolean.TRUE`). The subsequent check `format.hasPattern()` (B), which would correctly set up a string format, is never reached.
+ 
+-        // Otherwise, need one of these changes:
+-        final boolean hasLocale = format.hasLocale();
+-        final boolean hasTZ = format.hasTimeZone();
+-        final boolean asString = (shape == JsonFormat.Shape.STRING);
+-
+-        if (!hasLocale && !hasTZ && !asString) {
+-            return this;
+-        }
++**The Fix:**
++The fix involves reordering the checks within `createContextual` to prioritize an explicit pattern. If a pattern is present, it's a strong indicator that the user wants a string representation, regardless of any default numeric shape. By checking `format.hasPattern()` *before* `shape.isNumeric()`, we ensure that the pattern-based string serialization logic is applied when a pattern is specified.
+ 
+-        DateFormat df0 = serializers.getConfig().getDateFormat();
+-        // Jackson's own `StdDateFormat` is quite easy to deal with...
+-        if (df0 instanceof StdDateFormat) {
+-            StdDateFormat std = (StdDateFormat) df0;
+-            if (format.hasLocale()) {
+-                std = std.withLocale(format.getLocale());
+-            }
+-            if (format.hasTimeZone()) {
+-                std = std.withTimeZone(format.getTimeZone());
+-            }
+-            return withFormat(Boolean.FALSE, std);
+-        }
+-
+-        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+-        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+-        //    So: require it be `SimpleDateFormat`; can't config other types
+-        if (!(df0 instanceof SimpleDateFormat)) {
+-            serializers.reportBadDefinition(handledType(), String.format(
+-"Configured `DateFormat` (%s) not a `SimpleDateFormat`; cannot configure `Locale` or `TimeZone`",
+-df0.getClass().getName()));
+-        }
+-        SimpleDateFormat df = (SimpleDateFormat) df0;
+-        if (hasLocale) {
+-            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+-            df = new SimpleDateFormat(df.toPattern(), format.getLocale());
+-        } else {
+-            df = (SimpleDateFormat) df.clone();
+-        }
+-        TimeZone newTz = format.getTimeZone();
+-        boolean changeTZ = (newTz != null) && !newTz.equals(df.getTimeZone());
+-        if (changeTZ) {
+-            df.setTimeZone(newTz);
+-        }
+-        return withFormat(Boolean.FALSE, df);
+-    }
++This ensures that if a format override provides a pattern, it correctly takes precedence, and the date is serialized as a formatted string rather than a timestamp.

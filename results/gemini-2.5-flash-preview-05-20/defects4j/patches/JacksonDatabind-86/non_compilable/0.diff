@@ -1,0 +1,140 @@
+diff --git a/tmp/7aa1420c-68c9-45f2-b18e-7bc9cc3c2ebe_buggy.java b/tmp/cb0cca2f-2a1c-447c-aebc-e993501724cc_fixed.java
+index e69de29..1ec1b84 100644
+--- a/tmp/7aa1420c-68c9-45f2-b18e-7bc9cc3c2ebe_buggy.java
++++ b/tmp/cb0cca2f-2a1c-447c-aebc-e993501724cc_fixed.java
+@@ -0,0 +1,134 @@
++package com.fasterxml.jackson.databind.type;
++
++import com.fasterxml.jackson.databind.JavaType;
++
++import java.lang.reflect.Modifier;
++import java.lang.reflect.ParameterizedType;
++import java.lang.reflect.Type;
++import java.lang.reflect.TypeVariable;
++import java.lang.reflect.WildcardType;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++// Note: This is only the _fromClass method.
++// It assumes the surrounding TypeFactory class and its helper methods/fields
++// (like _knownClass, _constructType, _fromAny, _typeCache, TypeBindings, ClassKey, ResolvedRecursiveType, etc.)
++// are correctly defined elsewhere in the TypeFactory class.
++
++// The issue "databind#1647" specifically relates to ensuring ResolvedRecursiveType's
++// _referencedType is properly set and propagated through the cache.
++public class TypeFactory {
++
++    // ... (existing fields and other methods of TypeFactory) ...
++
++    /**
++     * Helper method used to construct {@link JavaType} for a Class.
++     * Needs to be able to handle recursive types correctly.
++     *
++     * @param context Stack used for cycle detection (can be null for initial call)
++     * @param rawType The raw class to construct type for
++     * @param bindings Type bindings for this class (e.g., from generic supertypes)
++     * @return Constructed {@link JavaType}
++     */
++    protected JavaType _fromClass(ClassStack context, Class<?> rawType, TypeBindings bindings)
++    {
++        // 1. Check for basic/canonical types first (optimization)
++        JavaType result = _knownClass(rawType);
++        if (result != null) {
++            return result;
++        }
++
++        // 2. Check cache
++        ClassKey key = new ClassKey(rawType);
++        result = _typeCache.get(key);
++        
++        // Fix for [databind#1647]: If we find a `ResolvedRecursiveType` in the cache,
++        // we must ensure that if it's already fully resolved, we return its `_referencedType`.
++        // If it's a placeholder (`_referencedType` is null), we proceed to finish its resolution.
++        if (result != null) {
++            if (result instanceof ResolvedRecursiveType) {
++                JavaType actual = ((ResolvedRecursiveType) result).getReferencedType();
++                if (actual != null) {
++                    // It's already fully resolved, return the actual type.
++                    return actual;
++                }
++                // Else: `actual` is null. This means the `ResolvedRecursiveType` is a
++                // placeholder that is currently being built (by an earlier call
++                // in the current stack, or a concurrent thread).
++                // We should not return the incomplete placeholder; instead,
++                // we'll proceed to finish the resolution.
++            } else {
++                // Not a recursive type, just a fully resolved type from cache.
++                return result;
++            }
++        }
++
++        // 3. Not in cache (or an unresolved ResolvedRecursiveType placeholder): start new resolution.
++        // Create a placeholder `ResolvedRecursiveType` and put it into the cache immediately.
++        // This prevents infinite recursion for truly recursive types and acts as a marker.
++        ResolvedRecursiveType refType = new ResolvedRecursiveType(rawType, bindings);
++        _typeCache.put(key, refType);
++
++        JavaType actualType = null;
++        try {
++            // Push current type onto stack for cycle detection (if `context` is used for this)
++            // ClassStack newContext = (context == null) ? new ClassStack(rawType) : context.child(rawType);
++
++            // Step A: Resolve superclass
++            JavaType superClass = null;
++            Class<?> superclass = rawType.getSuperclass();
++            if (superclass != null) {
++                // Recursively call _fromClass for superclass.
++                // Bindings are adjusted for the supertype context.
++                superClass = _fromClass(null /* or newContext */, superclass, bindings.forSupertype(rawType));
++            }
++
++            // Step B: Resolve interfaces
++            JavaType[] superInterfaces = NO_TYPES; // Assuming NO_TYPES is a predefined empty array
++            Type[] ifaces = rawType.getGenericInterfaces();
++            if (ifaces != null && ifaces.length > 0) {
++                superInterfaces = new JavaType[ifaces.length];
++                for (int i = 0; i < ifaces.length; ++i) {
++                    superInterfaces[i] = _fromAny(null /* or newContext */, ifaces[i], bindings.forSupertype(rawType));
++                }
++            }
++
++            // Step C: Construct the "real" JavaType based on resolved components
++            // _constructType method is responsible for creating concrete JavaType instances
++            // (e.g., SimpleType, CollectionType, MapType, etc.).
++            actualType = _constructType(rawType, bindings, superClass, superInterfaces);
++
++            // 4. Critical fix for [databind#1647]:
++            // The `ResolvedRecursiveType` placeholder that we put in the cache needs to
++            // be updated to reference the fully constructed `actualType`.
++            refType.setReference(actualType);
++
++            // 5. Update the cache with the fully resolved `actualType`, replacing the placeholder.
++            // This ensures subsequent direct lookups for `rawType` get the complete type,
++            // not the `ResolvedRecursiveType` wrapper.
++            // This atomic replacement helps with concurrent access.
++            _typeCache.put(key, actualType);
++
++            return actualType;
++        } finally {
++            // Clean up: if an exception occurred during construction (actualType is null),
++            // remove the placeholder to avoid leaving an incomplete type in the cache.
++            // Use remove(key, value) for atomic removal if supported by ConcurrentHashMap
++            // to prevent removing a type that was concurrently replaced by another thread.
++            if (actualType == null) {
++                _typeCache.remove(key, refType); 
++            }
++            // Pop current type from stack (if `context` is used)
++            // if (newContext != null) newContext.pop();
++        }
++    }
++
++    // ... (other methods of TypeFactory, including the dummy ones provided in thought process,
++    //      or actual Jackson TypeFactory implementation) ...
++}
+\ No newline at end of file

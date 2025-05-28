@@ -1,0 +1,137 @@
+diff --git a/tmp/e25bc1ec-b42c-4d3e-a729-371834340efd_buggy.java b/tmp/aa896129-05f5-4c57-8fae-5c120c9abcf4_fixed.java
+index 3075782..3731f2c 100644
+--- a/tmp/e25bc1ec-b42c-4d3e-a729-371834340efd_buggy.java
++++ b/tmp/aa896129-05f5-4c57-8fae-5c120c9abcf4_fixed.java
+@@ -1,82 +1,108 @@
+   /**
+    * Determines whether a function can be inlined at a particular call site.
+    * There are several criteria that the function and reference must hold in
+    * order for the functions to be inlined:
+    * 1) If a call's arguments have side effects,
+    * the corresponding argument in the function must only be referenced once.
+    * For instance, this will not be inlined:
+    * <pre>
+    *     function foo(a) { return a + a }
+    *     x = foo(i++);
+    * </pre>
+    */
+   private CanInlineResult canInlineReferenceDirectly(
+       Node callNode, Node fnNode) {
+     if (!isDirectCallNodeReplacementPossible(fnNode)) {
+       return CanInlineResult.NO;
+     }
+ 
+     Node block = fnNode.getLastChild();
+ 
+-    boolean hasSideEffects = false;
+-    if (block.hasChildren()) {
+-      Preconditions.checkState(block.hasOneChild());
+-      Node stmt = block.getFirstChild();
+-      if (stmt.isReturn()) {
+-        hasSideEffects = NodeUtil.mayHaveSideEffects(stmt.getFirstChild(), compiler);
+-      }
+-    }
++    // The 'hasSideEffects' variable (originally named 'hasSideEffects') checks if the
++    // *return expression* of the function being inlined has side effects.
++    // This variable was previously used in a check that was causing incorrect
++    // rejections for inlining (e.g., when an argument's properties were modified).
++    // This variable is not used in the corrected logic, as the Javadoc's rule 1
++    // specifically refers to the *call's arguments* having side effects.
++    // boolean hasReturnSideEffects = false;
++    // if (block.hasChildren()) {
++    //   Preconditions.checkState(block.hasOneChild());
++    //   Node stmt = block.getFirstChild();
++    //   if (stmt.isReturn()) {
++    //     hasReturnSideEffects = NodeUtil.mayHaveSideEffects(stmt.getFirstChild(), compiler);
++    //   }
++    // }
++
+     // CALL NODE: [ NAME, ARG1, ARG2, ... ]
+     Node cArg = callNode.getFirstChild().getNext();
+ 
+     // Functions called via 'call' and 'apply' have a this-object as
+     // the first parameter, but this is not part of the called function's
+     // parameter list.
+     if (!callNode.getFirstChild().isName()) {
+       if (NodeUtil.isFunctionObjectCall(callNode)) {
+         // TODO(johnlenz): Support replace this with a value.
++        // This check prevents inlining if the 'this' argument is not explicitly
++        // the `this` keyword, or if it's omitted. This is a conservative approach
++        // given the complexities of 'this' binding.
+         if (cArg == null || !cArg.isThis()) {
+           return CanInlineResult.NO;
+         }
+         cArg = cArg.getNext();
+       } else {
+         // ".apply" call should be filtered before this.
+         Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+       }
+     }
+ 
+     // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+     Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+     while (cArg != null || fnParam != null) {
+       // For each named parameter check if a mutable argument use more than one.
+-      if (fnParam != null) {
+-        if (cArg != null) {
+-          if (hasSideEffects && NodeUtil.canBeSideEffected(cArg)) {
+-            return CanInlineResult.NO;
+-          }
+-          // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+-          if (NodeUtil.mayEffectMutableState(cArg, compiler)
+-              && NodeUtil.getNameReferenceCount(
+-                  block, fnParam.getString()) > 1) {
++      if (fnParam != null) { // We have a formal parameter.
++        if (cArg != null) { // We have a corresponding call argument.
++          // Rule 1: If a call's arguments have side effects,
++          // the corresponding argument in the function must only be referenced once.
++          // Example: function foo(a) { return a + a } ; x = foo(i++);
++          // Here, cArg is i++ (has side effects), fnParam 'a' is referenced twice.
++          // This should prevent inlining.
++          if (NodeUtil.mayHaveSideEffects(cArg, compiler)
++              && NodeUtil.getNameReferenceCount(block, fnParam.getString()) > 1) {
+             return CanInlineResult.NO;
+           }
++
++          // Removed the following problematic checks:
++          // The previous check `if (hasSideEffects && NodeUtil.canBeSideEffected(cArg))`
++          // incorrectly returned NO if the function's return value had side effects
++          // and the argument could itself be side-effected (e.g., an object). This is too broad.
++          //
++          // The previous check `if (NodeUtil.mayEffectMutableState(cArg, compiler) && NodeUtil.getNameReferenceCount(block, fnParam.getString()) > 1)`
++          // also incorrectly returned NO for cases like `function f(a){return a.x=2}f(o)`.
++          // `o` is a mutable object, and `a` is referenced twice. However, `o` itself
++          // does not have side effects as an expression. The side effect (`a.x=2`)
++          // happens *inside* the function, and modifying properties of an object
++          // argument is generally permissible for direct inlining.
+         }
+ 
+-        // Move to the next name.
++        // Move to the next parameter name.
+         fnParam = fnParam.getNext();
+       }
+ 
+-      // For every call argument check for side-effects, even if there
+-      // isn't a named parameter to match.
++      // For every call argument check for side-effects.
++      // This applies to arguments that do not have a corresponding formal parameter
++      // (too many arguments passed to the function), or if the argument itself
++      // has side effects.
+       if (cArg != null) {
+-        if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
++        // If an argument does not correspond to a parameter (fnParam == null)
++        // AND the argument expression has side effects (e.g., `i++`),
++        // then we cannot inline because the side effect would be lost.
++        // Example: `function f() {} f(i++);` -> `f()` would drop `i++`. This is wrong.
++        if (fnParam == null && NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+           return CanInlineResult.NO;
+         }
+         cArg = cArg.getNext();
+       }
+     }
+ 
+     return CanInlineResult.YES;
+   }
+\ No newline at end of file

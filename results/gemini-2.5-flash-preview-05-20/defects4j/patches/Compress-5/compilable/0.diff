@@ -1,0 +1,151 @@
+diff --git a/tmp/e1506a23-2b9e-4c72-9f68-be2d60887e5f_buggy.java b/tmp/668e7a97-4a2d-4630-be39-ffc7991f0ffb_fixed.java
+index d907b39..4969c17 100644
+--- a/tmp/e1506a23-2b9e-4c72-9f68-be2d60887e5f_buggy.java
++++ b/tmp/668e7a97-4a2d-4630-be39-ffc7991f0ffb_fixed.java
+@@ -1,56 +1,128 @@
+     public int read(byte[] buffer, int start, int length) throws IOException {
+         if (closed) {
+             throw new IOException("The stream is closed");
+         }
++        // This check ensures that if the inflater has finished or there is no current entry,
++        // we signal EOF for the stream. It should be before any checks related to current entry's size.
+         if (inf.finished() || current == null) {
+             return -1;
+         }
+ 
+         // avoid int overflow, check null buffer
+         if (start <= buffer.length && length >= 0 && start >= 0
+             && buffer.length - start >= length) {
+             if (current.getMethod() == ZipArchiveOutputStream.STORED) {
+-                int csize = (int) current.getSize();
++                int csize = (int) current.getSize(); // Stored size is the uncompressed size
+                 if (readBytesOfEntry >= csize) {
+-                    return -1;
++                    return -1; // All data for this entry has been read
+                 }
++                // If we need to read from the underlying stream (current internal buffer exhausted or not yet filled)
+                 if (offsetInBuffer >= lengthOfLastRead) {
+-                    offsetInBuffer = 0;
+-                    if ((lengthOfLastRead = in.read(buf)) == -1) {
++                    offsetInBuffer = 0; // Reset internal buffer offset
++                    lengthOfLastRead = in.read(buf); // Try to read more data from underlying stream
++                    if (lengthOfLastRead == -1) {
++                        // Underlying stream has ended prematurely.
++                        // If we haven't read all expected bytes for this entry, it's a truncation.
++                        if (readBytesOfEntry < csize) {
++                            throw new IOException("Truncated ZIP file");
++                        }
++                        // Otherwise, all expected bytes were read or stream ended after them.
+                         return -1;
+                     }
+-                    count(lengthOfLastRead);
+-                    bytesReadFromStream += lengthOfLastRead;
++                    if (lengthOfLastRead == 0) {
++                        // Underlying stream returned 0 bytes, but not EOF.
++                        // If we still expect more bytes for this entry, it implies the stream is stuck or truncated.
++                        if (readBytesOfEntry < csize) {
++                            throw new IOException("Truncated ZIP file");
+                         }
+-                int toRead = length > lengthOfLastRead
+-                    ? lengthOfLastRead - offsetInBuffer
+-                    : length;
+-                if ((csize - readBytesOfEntry) < toRead) {
+-                    toRead = csize - readBytesOfEntry;
++                        // If readBytesOfEntry >= csize, it means we have finished reading the entry,
++                        // and returning 0 (or -1 eventually) is appropriate.
++                        // This case should ideally be caught by `readBytesOfEntry >= csize` earlier,
++                        // but if it somehow reached here, it's effectively end of entry.
++                        return 0; // Cannot read more bytes currently, return 0.
+                     }
++                    count(lengthOfLastRead); // Update CRC for the raw bytes read
++                    bytesReadFromStream += lengthOfLastRead; // Track total bytes read from underlying stream
++                }
++
++                // Determine how much to read into the user's buffer
++                int toRead = Math.min(length, lengthOfLastRead - offsetInBuffer);
++                // Also ensure we don't read more than the remaining size of the entry
++                toRead = Math.min(toRead, csize - readBytesOfEntry);
++
++                if (toRead <= 0) {
++                    // This can happen if the requested 'length' is 0, in which case return 0.
++                    // Or if readBytesOfEntry >= csize (already handled at the top of the block).
++                    // Or if lengthOfLastRead - offsetInBuffer is 0, which means the internal buffer is
++                    // exhausted and the next read will attempt to fill it again.
++                    // In these cases, returning 0 is usually correct.
++                    return toRead; // Returns 0 if no bytes can be read.
++                }
++
+                 System.arraycopy(buf, offsetInBuffer, buffer, start, toRead);
+                 offsetInBuffer += toRead;
+-                readBytesOfEntry += toRead;
+-                crc.update(buffer, start, toRead);
++                readBytesOfEntry += toRead; // Update total bytes read for this stored entry
++                crc.update(buffer, start, toRead); // Update CRC for the data copied to user buffer
+                 return toRead;
+             }
++
++            // For DEFLATED (and other compressed) entries
++            // Fill the inflater's input buffer if it needs more data
+             if (inf.needsInput()) {
+                 fill();
+-                if (lengthOfLastRead > 0) {
+-                    bytesReadFromStream += lengthOfLastRead;
+-                }
+             }
++
+             int read = 0;
+             try {
+                 read = inf.inflate(buffer, start, length);
+             } catch (DataFormatException e) {
+                 throw new ZipException(e.getMessage());
+             }
+-            if (read == 0 && inf.finished()) {
++
++            // Crucially, update readBytesOfEntry for DEFLATED entries as well.
++            // This tracks the *uncompressed* bytes read, which is what inflate returns.
++            readBytesOfEntry += read;
++
++            long uncompressedSize = current.getSize(); // Expected uncompressed size of the entry
++
++            if (read == 0) { // No bytes were inflated in this call
++                if (inf.finished()) {
++                    // Inflater claims it has finished processing the compressed stream.
++                    // If the total uncompressed bytes inflated (`readBytesOfEntry`) is less
++                    // than the expected uncompressed size (`uncompressedSize`), it's a truncation.
++                    if (readBytesOfEntry < uncompressedSize) {
++                        throw new IOException("Truncated ZIP file");
++                    }
++                    // Otherwise, it's a legitimate end of entry, return -1.
++                    return -1;
++                } else if (inf.needsInput()) {
++                    // Inflater needs more input but returned 0 bytes.
++                    // This scenario suggests `fill()` either couldn't provide more input
++                    // (e.g., underlying stream EOF or returned 0 bytes) or the compressed
++                    // data for the current entry is exhausted.
++                    // If we haven't reached the expected uncompressed size, it's a truncation.
++                    if (readBytesOfEntry < uncompressedSize) {
++                        throw new IOException("Truncated ZIP file");
++                    }
++                    // If readBytesOfEntry >= uncompressedSize, we've read all expected data.
++                    // Even if inf.finished() is false, effectively the entry is done.
+                     return -1;
++                } else {
++                    // `read == 0`, `!inf.finished()`, `!inf.needsInput()`
++                    // This state means the inflator is stuck: it can't produce more output,
++                    // but it also doesn't need input and isn't finished. This is an error state.
++                    // If we haven't read all expected uncompressed bytes, it's a truncation.
++                    if (readBytesOfEntry < uncompressedSize) {
++                        throw new IOException("Truncated ZIP file");
++                    }
++                    // If readBytesOfEntry >= uncompressedSize, then it's a normal end.
++                    return -1;
++                }
+             }
++
++            // Normal successful read: update CRC and return bytes read
+             crc.update(buffer, start, read);
+             return read;
+         }
+         throw new ArrayIndexOutOfBoundsException();
+     }
+\ No newline at end of file

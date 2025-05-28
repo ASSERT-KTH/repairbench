@@ -1,0 +1,142 @@
+diff --git a/tmp/be3bbbff-1c5d-4266-83a1-b92ea4cd7187_buggy.java b/tmp/8c7349d6-a991-46fd-bbd6-b546b81cbe90_fixed.java
+index 4b7e1e4..6c63699 100644
+--- a/tmp/be3bbbff-1c5d-4266-83a1-b92ea4cd7187_buggy.java
++++ b/tmp/8c7349d6-a991-46fd-bbd6-b546b81cbe90_fixed.java
+@@ -1,52 +1,118 @@
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.HashMap;
++import java.util.Map;
++
++// Assuming CharsetNames and IOUtils are available from the Apache Commons Compress context
++// For a standalone snippet, these would typically be imported or mocked.
++// e.g., import org.apache.commons.compress.utils.CharsetNames;
++// e.g., import org.apache.commons.compress.utils.IOUtils;
++
++public class TarArchiveInputStream { // Assuming this class context for globalPaxHeaders
++    private final Map<String, String> globalPaxHeaders = new HashMap<>(); // Placeholder for compilation
++
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+         final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+         // Format is "length keyword=value\n";
+-        while(true){ // get length
++        while(true){ // loop to process multiple header entries
+             int ch;
+             int len = 0;
+-            int read = 0;
++            int read = 0; // bytes read for the current pax header line
++            boolean digitFound = false;
++
++            // First, parse the length field (e.g., "123 ")
++            // This loop reads digits until a space or a newline is found.
++            // It expects a space to follow the digits for a valid header.
++            // A newline after digits is a malformed header.
++            // A newline without digits is a blank line (skipped).
+             while((ch = i.read()) != -1) {
+                 read++;
+-                if (ch == ' '){
+-                    // Get keyword
++                if (ch >= '0' && ch <= '9') {
++                    len = len * 10 + (ch - '0');
++                    digitFound = true;
++                } else if (ch == ' ') { // End of length field, and space found
++                    if (!digitFound) { // e.g., " keyword=value"
++                        throw new IOException("Invalid Paxheader. Length field is empty.");
++                    }
++                    break; // Length and space consumed, proceed to keyword
++                } else if (ch == '\n') { // Encountered newline (e.g., "123\n" or just "\n")
++                    if (read == 1 && len == 0 && !digitFound) { // Case: Empty line "\n"
++                        // This means an empty pax header line. The problem statement says "survives blank lines".
++                        // So, we just skip this line.
++                        ch = '\n'; // Set ch to indicate it was a newline, for the outer loop's check.
++                        break; // Break from this inner loop to outer loop's checks
++                    } else { // Malformed: e.g. "123\n" (missing space), or "abc\n" (non-digit leading char)
++                        throw new IOException("Invalid Paxheader. Unexpected newline or malformed length field.");
++                    }
++                } else { // Unexpected character (e.g., non-digit, non-space, not newline)
++                    throw new IOException("Invalid Paxheader. Expected digit or space but got '" + (char)ch + "' (ascii:" + ch + ").");
++                }
++            }
++
++            if (ch == -1) { // EOF encountered while parsing length or space
++                break; // Exit outer while(true) loop
++            }
++            if (ch == '\n') { // If we broke from length parsing due to a blank line
++                continue; // Skip this iteration and try to read the next header
++            }
++
++            // At this point, `len` is the total length of the line, and `read` is the bytes consumed for "length_string ".
++            // Next: parse keyword and value.
+             final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+             while((ch = i.read()) != -1) {
+-                        read++;
++                read++; // Accumulate bytes read for keyword and '='
+                 if (ch == '='){ // end of keyword
+                     final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
++
++                    // Get rest of entry (value + NL)
++                    // `len` is total length of "length keyword=value\n"
++                    // `read` is total bytes consumed *up to and including* the '='.
++                    final int restLen = len - read; // Expected remaining length (value + NL)
++
++                    if (restLen < 0) {
++                        throw new IOException("Invalid Paxheader. Header processing exceeded declared length of " + len + " bytes. Read " + read + " bytes.");
++                    }
++                    // The spec says "value and a new-line character". So `restLen` must be at least 1 (for `\n`).
++                    if (restLen == 0) { // This means "length keyword=" and no newline. Malformed.
++                        throw new IOException("Invalid Paxheader. Value or newline is missing after keyword.");
++                    }
++                    
++                    if (restLen == 1) { // Value is empty, only NL
+                         headers.remove(keyword);
+-                            } else {
++                        // Consume the remaining 1 byte (the newline).
++                        int nextCh = i.read();
++                        if (nextCh == -1 || nextCh != '\n') { // Expecting newline
++                            throw new IOException("Invalid Paxheader. Expected newline after empty value but got EOF or other character.");
++                        }
++                    } else { // Value present (restLen > 1)
+                         final byte[] rest = new byte[restLen];
+                         final int got = IOUtils.readFully(i, rest);
+                         if (got != restLen) {
+                             throw new IOException("Failed to read "
+                                                   + "Paxheader. Expected "
+                                                   + restLen
+                                                   + " bytes, read "
+                                                   + got);
+                         }
+-                                // Drop trailing NL
++                        // Drop trailing NL from the value string
+                         final String value = new String(rest, 0,
+                                                   restLen - 1, CharsetNames.UTF_8);
+                         headers.put(keyword, value);
+                     }
+-                            break;
++                    break; // Processed single header, break from inner (keyword) loop
++                } else if (ch == '\n') { // Unexpected newline during keyword parsing
++                    throw new IOException("Invalid Paxheader. Unexpected newline during keyword parsing.");
+                 }
+                 coll.write((byte) ch);
+             }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
++
++            if (ch == -1){ // EOF encountered during keyword or '=' parsing
++                break; // Exit outer while(true) loop
+             }
+         }
+         return headers;
+     }
++}
+\ No newline at end of file

@@ -1,0 +1,133 @@
+diff --git a/tmp/bdee5115-ee5a-406f-bd34-eb93154e30f6_buggy.java b/tmp/35226a57-171c-4078-abee-9b2cdf2c4b9e_fixed.java
+index 233a867..9133e3f 100644
+--- a/tmp/bdee5115-ee5a-406f-bd34-eb93154e30f6_buggy.java
++++ b/tmp/35226a57-171c-4078-abee-9b2cdf2c4b9e_fixed.java
+@@ -1,73 +1,123 @@
+   /**
+    * Determines whether a function can be inlined at a particular call site.
+    * There are several criteria that the function and reference must hold in
+    * order for the functions to be inlined:
+    * 1) If a call's arguments have side effects,
+    * the corresponding argument in the function must only be referenced once.
+    * For instance, this will not be inlined:
+    * <pre>
+    *     function foo(a) { return a + a }
+    *     x = foo(i++);
+    * </pre>
+    */
+   private CanInlineResult canInlineReferenceDirectly(
+       Node callNode, Node fnNode) {
+     if (!isDirectCallNodeReplacementPossible(fnNode)) {
+       return CanInlineResult.NO;
+     }
+ 
+     Node block = fnNode.getLastChild();
+ 
++    // New check: if the function body has side effects that are NOT solely
++    // on its formal parameters or their properties, and the function has
++    // parameters, it cannot be inlined. This prevents unintended interactions
++    // with global state or other aliased values.
++    // This addresses failures like testIssue1101a and testIssue1101b.
++    if (NodeUtil.mayHaveSideEffects(block, compiler)
++        && NodeUtil.getFunctionParameters(fnNode).hasChildren()) {
++
++      Set<String> paramNames = new HashSet<>();
++      Node fnParamNode = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
++      while (fnParamNode != null) {
++        paramNames.add(fnParamNode.getString());
++        fnParamNode = fnParamNode.getNext();
++      }
++
++      // Check all side-effecting nodes in the function body.
++      for (Node node : block.getDescendantsIterable()) {
++        if (NodeUtil.mayHaveSideEffects(node, compiler)) {
++          boolean isSideEffectOnParameter = false;
++          // Check if the side effect is an assignment or increment/decrement
++          // targeting a formal parameter or a property/element of a formal parameter.
++          if (node.isAssign() || node.isInc() || node.isDec()) {
++            Node target = node.isAssign() ? node.getFirstChild() : node.getLastChild();
++            // Case 1: Direct assignment to a parameter (e.g., 'a = 1')
++            if (target.isName() && paramNames.contains(target.getString())) {
++              isSideEffectOnParameter = true;
++            } else if (NodeUtil.isGet(target)) { // Case 2: Assignment to a property/element of a parameter (e.g., 'a.x = 2', 'a[0] = 2')
++              Node owner = target.getFirstChild();
++              // Check if the owner of the property/element access is a parameter.
++              if (owner.isName() && paramNames.contains(owner.getString())) {
++                isSideEffectOnParameter = true;
++              }
++            }
++          }
++          // If the side effect is not a direct assignment/modification on a parameter
++          // or its property, then it's a problematic side effect (e.g., a call like modifiyX()
++          // or an assignment to a global variable like x.prop = 2 where x is not a parameter).
++          if (!isSideEffectOnParameter) {
++            return CanInlineResult.NO;
++          }
++        }
++      }
++    }
++
+ 
+     // CALL NODE: [ NAME, ARG1, ARG2, ... ]
+     Node cArg = callNode.getFirstChild().getNext();
+ 
+     // Functions called via 'call' and 'apply' have a this-object as
+     // the first parameter, but this is not part of the called function's
+     // parameter list.
+     if (!callNode.getFirstChild().isName()) {
+       if (NodeUtil.isFunctionObjectCall(callNode)) {
+         // TODO(johnlenz): Support replace this with a value.
+         if (cArg == null || !cArg.isThis()) {
+           return CanInlineResult.NO;
+         }
+         cArg = cArg.getNext();
+       } else {
+         // ".apply" call should be filtered before this.
+         Preconditions.checkState(!NodeUtil.isFunctionObjectApply(callNode));
+       }
+     }
+ 
+     // FUNCTION NODE -> LP NODE: [ ARG1, ARG2, ... ]
+     Node fnParam = NodeUtil.getFunctionParameters(fnNode).getFirstChild();
+     while (cArg != null || fnParam != null) {
+       // For each named parameter check if a mutable argument use more than one.
+       if (fnParam != null) {
+         if (cArg != null) {
+ 
+           // Check for arguments that are evaluated more than once.
+-          // Note: Unlike block inlining, there it is not possible that a
+-          // parameter reference will be in a loop.
+-          if (NodeUtil.mayEffectMutableState(cArg, compiler)
++          // Rule 1: If a call's arguments have side effects,
++          // the corresponding argument in the function must only be referenced once.
++          // Using NodeUtil.mayHaveSideEffects covers all types of side effects,
++          // aligning better with the JSDoc description.
++          if (NodeUtil.mayHaveSideEffects(cArg, compiler)
+               && NodeUtil.getNameReferenceCount(
+                   block, fnParam.getString()) > 1) {
+             return CanInlineResult.NO;
+           }
+         }
+ 
+         // Move to the next name.
+         fnParam = fnParam.getNext();
+       }
+ 
+       // For every call argument check for side-effects, even if there
+       // isn't a named parameter to match.
++      // If a call argument has side effects and there is no formal parameter
++      // to bind it to, inlining would eliminate the side effect.
++      // E.g., `function foo() {} foo(alert(1));` if inlined to just nothing,
++      // would lose the `alert(1)` side effect.
+       if (cArg != null) {
+-        if (NodeUtil.mayHaveSideEffects(cArg, compiler)) {
++        if (fnParam == null && NodeUtil.mayHaveSideEffects(cArg, compiler)) {
+           return CanInlineResult.NO;
+         }
+         cArg = cArg.getNext();
+       }
+     }
+ 
+     return CanInlineResult.YES;
+   }
+\ No newline at end of file

@@ -1,0 +1,178 @@
+diff --git a/tmp/ae2a86d2-b46e-4148-871f-e3bc944eb253_buggy.java b/tmp/5fd3b159-535d-42cb-97f4-f1903efd5845_fixed.java
+index 032fa8e..4cce604 100644
+--- a/tmp/ae2a86d2-b46e-4148-871f-e3bc944eb253_buggy.java
++++ b/tmp/5fd3b159-535d-42cb-97f4-f1903efd5845_fixed.java
+@@ -1,108 +1,135 @@
+     /** Evaluate the impact of the proposed step on the event handler.
+      * @param interpolator step interpolator for the proposed step
+      * @return true if the event handler triggers an event before
+      * the end of the proposed step (this implies the step should be
+      * rejected)
+      * @exception DerivativeException if the interpolator fails to
+      * compute the switching function somewhere within the step
+      * @exception EventException if the switching function
+      * cannot be evaluated
+      * @exception ConvergenceException if an event cannot be located
+      */
+     public boolean evaluateStep(final StepInterpolator interpolator)
+         throws DerivativeException, EventException, ConvergenceException {
+ 
+         try {
+ 
+             forward = interpolator.isForward();
+             final double t1 = interpolator.getCurrentTime();
++            // n is the number of substeps based on maxCheckInterval.
++            // The step [t0, t1] is divided into n substeps.
+             final int    n  = Math.max(1, (int) Math.ceil(Math.abs(t1 - t0) / maxCheckInterval));
+             final double h  = (t1 - t0) / n;
+ 
+-            double ta = t0;
+-            double ga = g0;
+-            double tb = t0 + (interpolator.isForward() ? convergence : -convergence);
++            // tSubStart and gSubStart represent the time and g-value at the beginning of the current substep.
++            // They are initialized with t0 and g0 (from the start of the overall step).
++            // They will be updated at the end of each iteration to become tSubEnd and gSubEnd.
++            double tSubStart = t0;
++            double gSubStart = g0;
++            boolean gSubStartPositive = (g0 >= 0);
++
++            // Handle the case where the starting point t0 is exactly an event point.
++            // If g0 is zero and it's either the first event ever, or the previously handled event,
++            // we should effectively start searching *after* this event point to find subsequent events.
++            if (g0 == 0 && (Double.isNaN(previousEventTime) || Math.abs(t0 - previousEventTime) <= convergence)) {
++                // Shift the effective start point of the first substep slightly past t0.
++                tSubStart += (interpolator.isForward() ? convergence : -convergence);
++                // Update interpolator's time and re-evaluate g at the new start point.
++                interpolator.setInterpolatedTime(tSubStart);
++                gSubStart = handler.g(tSubStart, interpolator.getInterpolatedState());
++                gSubStartPositive = (gSubStart >= 0);
++            }
++
++
+             for (int i = 0; i < n; ++i) {
+ 
+-                // evaluate handler value at the end of the substep
+-                tb += h;
+-                interpolator.setInterpolatedTime(tb);
+-                final double gb = handler.g(tb, interpolator.getInterpolatedState());
++                // Calculate the end time of the current substep.
++                // tSubEnd should be t0 + (i+1)*h. For the last substep, ensure it matches t1 precisely.
++                double tSubEnd = t0 + (i + 1) * h;
++                if (i == n - 1) {
++                    tSubEnd = t1; // Ensure the last substep ends exactly at t1 to avoid floating point issues.
++                }
+ 
+-                // check events occurrence
+-                if (g0Positive ^ (gb >= 0)) {
+-                    // there is a sign change: an event is expected during this step
++                interpolator.setInterpolatedTime(tSubEnd);
++                final double gSubEnd = handler.g(tSubEnd, interpolator.getInterpolatedState());
++                boolean gSubEndPositive = (gSubEnd >= 0);
+ 
+-                        // this is a corner case:
+-                        // - there was an event near ta,
+-                        // - there is another event between ta and tb
+-                        // - when ta was computed, convergence was reached on the "wrong side" of the interval
+-                        // this implies that the real sign of ga is the same as gb, so we need to slightly
+-                        // shift ta to make sure ga and gb get opposite signs and the solver won't complain
+-                        // about bracketing
+-                            // this should never happen
++                // Check for event occurrence within the current substep [tSubStart, tSubEnd].
++                // A sign change means an event might have occurred.
++                if (gSubStartPositive ^ gSubEndPositive) {
++                    // A sign change is detected, meaning an event is expected.
+ 
+-                    // variation direction, with respect to the integration direction
+-                    increasing = gb >= ga;
++                    // Determine the direction of variation of g(t) over this substep.
++                    increasing = gSubEnd >= gSubStart;
+ 
+                     final UnivariateRealFunction f = new UnivariateRealFunction() {
+                         public double value(final double t) throws FunctionEvaluationException {
+                             try {
+                                 interpolator.setInterpolatedTime(t);
+                                 return handler.g(t, interpolator.getInterpolatedState());
+                             } catch (DerivativeException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             } catch (EventException e) {
+                                 throw new FunctionEvaluationException(e, t);
+                             }
+                         }
+                     };
++
+                     final BrentSolver solver = new BrentSolver();
+                     solver.setAbsoluteAccuracy(convergence);
+                     solver.setMaximalIterationCount(maxIterationCount);
+-                    final double root = (ta <= tb) ? solver.solve(f, ta, tb) : solver.solve(f, tb, ta);
+-                    if ((Math.abs(root - ta) <= convergence) &&
++
++                    // Find the root using the Brent solver within the current substep [tSubStart, tSubEnd].
++                    // BrentSolver requires function values at endpoints to have strictly opposite signs.
++                    // The `if (gSubStartPositive ^ gSubEndPositive)` check already ensures they are "different".
++                    // However, if one is exactly zero, this is not strictly opposite, and BrentSolver might fail.
++                    // The initial adjustment of tSubStart (if g0 == 0) addresses the main problem case.
++                    final double root = (tSubStart <= tSubEnd) ? solver.solve(f, tSubStart, tSubEnd) : solver.solve(f, tSubEnd, tSubStart);
++
++                    // Check if the found root is either a past event already accounted for, or a new event.
++                    if ((Math.abs(root - tSubStart) <= convergence) &&
+                          (Math.abs(root - previousEventTime) <= convergence)) {
+-                        // we have either found nothing or found (again ?) a past event, we simply ignore it
+-                        ta = tb;
+-                        ga = gb;
++                        // We have either found nothing or found (again ?) a past event. We ignore it.
++                        // Advance to the end of this substep for the next iteration.
++                        tSubStart = tSubEnd;
++                        gSubStart = gSubEnd;
++                        gSubStartPositive = gSubEndPositive;
+                     } else if (Double.isNaN(previousEventTime) ||
+                                (Math.abs(previousEventTime - root) > convergence)) {
++                        // This is a new event or an event that has moved significantly.
+                         pendingEventTime = root;
+                         if (pendingEvent && (Math.abs(t1 - pendingEventTime) <= convergence)) {
+-                            // we were already waiting for this event which was
+-                            // found during a previous call for a step that was
+-                            // rejected, this step must now be accepted since it
+-                            // properly ends exactly at the event occurrence
++                            // We were already waiting for this event which was found during a previous
++                            // call for a step that was rejected. This step must now be accepted
++                            // since it properly ends exactly at the event occurrence.
+                             return false;
+                         }
+-                        // either we were not waiting for the event or it has
+-                        // moved in such a way the step cannot be accepted
++                        // Either we were not waiting for the event or it has moved, so the step must be rejected.
+                         pendingEvent = true;
+                         return true;
+                     }
+ 
+                 } else {
+-                    // no sign change: there is no event for now
+-                    ta = tb;
+-                    ga = gb;
++                    // No sign change within this substep: no event for now.
++                    // Advance to the end of this substep for the next iteration.
++                    tSubStart = tSubEnd;
++                    gSubStart = gSubEnd;
++                    gSubStartPositive = gSubEndPositive;
+                 }
+-
+             }
+ 
+-            // no event during the whole step
++            // No event found during the whole step.
+             pendingEvent     = false;
+             pendingEventTime = Double.NaN;
+             return false;
+ 
+         } catch (FunctionEvaluationException e) {
+             final Throwable cause = e.getCause();
+             if ((cause != null) && (cause instanceof DerivativeException)) {
+                 throw (DerivativeException) cause;
+             } else if ((cause != null) && (cause instanceof EventException)) {
+                 throw (EventException) cause;
+             }
+             throw new EventException(e);
+         }
+-
+     }
+\ No newline at end of file

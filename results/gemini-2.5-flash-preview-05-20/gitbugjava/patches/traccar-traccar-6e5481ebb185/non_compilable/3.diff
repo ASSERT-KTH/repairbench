@@ -1,0 +1,124 @@
+diff --git a/tmp/f44f6992-0ff2-4dcc-81d0-6f9869acb22c_buggy.java b/tmp/f1c58b03-c76a-46da-8dc3-fb7ec5e3cff9_fixed.java
+index ee599aa..494e607 100644
+--- a/tmp/f44f6992-0ff2-4dcc-81d0-6f9869acb22c_buggy.java
++++ b/tmp/f1c58b03-c76a-46da-8dc3-fb7ec5e3cff9_fixed.java
+@@ -1,50 +1,111 @@
++import org.traccar.helper.BitUtil;
++import org.traccar.model.CellTower;
++import org.traccar.model.Network;
++import org.traccar.model.Position;
++import io.netty.buffer.ByteBuf;
++
++// Assuming Gt06ProtocolDecoder constants are accessible or imported.
++// For the purpose of this self-contained function, they are qualified with Gt06ProtocolDecoder.
++// In a real scenario, these would likely be constants within the Gt06ProtocolDecoder class itself,
++// or imported if decodeLbs was in a separate helper class.
++import static org.traccar.protocol.Gt06ProtocolDecoder.MSG_GPS_LBS_6;
++import static org.traccar.protocol.Gt06ProtocolDecoder.MSG_GPS_LBS_7;
++import static org.traccar.protocol.Gt06ProtocolDecoder.MSG_LBS_ALARM;
++
++
++class Gt06ProtocolDecoder { // Class context for the function and constants
++    // These constants would typically be defined in the Gt06ProtocolDecoder class
++    // or imported if decodeLbs was a standalone helper.
++    // Added here for compilation context for the fix.
++    public static final int MSG_GPS_LBS_6 = 0x34;
++    public static final int MSG_GPS_LBS_7 = 0x35;
++    public static final int MSG_LBS_ALARM = 0xA0;
++    // Other MSG_GPS_LBS types might be present, but not directly used in 'type' checks here.
++
++
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+         int length = 0;
++        // Store the reader index before parsing any LBS fields (MCC, MNC, etc.)
++        // This index is either directly after the protocol type (if no length byte)
++        // or directly after the length byte (if hasLength is true).
++        int initialLbsReaderIndex = buf.readerIndex();
++
+         if (hasLength) {
+-            length = buf.readUnsignedByte();
+-            if (length == 0) {
++            length = buf.readUnsignedByte(); // Read the LBS block length byte
++            if (length == 0) { // If length is 0, indicates no LBS data or all zeroed data
++                // This specific block is often a quirk of the protocol for zero length LBS blocks.
++                // It means LBS fields are not present, or they are implicitly zeroed,
++                // and there might be some padding bytes that also need to be consumed.
+                 boolean zeroedData = true;
++                // Check if the next 9 to 45 bytes are all zeroes (a common pattern for zeroed out LBS blocks)
+                 for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
+                     if (buf.getByte(i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+                 if (zeroedData) {
++                    // Skip these zeroed bytes if they are found
+                     buf.skipBytes(Math.min(buf.readableBytes(), 45));
+                 }
+-                return false;
++                return false; // Return false as no valid LBS data is present
+             }
++            // If length is non-zero, update initialLbsReaderIndex to be right after the length byte,
++            // pointing to the actual start of MCC/MNC/LAC/CID data.
++            initialLbsReaderIndex = buf.readerIndex();
+         }
+ 
++        // Read MCC, MNC, LAC, CID fields
+         int mcc = buf.readUnsignedShort();
+         int mnc;
+         if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
+             mnc = buf.readUnsignedShort();
+         } else {
+             mnc = buf.readUnsignedByte();
+         }
+         int lac;
+         if (type == MSG_LBS_ALARM) {
+             lac = buf.readInt();
+         } else {
+             lac = buf.readUnsignedShort();
+         }
+         long cid;
+         if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
+             cid = buf.readLong();
+         } else if (type == MSG_GPS_LBS_6) {
+             cid = buf.readUnsignedInt();
+         } else {
+             cid = buf.readUnsignedMedium();
+         }
+ 
+-        position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
++        // Calculate the actual number of bytes consumed by reading MCC, MNC, LAC, CID fields.
++        // This is crucial for correctly skipping remaining bytes, as the length of these fields varies.
++        int bytesConsumedForLbsFields = buf.readerIndex() - initialLbsReaderIndex;
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
++        // Attempt to create a CellTower object.
++        // CellTower.from(0, 0, 0, 0) returns null, indicating invalid LBS data.
++        CellTower cellTower = CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid);
++
++        // Skip any remaining bytes in the LBS block based on the 'length' field.
++        // This must be done whether the CellTower data is valid or not, to ensure the buffer
++        // is consumed correctly and prevent issues with subsequent message parsing.
++        if (hasLength && length > bytesConsumedForLbsFields) {
++            // 'length' here represents the total length of the LBS block (from MCC to end of LBS data).
++            // We have already read 'bytesConsumedForLbsFields' of that block.
++            // So, skip the difference to consume the rest of the LBS block.
++            buf.skipBytes(length - bytesConsumedForLbsFields);
++        }
++
++        // If cellTower is null, it means the LBS data was invalid (e.g., all zeros or other invalid combinations).
++        // In this case, we should indicate failure by returning false.
++        if (cellTower == null) {
++            return false;
+         }
+ 
+-        return true;
++        // If a valid CellTower was created, set the network for the position.
++        position.setNetwork(new Network(cellTower));
++
++        return true; // LBS data successfully decoded and considered valid
++    }
+ }
+\ No newline at end of file

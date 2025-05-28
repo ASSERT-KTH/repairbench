@@ -1,0 +1,277 @@
+diff --git a/tmp/1c9a87fe-916a-4681-b886-abd220651d9d_buggy.java b/tmp/6eec9e97-78db-45da-ac84-9d4d3bf692f5_fixed.java
+index e69de29..79350b3 100644
+--- a/tmp/1c9a87fe-916a-4681-b886-abd220651d9d_buggy.java
++++ b/tmp/6eec9e97-78db-45da-ac84-9d4d3bf692f5_fixed.java
+@@ -0,0 +1,271 @@
++package com.fasterxml.jackson.databind.type;
++
++import com.fasterxml.jackson.databind.JavaType;
++import com.fasterxml.jackson.databind.util.ClassKey;
++import com.fasterxml.jackson.databind.util.LRUMap;
++
++import java.lang.reflect.Type;
++import java.util.Collection;
++import java.util.Map;
++
++/**
++ * Partial re-implementation of TypeFactory to demonstrate the fix.
++ * Assumes surrounding TypeFactory class, its fields, and helper methods
++ * like `TypeBindings.emptyBindings()`, `TypeBindings.findBoundType()`,
++ * `LRUMap`, `SimpleType.constructUnresolved()`, `ArrayType.construct()`,
++ * `CollectionType.construct()`, `MapType.construct()`,
++ * `JavaType.withSuperClass()`, `JavaType.withSuperInterfaces()` exist
++ * and behave as in the actual Jackson library.
++ */
++public class TypeFactory {
++
++    // These fields are typically part of the TypeFactory class
++    protected final LRUMap<ClassKey, JavaType> _typeCache;
++
++    // Dummy JavaType instances for well-known types (actual TypeFactory has these)
++    protected static final JavaType _unknownType = SimpleType.constructUnresolved(Object.class);
++    protected static final JavaType _stringType = SimpleType.constructUnresolved(String.class);
++    protected static final MapType MAP_TYPE_FOR_PROPERTIES = MapType.construct(String.class, TypeBindings.emptyBindings(), _stringType, _stringType);
++
++    // Dummy constructor (actual TypeFactory has more complex setup)
++    public TypeFactory() {
++        // Default LRUMap size (e.g., from Jackson's TypeFactory)
++        _typeCache = new LRUMap<>(16, 100);
++    }
++
++    /**
++     * The fixed version of the buggy function.
++     * This method is responsible for constructing and caching JavaType instances.
++     * The fix ensures that the `_superClass` and `_superInterfaces` of a
++     * `JavaType` are fully resolved and set before the type is permanently
++     * stored in the cache, especially important when dealing with inheritance.
++     */
++    protected JavaType _fromClass(Class<?> rawType, TypeBindings bindings) {
++        // 1. Check cache for already resolved type
++        ClassKey key = new ClassKey(rawType);
++        JavaType result = _typeCache.get(key);
++        if (result != null) {
++            return result;
++        }
++
++        // 2. Handle well-known special types first (optimization)
++        if (rawType == String.class) {
++            result = _stringType;
++        } else if (rawType == Object.class) {
++            result = _unknownType;
++        } else if (rawType == java.util.Properties.class) {
++            result = MAP_TYPE_FOR_PROPERTIES;
++        }
++
++        // If it's a well-known type, cache and return early
++        if (result != null) {
++            _typeCache.put(key, result);
++            return result;
++        }
++
++        // --- FIX STARTS HERE ---
++        // For other types, place a temporary placeholder in the cache.
++        // This is critical for preventing infinite recursion when handling
++        // self-referential or deeply nested generic types.
++        // It also ensures that if `_resolveSuperClass` or `_resolveSuperInterfaces`
++        // recursively calls `_fromClass` for `rawType` itself, it finds a placeholder
++        // instead of re-entering full construction.
++
++        // Create an initial placeholder type. Its superclass/interfaces might be `_unknownType` initially.
++        SimpleType placeholderType = SimpleType.constructUnresolved(rawType);
++        // Add it to the 'holding' state of the cache. This indicates construction is in progress.
++        // (Assuming LRUMap has a `addHolding` method as in Jackson's TypeFactory)
++        _typeCache.addHolding(key, placeholderType);
++
++        try {
++            JavaType actualType;
++            if (rawType.isArray()) {
++                JavaType componentType = _fromClass(rawType.getComponentType(), bindings);
++                actualType = ArrayType.construct(componentType, bindings);
++            } else if (Map.class.isAssignableFrom(rawType)) {
++                // Simplified MapType construction; actual Jackson handles generics properly
++                actualType = MapType.construct(rawType, bindings, _unknownType, _unknownType);
++            } else if (Collection.class.isAssignableFrom(rawType)) {
++                // Simplified CollectionType construction; actual Jackson handles generics properly
++                actualType = CollectionType.construct(rawType, bindings, _unknownType);
++            } else {
++                // For regular classes (like Base and Sub), which map to SimpleType
++                actualType = placeholderType; // Use the placeholder as the base to update
++
++                // Resolve super class and interfaces. This will recursively call _fromClass.
++                // When _resolveSuperClass resolves `Base.class`, it will get it from the cache
++                // because `tf.constructType(Base.class)` already put it there.
++                JavaType superClass = _resolveSuperClass(rawType, bindings);
++                JavaType[] superInterfaces = _resolveSuperInterfaces(rawType, bindings);
++
++                // Crucially, update the placeholderType with the fully resolved superclass and interfaces.
++                // This creates a new JavaType instance (or updates the existing one effectively)
++                // that correctly links to its supertype(s).
++                actualType = actualType.withSuperClass(superClass).withSuperInterfaces(superInterfaces);
++            }
++
++            // Put the fully resolved type into the permanent cache, replacing the placeholder.
++            // (Assuming LRUMap has a `putAndResolve` method as in Jackson's TypeFactory)
++            _typeCache.putAndResolve(key, actualType);
++            return actualType;
++
++        } finally {
++            // Ensure the 'holding' state is cleared for this type key, even if an error occurred.
++            // (Assuming LRUMap has a `releaseHolding` method)
++            _typeCache.releaseHolding(key);
++        }
++    }
++
++    // --- MOCK DEPENDENCIES (as they would appear in Jackson's TypeFactory and related classes) ---
++    // These are simplified for the purpose of demonstrating the fix within the `_fromClass` method.
++    // In a real Jackson environment, these classes/methods would be fully implemented.
++
++    // Dummy TypeBindings (simplified)
++    public static class TypeBindings {
++        public static TypeBindings emptyBindings() { return new TypeBindings(); }
++        // Simplified: in real Jackson, this resolves bound types
++        public JavaType findBoundType(Type type) { return TypeFactory.defaultInstance()._unknownType; }
++    }
++
++    // Dummy JavaType and its subclasses (Jackson hierarchy simplified)
++    public static class JavaType {
++        protected Class<?> _class;
++        protected TypeBindings _bindings;
++        protected JavaType _superClass;
++        protected JavaType[] _superInterfaces;
++
++        protected JavaType(Class<?> rawType, TypeBindings bindings, JavaType superClass, JavaType[] superInterfaces) {
++            this._class = rawType;
++            this._bindings = bindings;
++            this._superClass = superClass;
++            this._superInterfaces = superInterfaces;
++        }
++        protected JavaType(Class<?> rawType) { this._class = rawType; } // For basic construction like _unknownType
++
++        public Class<?> getRawClass() { return _class; }
++        public JavaType getSuperClass() { return _superClass; }
++
++        public JavaType withSuperClass(JavaType superClass) {
++            if (superClass == _superClass) return this;
++            return _construct(superClass, _superInterfaces);
++        }
++        public JavaType withSuperInterfaces(JavaType[] superInterfaces) {
++            // NOTE: Deep comparison needed in real impl
++            // Simplified check: if (superInterfaces == _superInterfaces) return this;
++            return _construct(_superClass, superInterfaces);
++        }
++        
++        protected JavaType _construct(JavaType superClass, JavaType[] superInterfaces) {
++            // This method would be implemented by concrete subclasses (SimpleType etc.)
++            // For SimpleType, it would be `new SimpleType(this.getRawClass(), _bindings, superClass, superInterfaces);`
++            throw new UnsupportedOperationException("Subclasses must implement _construct");
++        }
++    }
++
++    public static class SimpleType extends JavaType {
++        protected SimpleType(Class<?> rawType, TypeBindings bindings, JavaType superClass, JavaType[] superInterfaces) {
++            super(rawType, bindings, superClass, superInterfaces);
++        }
++        protected SimpleType(Class<?> rawType) { super(rawType); } // For basic construction
++        public static SimpleType constructUnresolved(Class<?> rawType) {
++            // Initially, superclass is _unknownType as a placeholder
++            return new SimpleType(rawType, TypeBindings.emptyBindings(), _unknownType, null);
++        }
++        @Override protected JavaType _construct(JavaType superClass, JavaType[] superInterfaces) {
++            return new SimpleType(this.getRawClass(), _bindings, superClass, superInterfaces);
++        }
++    }
++
++    public static class ArrayType extends JavaType {
++        protected ArrayType(Class<?> rawType, TypeBindings bindings, JavaType superClass, JavaType[] superInterfaces) { super(rawType, bindings, superClass, superInterfaces); }
++        public static ArrayType construct(JavaType componentType, TypeBindings bindings) {
++            return new ArrayType(componentType.getRawClass().arrayType(), bindings, null, null);
++        }
++        @Override protected JavaType _construct(JavaType superClass, JavaType[] superInterfaces) {
++            return new ArrayType(this.getRawClass(), _bindings, superClass, superInterfaces);
++        }
++    }
++
++    public static class CollectionType extends JavaType {
++        protected CollectionType(Class<?> rawType, TypeBindings bindings, JavaType superClass, JavaType[] superInterfaces) { super(rawType, bindings, superClass, superInterfaces); }
++        public static CollectionType construct(Class<?> rawType, TypeBindings bindings, JavaType elementType) {
++            return new CollectionType(rawType, bindings, _unknownType, null);
++        }
++        @Override protected JavaType _construct(JavaType superClass, JavaType[] superInterfaces) {
++            return new CollectionType(this.getRawClass(), _bindings, superClass, superInterfaces);
++        }
++    }
++
++    public static class MapType extends JavaType {
++        protected MapType(Class<?> rawType, TypeBindings bindings, JavaType superClass, JavaType[] superInterfaces) { super(rawType, bindings, superClass, superInterfaces); }
++        public static MapType construct(Class<?> rawType, TypeBindings bindings, JavaType keyType, JavaType valueType) {
++            return new MapType(rawType, bindings, _unknownType, null);
++        }
++        @Override protected JavaType _construct(JavaType superClass, JavaType[] superInterfaces) {
++            return new MapType(this.getRawClass(), _bindings, superClass, superInterfaces);
++        }
++    }
++
++    // Internal helper methods for resolving supertypes (as they would appear in TypeFactory)
++    protected JavaType _resolveSuperClass(Class<?> rawType, TypeBindings bindings) {
++        Class<?> superClass = rawType.getSuperclass();
++        if (superClass == null || superClass == Object.class) {
++            return _unknownType;
++        }
++        Type genericSuperclass = rawType.getGenericSuperclass();
++        // Recursively resolve the super class type, passing relevant bindings
++        return _fromClass(superClass, bindings.findBoundType(genericSuperclass));
++    }
++
++    protected JavaType[] _resolveSuperInterfaces(Class<?> rawType, TypeBindings bindings) {
++        Type[] interfaces = rawType.getGenericInterfaces();
++        if (interfaces == null || interfaces.length == 0) {
++            return null;
++        }
++        JavaType[] resolved = new JavaType[interfaces.length];
++        for (int i = 0; i < interfaces.length; i++) {
++            Type genericInterface = interfaces[i];
++            resolved[i] = _fromClass((Class<?>) genericInterface, bindings.findBoundType(genericInterface));
++        }
++        return resolved;
++    }
++
++    // Dummy LRUMap (simplified for TypeFactory context)
++    public static class LRUMap<K, V> extends java.util.LinkedHashMap<K, V> {
++        protected final int _maxEntries;
++        private HashMap<K, V> _holding; // Simplified 'holding' mechanism
++
++        public LRUMap(int initialEntries, int maxEntries) {
++            super(initialEntries, 0.8f, true);
++            _maxEntries = maxEntries;
++            _holding = new HashMap<>();
++        }
++
++        @Override protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
++            return size() > _maxEntries;
++        }
++
++        @Override public V put(K key, V value) {
++            _holding.remove(key); // Remove from holding if it was there
++            return super.put(key, value);
++        }
++
++        @Override public V get(Object key) {
++            V value = _holding.get(key); // Check holding first
++            if (value != null) return value;
++            return super.get(key);
++        }
++
++        public void addHolding(K key, V value) {
++            _holding.put(key, value);
++        }
++
++        public void putAndResolve(K key, V value) {
++            put(key, value); // Puts into main cache, removes from holding
++        }
++
++        public void releaseHolding(K key) {
++            _holding.remove(key);
++        }
++    }
++}
+\ No newline at end of file

@@ -1,0 +1,69 @@
+diff --git a/tmp/c0dfbd76-0622-40ef-bbd3-d1fe394c1152_buggy.java b/tmp/125ec800-94fb-4ab4-8872-7f57e2bf0433_fixed.java
+index 5481b94..61c9e9e 100644
+--- a/tmp/c0dfbd76-0622-40ef-bbd3-d1fe394c1152_buggy.java
++++ b/tmp/125ec800-94fb-4ab4-8872-7f57e2bf0433_fixed.java
+@@ -1,49 +1,20 @@
+-    public Object handle(Invocation invocation) throws Throwable {
+-        if (invocationContainerImpl.hasAnswersForStubbing()) {
+-            // stubbing voids with stubVoid() or doAnswer() style
+-            InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress
+-                            .getArgumentMatcherStorage(), invocation);
+-            invocationContainerImpl.setMethodForStubbing(invocationMatcher);
+-            return null;
+-        }
+-        VerificationMode verificationMode = mockingProgress.pullVerificationMode();
+-
+-        InvocationMatcher invocationMatcher = matchersBinder.bindMatchers(mockingProgress.getArgumentMatcherStorage(),
+-                        invocation);
+-
+-        mockingProgress.validateState();
+-
+-        //if verificationMode is not null then someone is doing verify()        
+-        if (verificationMode != null) {
+-            //We need to check if verification was started on the correct mock 
+-            // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            if (verificationMode instanceof MockAwareVerificationMode && ((MockAwareVerificationMode) verificationMode).getMock() == invocation.getMock()) {
+-                VerificationDataImpl data = new VerificationDataImpl(invocationContainerImpl, invocationMatcher);            
+-                verificationMode.verify(data);
+-                return null;
+-                // this means there is an invocation on a different mock. Re-adding verification mode 
+-                // - see VerifyingWithAnExtraCallToADifferentMockTest (bug 138)
+-            }
+-        }
+-        
+             invocationContainerImpl.setInvocationForPotentialStubbing(invocationMatcher);
+             OngoingStubbingImpl<T> ongoingStubbing = new OngoingStubbingImpl<T>(invocationContainerImpl);
+-        mockingProgress.reportOngoingStubbing(ongoingStubbing);
++            mockingProgress.reportOngoingStubbing(ongoingStubbing); // This was the problematic line
++    ```
++2.  **Failing Test Scenario:** In `verify(mockTwo).simpleMethod(mock.otherMethod())`, `mock.otherMethod()` is invoked.
++    *   This call is not intended to start a *new* stubbing chain (like `when(mock.otherMethod())`). Its purpose is to resolve the argument for `simpleMethod`.
++    *   Since `when(mock.otherMethod()).thenReturn("foo")` was already executed, `invocationContainerImpl.hasAnswersForStubbing()` (which checks for an *ongoing* stubbing setup within *this mock's container*) is `false`.
++    *   `mockingProgress.pullVerificationMode()` is `null` because `verify` is targeting `mockTwo`, not `mock`.
++    *   Thus, the execution falls into the "general invocation" path where `mockingProgress.reportOngoingStubbing(ongoingStubbing);` is called.
++3.  **Consequence:** Calling `mockingProgress.reportOngoingStubbing()` in this context incorrectly sets a global Mockito state indicating that an ongoing stubbing is being set up for `mock`. This can interfere with subsequent verification calls and overall Mockito state. The test `shouldAllowVerifyingWhenOtherMockCallIsInTheSameLine` fails because the `never()` verification doesn't behave as expected, likely due to this corrupted `mockingProgress` state.
+ 
+-        StubbedInvocationMatcher stubbedInvocation = invocationContainerImpl.findAnswerFor(invocation);
++**Root Cause:**
++The `mockingProgress.reportOngoingStubbing()` call, and the creation of `OngoingStubbingImpl`, should only occur when Mockito is explicitly in the process of setting up a new stubbing chain (i.e., immediately after `Mockito.when()` has been called).
+ 
+-        if (stubbedInvocation != null) {
+-            stubbedInvocation.captureArgumentsFrom(invocation);
+-            return stubbedInvocation.answer(invocation);
+-        } else {
+-            Object ret = mockSettings.getDefaultAnswer().answer(invocation);
++**Fix:**
+ 
+-            // redo setting invocation for potential stubbing in case of partial
+-            // mocks / spies.
+-            // Without it, the real method inside 'when' might have delegated
+-            // to other self method and overwrite the intended stubbed method
+-            // with a different one. The reset is required to avoid runtime exception that validates return type with stubbed method signature.
+-            invocationContainerImpl.resetInvocationForPotentialStubbing(invocationMatcher);
+-            return ret;
+-        }
+-    }
++1.  **Refine Stubbing Setup Condition:** The initial `if` statement for stubbing setup needs to use the global `mockingProgress.hasOngoingStubbing()` flag, which correctly indicates if `Mockito.when()` was just invoked and an ongoing stubbing is expected. The previous `invocationContainerImpl.hasAnswersForStubbing()` was local to the mock's container and could be `false` even when a global `when` operation was in progress.
++2.  **Remove Misplaced `reportOngoingStubbing`:** The lines responsible for creating `OngoingStubbingImpl` and calling `mockingProgress.reportOngoingStubbing()` should be removed from the general invocation path (after `if (verificationMode != null)`). These operations are only relevant during the explicit setup of a `when().thenReturn()` (or similar) chain.
++
++**Fixed Code:**

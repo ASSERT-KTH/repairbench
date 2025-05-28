@@ -1,0 +1,166 @@
+diff --git a/tmp/dae96717-8b95-4a70-bdb6-1467461a76f0_buggy.java b/tmp/38019745-a7dd-4208-8d9d-53cf4732a754_fixed.java
+index d8b0158..ff6cc0e 100644
+--- a/tmp/dae96717-8b95-4a70-bdb6-1467461a76f0_buggy.java
++++ b/tmp/38019745-a7dd-4208-8d9d-53cf4732a754_fixed.java
+@@ -1,113 +1,151 @@
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   private Node tryFoldArrayJoin(Node n) {
+     Node callTarget = n.getFirstChild();
+ 
+     if (callTarget == null || !NodeUtil.isGetProp(callTarget)) {
+       return n;
+     }
+ 
++    // Check for extra arguments to join(), as it only accepts one.
++    // n is the CALL node.
++    // n.getFirstChild() is the GETPROP (array.join).
++    // n.getFirstChild().getNext() is the first argument (separator).
++    // If n has more than 2 children, there are extra arguments.
++    if (n.getChildCount() > 2) {
++      return n;
++    }
++
+     Node right = callTarget.getNext();
+     if (right != null) {
+       if (!NodeUtil.isImmutableValue(right)) {
+         return n;
+       }
+     }
+ 
+     Node arrayNode = callTarget.getFirstChild();
+     Node functionName = arrayNode.getNext();
+ 
+     if ((arrayNode.getType() != Token.ARRAYLIT) ||
+         !functionName.getString().equals("join")) {
+       return n;
+     }
+ 
+     // "," is the default, it doesn't need to be explicit
+-
+     String joinString = (right == null) ? "," : NodeUtil.getStringValue(right);
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+     StringBuilder sb = null;
+-    int foldedSize = 0;
++    int foldedSize = 0; // This accumulates cost of new array elements' content
+     Node prev = null;
+     Node elem = arrayNode.getFirstChild();
+     // Merges adjacent String nodes.
+     while (elem != null) {
+       if (NodeUtil.isImmutableValue(elem) || elem.getType() == Token.EMPTY) {
+         if (sb == null) {
+           sb = new StringBuilder();
+         } else {
+           sb.append(joinString);
+         }
++        // Fix: Implement JS Array.prototype.join behavior for null/undefined
++        // Null and undefined elements are converted to the empty string.
++        if (elem.getType() == Token.NULL || elem.getType() == Token.VOID) { // VOID means undefined
++            sb.append("");
++        } else {
+             sb.append(NodeUtil.getArrayElementStringValue(elem));
++        }
+       } else {
+         if (sb != null) {
+           Preconditions.checkNotNull(prev);
+           // + 2 for the quotes.
+           foldedSize += sb.length() + 2;
+           arrayFoldedChildren.add(
+               Node.newString(sb.toString()).copyInformationFrom(prev));
+           sb = null;
+         }
+         foldedSize += InlineCostEstimator.getCost(elem);
+         arrayFoldedChildren.add(elem);
+       }
+       prev = elem;
+       elem = elem.getNext();
+     }
+ 
+     if (sb != null) {
+       Preconditions.checkNotNull(prev);
+       // + 2 for the quotes.
+       foldedSize += sb.length() + 2;
+       arrayFoldedChildren.add(
+           Node.newString(sb.toString()).copyInformationFrom(prev));
+     }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
++    // Removed: foldedSize += arrayFoldedChildren.size() - 1;
++    // This line was incorrect as it applied to all cases and was not part of
++    // the true cost of the new expression in the default case.
+ 
+     int originalSize = InlineCostEstimator.getCost(n);
+     switch (arrayFoldedChildren.size()) {
+       case 0:
+         Node emptyStringNode = Node.newString("");
+         n.getParent().replaceChild(n, emptyStringNode);
+         reportCodeChange();
+         return emptyStringNode;
+       case 1:
+         Node foldedStringNode = arrayFoldedChildren.remove(0);
++        // 'foldedSize' here represents the cost of the single element
++        // (either a new string literal or an existing node's cost).
+         if (foldedSize > originalSize) {
+           return n;
+         }
+         arrayNode.detachChildren();
+         if (foldedStringNode.getType() != Token.STRING) {
+           // If the Node is not a string literal, ensure that
+           // it is coerced to a string.
+           Node replacement = new Node(Token.ADD,
+               Node.newString("").copyInformationFrom(n),
+               foldedStringNode);
+           foldedStringNode = replacement;
+         }
+         n.getParent().replaceChild(n, foldedStringNode);
+         reportCodeChange();
+         return foldedStringNode;
+       default:
+-        // No folding could actually be performed.
++        // No folding could actually be performed (i.e. if the number of children
++        // did not change, meaning no adjacent strings were merged).
+         if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+           return n;
+         }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += (right != null) ? InlineCostEstimator.getCost(right) : 0;
+-        if (foldedSize > originalSize) {
++
++        // Calculate the cost of the NEW array.join() expression accurately.
++        // This includes the cost of the array literal, the '.join' property,
++        // the separator argument, and the CALL parentheses.
++        int newJoinExprCost = 0;
++        for (Node node : arrayFoldedChildren) {
++          newJoinExprCost += InlineCostEstimator.getCost(node);
++        }
++        // Add cost for the new array literal: brackets "[]"
++        newJoinExprCost += 2;
++        // Add cost for commas within the array literal (e.g., [a,b,c] has 2 commas)
++        newJoinExprCost += arrayFoldedChildren.size() > 1 ? arrayFoldedChildren.size() - 1 : 0;
++
++        // Add cost for the ".join" property access:
++        // The property name "join" itself and the overhead for GETPROP.
++        newJoinExprCost += ".join".length() + 2; // "join" (4 chars) + 2 for quotes as a string literal cost
++
++        // Add cost for the separator argument (if present)
++        newJoinExprCost += (right != null) ? InlineCostEstimator.getCost(right) : 0;
++
++        // Add cost for the CALL parentheses "()"
++        newJoinExprCost += 2;
++
++        if (newJoinExprCost > originalSize) {
+           return n;
+         }
+         arrayNode.detachChildren();
+         for (Node node : arrayFoldedChildren) {
+           arrayNode.addChildToBack(node);
+         }
+         reportCodeChange();
+         break;
+     }
+ 
+     return n;
+   }
+\ No newline at end of file

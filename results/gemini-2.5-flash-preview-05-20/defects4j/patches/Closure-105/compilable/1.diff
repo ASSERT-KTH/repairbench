@@ -1,0 +1,140 @@
+diff --git a/tmp/4a2c9101-68e0-49c6-8426-68b3b8b7f041_buggy.java b/tmp/edb94e36-5f04-41b3-9861-a1aaf4823429_fixed.java
+index ef65dd9..399ea0f 100644
+--- a/tmp/4a2c9101-68e0-49c6-8426-68b3b8b7f041_buggy.java
++++ b/tmp/edb94e36-5f04-41b3-9861-a1aaf4823429_fixed.java
+@@ -1,92 +1,126 @@
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
+     if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
+       return;
+     }
+ 
+     Node arrayNode = left.getFirstChild();
+     Node functionName = arrayNode.getNext();
+ 
+     if ((arrayNode.getType() != Token.ARRAYLIT) ||
+         !functionName.getString().equals("join")) {
+       return;
+     }
+ 
+     String joinString = NodeUtil.getStringValue(right);
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+     StringBuilder sb = new StringBuilder();
+     int foldedSize = 0;
+     Node elem = arrayNode.getFirstChild();
++
+     // Merges adjacent String nodes.
++    // This flag ensures that the joinString is only added *between* elements
++    // within a continuous sequence of foldable string literals.
++    boolean firstStringInSequence = true;
+     while (elem != null) {
+       if (NodeUtil.isImmutableValue(elem)) {
+-        if (sb.length() > 0) {
++        // If it's not the very first string literal in this sequence,
++        // append the joinString as a separator.
++        if (!firstStringInSequence) {
+           sb.append(joinString);
+         }
+         sb.append(NodeUtil.getStringValue(elem));
++        firstStringInSequence = false; // Mark that a string literal has been processed
+       } else {
++        // When a non-foldable element is encountered, flush the current
++        // accumulated string literal from sb into arrayFoldedChildren.
+         if (sb.length() > 0) {
+           // + 2 for the quotes.
+           foldedSize += sb.length() + 2;
+           arrayFoldedChildren.add(Node.newString(sb.toString()));
+-          sb = new StringBuilder();
++          sb = new StringBuilder(); // Reset sb for a new sequence
+         }
+         foldedSize += InlineCostEstimator.getCost(elem);
+         arrayFoldedChildren.add(elem);
++        firstStringInSequence = true; // Reset flag for the start of a potential new string sequence
+       }
+       elem = elem.getNext();
+     }
+ 
++    // Flush any remaining string content in sb after the loop finishes.
+     if (sb.length() > 0) {
+       // + 2 for the quotes.
+       foldedSize += sb.length() + 2;
+       arrayFoldedChildren.add(Node.newString(sb.toString()));
+     }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
++    // The problematic line `foldedSize += arrayFoldedChildren.size() - 1;` is removed.
++    // Its intent was to add cost for commas, but this is handled more precisely
++    // within the `default` case or is not applicable for cases 0 and 1.
+ 
+     int originalSize = InlineCostEstimator.getCost(n);
+     switch (arrayFoldedChildren.size()) {
+       case 0:
++        // Case: []
+         Node emptyStringNode = Node.newString("");
+         parent.replaceChild(n, emptyStringNode);
+         break;
+ 
+       case 1:
++        // Case: ['a'] or ['a', 'b'].join() -> 'ab'
+         Node foldedStringNode = arrayFoldedChildren.remove(0);
++        // At this point, foldedSize contains the cost of the single resulting string literal.
+         if (foldedSize > originalSize) {
+           return;
+         }
+         arrayNode.detachChildren();
+         if (foldedStringNode.getType() != Token.STRING) {
+           // If the Node is not a string literal, ensure that
+           // it is coerced to a string.
+           Node replacement = new Node(Token.ADD,
+               Node.newString(""), foldedStringNode);
+           foldedStringNode = replacement;
+         }
+         parent.replaceChild(n, foldedStringNode);
+         break;
+ 
+       default:
+-        // No folding could actually be performed.
++        // Case: ['a', foo, 'b', 'c'].join(',') -> ["a", foo, "b,c"].join(",")
++        // This case is for partial folding where some strings are merged,
++        // but the array join still exists.
++
++        // If no folding could actually be performed (i.e., array structure is unchanged),
++        // then return to avoid unnecessary work or potential cost increase.
+         if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+           return;
+         }
++
++        // Recalculate the total folded cost for the new expression format:
++        // [element1, element2, ...].join(joinString)
++        // foldedSize currently holds the sum of costs of the elements themselves.
++        int newTotalFoldedCost = foldedSize;
++
++        // Add cost for the array literal structure (brackets and commas)
++        newTotalFoldedCost += 1; // Cost for the '[' and ']'
++        newTotalFoldedCost += Math.max(0, arrayFoldedChildren.size() - 1); // Cost for commas
++
++        // Add cost for the '.join()' property access overhead
+         int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += InlineCostEstimator.getCost(right);
+-        if (foldedSize > originalSize) {
++        newTotalFoldedCost += kJoinOverhead;
++
++        // Add cost for the join string literal itself
++        newTotalFoldedCost += InlineCostEstimator.getCost(right);
++
++        if (newTotalFoldedCost > originalSize) {
+           return;
+         }
+         arrayNode.detachChildren();
+         for (Node node : arrayFoldedChildren) {
+           arrayNode.addChildToBack(node);
+         }
+         break;
+     }
+     t.getCompiler().reportCodeChange();
+   }
+\ No newline at end of file

@@ -1,0 +1,130 @@
+diff --git a/tmp/65fbcc42-b1f7-499c-bb84-89973cabe347_buggy.java b/tmp/06bafe18-6bd1-4c63-a4da-4736657a0847_fixed.java
+index d926eea..3d51bdb 100644
+--- a/tmp/65fbcc42-b1f7-499c-bb84-89973cabe347_buggy.java
++++ b/tmp/06bafe18-6bd1-4c63-a4da-4736657a0847_fixed.java
+@@ -1,48 +1,97 @@
+     @Override
+     public JsonSerializer<?> createContextual(SerializerProvider serializers,
+             BeanProperty property) throws JsonMappingException
+     {
+         if (property == null) {
+             return this;
+         }
++
++        // `findFormatOverrides` retrieves JsonFormat annotation values
+         JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+-        if (format == null) {
+-            return this;
+-        }
+-        // Simple case first: serialize as numeric timestamp?
++        
++        // 1. Handle numeric timestamp serialization (highest priority if specified)
++        if (format != null) {
+             JsonFormat.Shape shape = format.getShape();
+             if (shape.isNumeric()) {
+                 return withFormat(Boolean.TRUE, null);
+             }
++        }
++
++        // Determine effective Locale and TimeZone for contextualization,
++        // prioritizing annotation overrides, then serializers' context.
++        Locale loc = (format != null && format.hasLocale())
++                        ? format.getLocale() : serializers.getLocale();
++        TimeZone tz = (format != null && format.hasTimeZone())
++                        ? format.getTimeZone() : serializers.getTimeZone();
+ 
+-        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+-        // First: custom pattern will override things
+-                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+-                                || format.hasLocale() || format.hasTimeZone()) {
+-                    TimeZone tz = format.getTimeZone();
+-                    final String pattern = format.hasPattern()
+-                                    ? format.getPattern()
+-                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+-            final Locale loc = format.hasLocale()
+-                            ? format.getLocale()
+-                            : serializers.getLocale();
+-                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+-                    if (tz == null) {
+-                        tz = serializers.getTimeZone();
++        // 2. Handle explicit pattern override from JsonFormat annotation
++        if (format != null && format.hasPattern()) {
++            final String pattern = format.getPattern();
++            // Always use SimpleDateFormat for explicit patterns
++            SimpleDateFormat simpleDf = new SimpleDateFormat(pattern, loc);
++            if (tz != null) {
++                simpleDf.setTimeZone(tz);
+             }
+-            df.setTimeZone(tz);
+-            return withFormat(Boolean.FALSE, df);
++            // `withFormat` creates a new serializer instance with the specified format
++            return withFormat(Boolean.FALSE, simpleDf);
+         }
+ 
+-        // Otherwise, need one of these changes:
++        // 3. Adapt existing DateFormat for contextual locale/timezone if needed.
++        // This applies when:
++        //   a) format.hasLocale() or format.hasTimeZone() is true (annotation override for TZ/Locale)
++        //   b) Or, if no format overrides, but the current serializer's locale/timezone differs
++        //      from the serializers' provider context (default contextualization).
++
++        // Get the base DateFormat instance for this serializer.
++        // It could be from a global ObjectMapper.setDateFormat() (`_customDateFormat`)
++        // or the default StdDateFormat (`serializers.getConfig().getDateFormat()`).
++        DateFormat df = _customDateFormat;
++        if (df == null) {
++            df = serializers.getConfig().getDateFormat();
++        }
+ 
++        // Check if current DateFormat needs to be adapted for timezone or locale differences.
++        // This is crucial for handling [databind#1648] where only TZ/Locale is specified.
++        boolean timezoneDiffers = (tz != null && !tz.equals(df.getTimeZone()));
++        boolean localeDiffers = (loc != null && !loc.equals(df.getLocale()));
+ 
+-        // Jackson's own `StdDateFormat` is quite easy to deal with...
++        if (timezoneDiffers || localeDiffers) {
++            if (df instanceof SimpleDateFormat) {
++                // SimpleDateFormat needs cloning and re-setting properties
++                SimpleDateFormat simpleDf = (SimpleDateFormat) df.clone();
++                if (tz != null) {
++                    simpleDf.setTimeZone(tz);
++                }
++                if (loc != null && !loc.equals(simpleDf.getLocale())) {
++                    // SimpleDateFormat's locale is immutable, must reconstruct if it changes
++                    simpleDf = new SimpleDateFormat(simpleDf.toPattern(), loc);
++                    if (tz != null) { // Re-apply timezone if reconstructed
++                        simpleDf.setTimeZone(tz);
++                    }
++                }
++                return withFormat(Boolean.FALSE, simpleDf);
++            } else if (df instanceof StdDateFormat) {
++                // StdDateFormat has fluent methods for contextualization
++                StdDateFormat stdDf = (StdDateFormat) df;
++                if (tz != null) {
++                    stdDf = stdDf.withTimeZone(tz);
++                }
++                if (loc != null) {
++                    stdDf = stdDf.withLocale(loc);
++                }
++                return withFormat(Boolean.FALSE, stdDf);
++            }
++            // For other `DateFormat` types, or if `df` is null (shouldn't happen here),
++            // we cannot reliably adapt it. Fall through to return `this`.
++        }
++
++        // 4. If current serializer produces numeric timestamp, but context indicates string output.
++        // This happens if JsonFormat.Shape.STRING is implied (e.g., default), and `_useTimestamp` is true.
++        if (_useTimestamp == Boolean.TRUE) {
++            // Switch to default string format (which will then be resolved via `df` above if needed)
++            return withFormat(Boolean.FALSE, null);
++        }
+ 
+-        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+-        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+-        //    So: require it be `SimpleDateFormat`; can't config other types
+-//            serializers.reportBadDefinition(handledType(), String.format(
+-            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
++        // 5. No specific format changes are needed. Return current serializer instance.
+         return this;
+     }
+\ No newline at end of file

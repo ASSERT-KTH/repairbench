@@ -1,0 +1,156 @@
+diff --git a/tmp/91415e04-3fd2-474e-b2ea-4413198c6661_buggy.java b/tmp/212b7118-6704-4e91-85a4-6397a0ad2cbb_fixed.java
+index 7d7ab59..fe52cff 100644
+--- a/tmp/91415e04-3fd2-474e-b2ea-4413198c6661_buggy.java
++++ b/tmp/212b7118-6704-4e91-85a4-6397a0ad2cbb_fixed.java
+@@ -1,124 +1,141 @@
+   /**
+    * Attempts to minimize the number of explicit exit points in a control
+    * structure to take advantage of the implied exit at the end of the
+    * structure.  This is accomplished by removing redundant statements, and
+    * moving statements following a qualifying IF node into that node.
+    * For example:
+    *
+    * function () {
+    *   if (x) return;
+    *   else blah();
+    *   foo();
+    * }
+    *
+    * becomes:
+    *
+    * function () {
+    *  if (x) ;
+    *  else {
+    *    blah();
+    *    foo();
+    *  }
+    *
+    * @param n The execution node of a parent to inspect.
+    * @param exitType The type of exit to look for.
+    * @param labelName If parent is a label the name of the label to look for,
+    *   null otherwise.
+    * @nullable labelName non-null only for breaks within labels.
+    */
+   void tryMinimizeExits(Node n, int exitType, String labelName) {
+ 
+-    // Just an 'exit'.
+-    if (matchingExitNode(n, exitType, labelName)) {
++    // Fix 3: An exit node is only redundant if it's the last child
++    // of its parent and its parent is a statement-containing block.
++    // This prevents removal of exits that are followed by other statements.
++    if (n.getParent() != null && n == n.getParent().getLastChild() &&
++        matchingExitNode(n, exitType, labelName)) {
+       NodeUtil.removeChild(n.getParent(), n);
+       compiler.reportCodeChange();
+       return;
+     }
+ 
+     // Just an 'if'.
+     if (n.isIf()) {
+       Node ifBlock = n.getFirstChild().getNext();
+       tryMinimizeExits(ifBlock, exitType, labelName);
+       Node elseBlock = ifBlock.getNext();
+       if (elseBlock != null) {
+         tryMinimizeExits(elseBlock, exitType, labelName);
+       }
+       return;
+     }
+ 
+     // Just a 'try/catch/finally'.
+     if (n.isTry()) {
+       Node tryBlock = n.getFirstChild();
+       tryMinimizeExits(tryBlock, exitType, labelName);
+       Node allCatchNodes = NodeUtil.getCatchBlock(n);
+       if (NodeUtil.hasCatchHandler(allCatchNodes)) {
+         Preconditions.checkState(allCatchNodes.hasOneChild());
+         Node catchNode = allCatchNodes.getFirstChild();
+         Node catchCodeBlock = catchNode.getLastChild();
+         tryMinimizeExits(catchCodeBlock, exitType, labelName);
+       }
+       /* Don't try to minimize the exits of finally blocks, as this
+        * can cause problems if it changes the completion type of the finally
+        * block. See ECMA 262 Sections 8.9 & 12.14
+        */
+-      if (NodeUtil.hasFinally(n)) {
+-        Node finallyBlock = n.getLastChild();
+-        tryMinimizeExits(finallyBlock, exitType, labelName);
+-      }
++      // Fix 1: Removed the call to tryMinimizeExits on the finally block.
++      // if (NodeUtil.hasFinally(n)) {
++      //   Node finallyBlock = n.getLastChild();
++      //   tryMinimizeExits(finallyBlock, exitType, labelName);
++      // }
++      // Fix 2: Added return to prevent fall-through.
++      return;
+     }
+ 
+     // Just a 'label'.
+     if (n.isLabel()) {
+       Node labelBlock = n.getLastChild();
+       tryMinimizeExits(labelBlock, exitType, labelName);
++      // Fix 2: Added return to prevent fall-through.
++      return;
+     }
+ 
+     // TODO(johnlenz): The last case of SWITCH statement?
+ 
+     // The rest assumes a block with at least one child, bail on anything else.
+     if (!n.isBlock() || n.getLastChild() == null) {
+       return;
+     }
+ 
+     // Multiple if-exits can be converted in a single pass.
+     // Convert "if (blah) break;  if (blah2) break; other_stmt;" to
+     // become "if (blah); else { if (blah2); else { other_stmt; } }"
+     // which will get converted to "if (!blah && !blah2) { other_stmt; }".
++    // The iteration over children should be robust to modifications
++    // (e.g., nodes being moved out of 'n' by tryMinimizeIfBlockExits).
++    // Node.children() usually provides a resilient iterator,
++    // so the existing for-each loop might be fine, but the early break is problematic.
++    // The previous loop structure assumes Node.children() iterator is robust.
++    // Removing the early break ensures all IFs are processed, and the last-child logic
++    // gets a chance to run afterward on the potentially new last child.
+     for (Node c : n.children()) {
+ 
+       // An 'if' block to process below.
+       if (c.isIf()) {
+         Node ifTree = c;
+         Node trueBlock, falseBlock;
+ 
+         // First, the true condition block.
+         trueBlock = ifTree.getFirstChild().getNext();
+         falseBlock = trueBlock.getNext();
+         tryMinimizeIfBlockExits(trueBlock, falseBlock,
+             ifTree, exitType, labelName);
+ 
+         // Now the else block.
+         // The if blocks may have changed, get them again.
+         trueBlock = ifTree.getFirstChild().getNext();
+         falseBlock = trueBlock.getNext();
+         if (falseBlock != null) {
+           tryMinimizeIfBlockExits(falseBlock, trueBlock,
+               ifTree, exitType, labelName);
+         }
+       }
+-
+-      if (c == n.getLastChild()) {
+-        break;
+-      }
++      // Removed: if (c == n.getLastChild()) { break; }
++      // This break was causing certain IF nodes, especially if they were the last original child,
++      // to not allow the subsequent 'last child' cleanup loop to run if they didn't modify
++      // the last child themselves. It's safer to let the loop complete.
+     }
+ 
+     // Now try to minimize the exits of the last child, if it is removed
+     // look at what has become the last child.
++    // This loop relies on tryMinimizeExits itself handling the removal if applicable.
+     for (Node c = n.getLastChild(); c != null; c = n.getLastChild()) {
+       tryMinimizeExits(c, exitType, labelName);
+       // If the node is still the last child, we are done.
++      // This check is important as tryMinimizeExits(c, ...) might remove 'c'.
+       if (c == n.getLastChild()) {
+         break;
+       }
+     }
+   }

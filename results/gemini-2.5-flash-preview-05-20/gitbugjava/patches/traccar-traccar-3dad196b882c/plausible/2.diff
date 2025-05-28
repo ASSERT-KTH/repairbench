@@ -1,0 +1,156 @@
+diff --git a/tmp/a80a07a8-08a2-47fa-97ad-85e250501e93_buggy.java b/tmp/6c4ed35e-bb93-49b7-b072-11a6e2d8222d_fixed.java
+index c6164f1..52a9465 100644
+--- a/tmp/a80a07a8-08a2-47fa-97ad-85e250501e93_buggy.java
++++ b/tmp/6c4ed35e-bb93-49b7-b072-11a6e2d8222d_fixed.java
+@@ -1,116 +1,144 @@
+     private Position decodePosition(
+             Channel channel, SocketAddress remoteAddress, ByteBuf buf, int index) {
+ 
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         int status = buf.readUnsignedShort();
+ 
+         position.setValid(BitUtil.check(status, 15));
+ 
+         position.set(Position.KEY_STATUS, status);
+         position.set(Position.KEY_IGNITION, BitUtil.check(status, 14));
+ 
+         int event = buf.readUnsignedShort();
+         position.set(Position.KEY_ALARM, decodeAlarm(event));
+         position.set(Position.KEY_EVENT, event);
+ 
+         String time = buf.readCharSequence(12, StandardCharsets.US_ASCII).toString();
+ 
+         DateBuilder dateBuilder = new DateBuilder()
+                 .setYear(Integer.parseInt(time.substring(0, 2)))
+                 .setMonth(Integer.parseInt(time.substring(2, 4)))
+                 .setDay(Integer.parseInt(time.substring(4, 6)))
+                 .setHour(Integer.parseInt(time.substring(6, 8)))
+                 .setMinute(Integer.parseInt(time.substring(8, 10)))
+                 .setSecond(Integer.parseInt(time.substring(10, 12)));
+         position.setTime(dateBuilder.getDate());
+ 
+         position.setLongitude(buf.readInt() * 0.00001);
+         position.setLatitude(buf.readInt() * 0.00001);
+ 
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort()));
+         position.setCourse(buf.readUnsignedShort());
+         position.setAltitude(buf.readUnsignedShort());
+ 
+         position.set(Position.KEY_ODOMETER, buf.readUnsignedShort() * 1000);
+ 
+         Network network = new Network();
+ 
+-        while (buf.readableBytes() > 4) {
++        while (buf.readableBytes() > 4) { // Ensure at least 4 bytes for subtype (2) + totalBlockLength (2)
+             int subtype = buf.readUnsignedShort();
+-            int length = buf.readUnsignedShort() - 4;
++            int totalBlockLength = buf.readUnsignedShort(); // This is the total length of the block
++
++            int payloadLength = totalBlockLength - 4; // This is the length of the data portion, excluding header
++
++            // Handle malformed block where reported total length is less than the header size
++            if (payloadLength < 0) {
++                // The block is malformed (totalBlockLength < 4).
++                // We've already consumed 4 bytes (subtype + totalBlockLength).
++                // There's no valid payload to read or skip for this block.
++                // Continue to the next iteration to see if more valid blocks exist.
++                continue;
++            }
++
++            // Handle truncated or severely malformed block where advertised payload exceeds available bytes
++            if (payloadLength > buf.readableBytes()) {
++                // Advertised payload length is greater than what's remaining in the buffer.
++                // This indicates a truncated packet or severe corruption.
++                // Further reads based on payloadLength would lead to IndexOutOfBoundsException.
++                // It's safer to break out of the loop and stop processing this buffer.
++                break;
++            }
++
+             switch (subtype) {
+                 case 0x0001:
++                    // Note: If the sum of bytes read in this case does not exactly equal payloadLength,
++                    // there might be a silent bug or remaining bytes that should be skipped/handled.
++                    // For more robustness, one might use buf.readSlice(payloadLength) and read from the slice.
+                     int coolantTemperature = buf.readUnsignedByte() - 40;
+                     if (coolantTemperature <= 215) {
+                         position.set(Position.KEY_COOLANT_TEMP, coolantTemperature);
+                     }
+                     int rpm = buf.readUnsignedShort();
+                     if (rpm <= 65535) {
+                         position.set(Position.KEY_RPM, rpm);
+                     }
+                     position.set("averageSpeed", buf.readUnsignedByte());
+                     buf.readUnsignedShort(); // interval fuel consumption
+                     position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort());
+                     position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte() * 0.4);
+                     buf.readUnsignedInt(); // trip id
+                     break;
+                 case 0x0005:
+                     position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                     position.set(Position.KEY_HDOP, buf.readUnsignedByte());
+                     buf.readUnsignedInt(); // run time
+                     break;
+                 case 0x0009:
++                    // This uses payloadLength directly, which is now guaranteed to be non-negative
+                     position.set(
+-                            Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
++                            Position.KEY_VIN, buf.readCharSequence(payloadLength, StandardCharsets.US_ASCII).toString());
+                     break;
+                 case 0x0011:
+                     position.set(Position.KEY_HOURS, buf.readUnsignedInt() * 0.05);
+                     break;
+                 case 0x0014:
+                     position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() / 255.0);
+                     position.set("timingAdvance", buf.readUnsignedByte() * 0.5);
+                     position.set("airTemp", buf.readUnsignedByte() - 40);
+                     position.set("airFlow", buf.readUnsignedShort() * 0.01);
+                     position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() / 255.0);
+                     break;
+                 case 0x0020:
++                    // This uses payloadLength directly, which is now guaranteed to be non-negative
+                     String[] cells = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                            payloadLength, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String cell : cells) {
+                         String[] values = cell.split("@");
+                         network.addCellTower(CellTower.from(
+                                 Integer.parseInt(values[0]), Integer.parseInt(values[1]),
+                                 Integer.parseInt(values[2], 16), Integer.parseInt(values[3], 16)));
+                     }
+                     break;
+                 case 0x0021:
++                    // This uses payloadLength directly, which is now guaranteed to be non-negative
+                     String[] points = buf.readCharSequence(
+-                            length, StandardCharsets.US_ASCII).toString().split("\\+");
++                            payloadLength, StandardCharsets.US_ASCII).toString().split("\\+");
+                     for (String point : points) {
+                         String[] values = point.split("@");
+                         network.addWifiAccessPoint(WifiAccessPoint.from(values[0], Integer.parseInt(values[1])));
+                     }
+                     break;
+                 default:
+-                    buf.skipBytes(length);
++                    // This now uses payloadLength, which is guaranteed to be non-negative by the checks above
++                    buf.skipBytes(payloadLength);
+                     break;
+             }
+         }
+ 
+         if (network.getCellTowers() != null || network.getWifiAccessPoints() != null) {
+             position.setNetwork(network);
+         }
+ 
+         sendResponse(channel, MSG_POSITION_RSP, index, null);
+ 
+         return position;
+     }
+\ No newline at end of file

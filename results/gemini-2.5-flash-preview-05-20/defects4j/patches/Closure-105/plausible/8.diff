@@ -1,0 +1,137 @@
+diff --git a/tmp/0c4245a6-a66e-4962-a58f-3a8b8cd95e08_buggy.java b/tmp/2113e0ad-594c-4d53-88ae-36fc2b40dac2_fixed.java
+index ef65dd9..c417966 100644
+--- a/tmp/0c4245a6-a66e-4962-a58f-3a8b8cd95e08_buggy.java
++++ b/tmp/2113e0ad-594c-4d53-88ae-36fc2b40dac2_fixed.java
+@@ -1,92 +1,122 @@
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   void tryFoldStringJoin(NodeTraversal t, Node n, Node left, Node right,
+                          Node parent) {
+     if (!NodeUtil.isGetProp(left) || !NodeUtil.isImmutableValue(right)) {
+       return;
+     }
+ 
+     Node arrayNode = left.getFirstChild();
+     Node functionName = arrayNode.getNext();
+ 
+     if ((arrayNode.getType() != Token.ARRAYLIT) ||
+         !functionName.getString().equals("join")) {
+       return;
+     }
+ 
+     String joinString = NodeUtil.getStringValue(right);
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+     StringBuilder sb = new StringBuilder();
+     int foldedSize = 0;
+     Node elem = arrayNode.getFirstChild();
++    // A flag to track if we have processed at least one immutable node in the
++    // current sequence being accumulated in the StringBuilder. This is crucial
++    // for correctly appending the joinString, especially with empty string
++    // elements.
++    boolean hasPreviousImmutableInSequence = false;
++
+     // Merges adjacent String nodes.
+     while (elem != null) {
+       if (NodeUtil.isImmutableValue(elem)) {
+-        if (sb.length() > 0) {
++        // If a previous immutable node was processed for this sequence,
++        // we need to append the join string before the current element's value.
++        if (hasPreviousImmutableInSequence) {
+           sb.append(joinString);
+         }
+         sb.append(NodeUtil.getStringValue(elem));
++        hasPreviousImmutableInSequence = true;
+       } else {
+-        if (sb.length() > 0) {
++        // Current element is not immutable, so we break the current
++        // sequence of immutable strings.
++        if (hasPreviousImmutableInSequence) {
++          // Flush the accumulated string.
+           // + 2 for the quotes.
+           foldedSize += sb.length() + 2;
+           arrayFoldedChildren.add(Node.newString(sb.toString()));
+-          sb = new StringBuilder();
++          sb = new StringBuilder(); // Reset sb for the next sequence
+         }
++        // Add the non-immutable element itself.
+         foldedSize += InlineCostEstimator.getCost(elem);
+         arrayFoldedChildren.add(elem);
++        hasPreviousImmutableInSequence = false; // Reset flag as the sequence is broken
+       }
+       elem = elem.getNext();
+     }
+ 
+-    if (sb.length() > 0) {
++    // Flush any remaining string builder content after the loop.
++    if (hasPreviousImmutableInSequence) {
+       // + 2 for the quotes.
+       foldedSize += sb.length() + 2;
+       arrayFoldedChildren.add(Node.newString(sb.toString()));
+     }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
+ 
+     int originalSize = InlineCostEstimator.getCost(n);
+     switch (arrayFoldedChildren.size()) {
+       case 0:
++        // Case: [].join(X) -> ""
+         Node emptyStringNode = Node.newString("");
+         parent.replaceChild(n, emptyStringNode);
+         break;
+ 
+       case 1:
++        // Case: ['a'].join(X) -> 'a', or [foo].join(X) -> foo (coerced to string)
+         Node foldedStringNode = arrayFoldedChildren.remove(0);
++        // foldedSize already contains the cost of the single resulting string node
++        // (including quotes if it's a string literal).
+         if (foldedSize > originalSize) {
+           return;
+         }
+         arrayNode.detachChildren();
+         if (foldedStringNode.getType() != Token.STRING) {
+           // If the Node is not a string literal, ensure that
+           // it is coerced to a string.
+           Node replacement = new Node(Token.ADD,
+               Node.newString(""), foldedStringNode);
+           foldedStringNode = replacement;
++          // TODO(user): If this coercion increases cost, this should be re-evaluated
++          // or the cost estimate should include this.
+         }
+         parent.replaceChild(n, foldedStringNode);
+         break;
+ 
+       default:
+-        // No folding could actually be performed.
++        // Case: Some folding occurred, but not into a single string.
++        // E.g., ['a', foo, 'b'].join(',') -> ["a", foo, "b"].join(',')
++        // Or no folding at all, but the cost calculation might reveal a win.
+         if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
++          // If no folding could actually be performed (i.e., the number of
++          // children is the same and none were merged), return.
++          // This check prevents unnecessary work and potential no-op changes.
+           return;
+         }
+-        int kJoinOverhead = "[].join()".length();
++
++        // Calculate the cost of the transformed expression: [new_array_elements].join(joinString)
++        int kJoinOverhead = "[].join()".length(); // Cost of array literal structure and .join() call
+         foldedSize += kJoinOverhead;
+-        foldedSize += InlineCostEstimator.getCost(right);
++        foldedSize += InlineCostEstimator.getCost(right); // Cost of the join string literal itself
++        // Add cost for commas in the re-built array literal.
++        // Only add if there's more than one element in the new array.
++        foldedSize += Math.max(0, arrayFoldedChildren.size() - 1);
++
+         if (foldedSize > originalSize) {
+           return;
+         }
+         arrayNode.detachChildren();
+         for (Node node : arrayFoldedChildren) {
+           arrayNode.addChildToBack(node);
+         }
+         break;
+     }
+     t.getCompiler().reportCodeChange();
+   }
+\ No newline at end of file

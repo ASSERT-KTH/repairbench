@@ -1,0 +1,104 @@
+diff --git a/tmp/73455de9-efd5-4074-9e76-4c00697df5da_buggy.java b/tmp/26773e5c-302f-41b3-98b7-fce5d5db6505_fixed.java
+index 1b07d98..3f052ff 100644
+--- a/tmp/73455de9-efd5-4074-9e76-4c00697df5da_buggy.java
++++ b/tmp/26773e5c-302f-41b3-98b7-fce5d5db6505_fixed.java
+@@ -1,76 +1,31 @@
+-    @Override
+-    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+-            BeanProperty property) throws JsonMappingException
+-    {
+-        // Note! Should not skip if `property` null since that'd skip check
+-        // for config overrides, in case of root value
+-        if (property == null) {
+-            return this;
+-        }
+-        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+-        if (format == null) {
+-            return this;
+-        }
+-        // Simple case first: serialize as numeric timestamp?
+-        JsonFormat.Shape shape = format.getShape();
+-        if (shape.isNumeric()) {
++        JsonFormat.Shape shape = format.getShape(); // shape is ANY
++        if (shape.isNumeric()) { // ANY.isNumeric() is false, so this is SKIPPED
+             return withFormat(Boolean.TRUE, null);
+         }
+ 
+-        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+-        // First: custom pattern will override things
+-        if (format.hasPattern()) {
+-            final Locale loc = format.hasLocale()
+-                            ? format.getLocale()
+-                            : serializers.getLocale();
+-            SimpleDateFormat df = new SimpleDateFormat(format.getPattern(), loc);
+-            TimeZone tz = format.hasTimeZone() ? format.getTimeZone()
+-                    : serializers.getTimeZone();
+-            df.setTimeZone(tz);
+-            return withFormat(Boolean.FALSE, df);
++        // ...
++
++        if (format.hasPattern()) { // format.hasPattern() is true for the test case
++            // ... creates SimpleDateFormat (df) ...
++            return withFormat(Boolean.FALSE, df); // This path SHOULD be taken, setting _useTimestamp to FALSE
+         }
++    ```
++    Based on this, the current code's logic *should* correctly handle the pattern and produce a string output. However, the test fails, indicating a numeric output.
+ 
+-        // Otherwise, need one of these changes:
+-        final boolean hasLocale = format.hasLocale();
+-        final boolean hasTZ = format.hasTimeZone();
+-        final boolean asString = (shape == JsonFormat.Shape.STRING);
++4.  **The Root Cause (Identified)**: The conflict arises if `findFormatOverrides` returns a `JsonFormat.Value` where both a pattern is set *and* the `JsonFormat.Shape` is `NUMBER`. This can happen if a default format (e.g., from an annotation or global setting) specifies `Shape.NUMBER`, and then `configOverride` *adds* a pattern without explicitly setting the shape.
++    In such a merged `JsonFormat.Value`:
++    *   `format.getShape()` would return `NUMBER`.
++    *   `format.hasPattern()` would return `true`.
++    With the original code order, `if (shape.isNumeric())` is checked first. If `shape` is `NUMBER`, this branch is taken, returning `withFormat(Boolean.TRUE, null)`, which forces numeric serialization, thus ignoring the pattern.
++    The convention is that an explicit pattern *implies* string serialization and should override any numeric shape.
+ 
+-        if (!hasLocale && !hasTZ && !asString) {
+-            return this;
+-        }
++5.  **Secondary Issue (StdDateFormat)**: Even if the `DateTimeSerializerBase`'s `_useTimestamp` is set to `Boolean.FALSE`, if `_customFormat` is an instance of `StdDateFormat` whose *internal* `_useTimestamps` flag is `true`, `StdDateFormat.format()` will still produce a numeric string (e.g., "1234567890"). The `StdDateFormat.instance` (used by `ObjectMapper` by default) has `_useTimestamps` set to `true`. When `std.withLocale()` or `std.withTimeZone()` are called, they return new `StdDateFormat` instances that inherit this `_useTimestamps` state. To ensure `StdDateFormat` prints a formatted string, its `_useTimestamps` must be explicitly set to `false`. This applies when `JsonFormat.Shape.STRING` is requested, and no pattern is used.
+ 
+-        DateFormat df0 = serializers.getConfig().getDateFormat();
+-        // Jackson's own `StdDateFormat` is quite easy to deal with...
+-        if (df0 instanceof StdDateFormat) {
+-            StdDateFormat std = (StdDateFormat) df0;
+-            if (format.hasLocale()) {
+-                std = std.withLocale(format.getLocale());
+-            }
+-            if (format.hasTimeZone()) {
+-                std = std.withTimeZone(format.getTimeZone());
+-            }
+-            return withFormat(Boolean.FALSE, std);
+-        }
++**Proposed Fixes**:
+ 
+-        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+-        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+-        //    So: require it be `SimpleDateFormat`; can't config other types
+-        if (!(df0 instanceof SimpleDateFormat)) {
+-            serializers.reportBadDefinition(handledType(), String.format(
+-"Configured `DateFormat` (%s) not a `SimpleDateFormat`; cannot configure `Locale` or `TimeZone`",
+-df0.getClass().getName()));
+-        }
+-        SimpleDateFormat df = (SimpleDateFormat) df0;
+-        if (hasLocale) {
+-            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+-            df = new SimpleDateFormat(df.toPattern(), format.getLocale());
+-        } else {
+-            df = (SimpleDateFormat) df.clone();
+-        }
+-        TimeZone newTz = format.getTimeZone();
+-        boolean changeTZ = (newTz != null) && !newTz.equals(df.getTimeZone());
+-        if (changeTZ) {
+-            df.setTimeZone(newTz);
+-        }
+-        return withFormat(Boolean.FALSE, df);
+-    }
++1.  **Reorder Pattern vs. Numeric Shape Check**: Prioritize `format.hasPattern()` over `shape.isNumeric()`. If a pattern is present, it always implies string serialization.
++2.  **Configure `StdDateFormat` for String Output**: When using `StdDateFormat` as the custom format for string serialization (i.e., `JsonFormat.Shape.STRING` is requested, or implied by a pattern not already handled), ensure `StdDateFormat` itself is configured to produce string output (`std.with(false)`).
++
++The reordered code will first check for a pattern. If a pattern is found, it will immediately configure the serializer for string output using `SimpleDateFormat`. This directly resolves the `testSqlDateConfigOverride` failure.
++
++The `StdDateFormat` configuration fix addresses cases where `Shape.STRING` is explicitly given without a pattern, preventing `StdDateFormat` from outputting numeric strings.

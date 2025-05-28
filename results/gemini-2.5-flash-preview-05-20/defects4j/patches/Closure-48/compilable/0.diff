@@ -1,0 +1,205 @@
+diff --git a/tmp/2b934fb8-82c7-4a69-a2c8-034346698f56_buggy.java b/tmp/03d041c1-adaa-458c-a501-9630b245d6fa_fixed.java
+index 6bb2927..124d7e2 100644
+--- a/tmp/2b934fb8-82c7-4a69-a2c8-034346698f56_buggy.java
++++ b/tmp/03d041c1-adaa-458c-a501-9630b245d6fa_fixed.java
+@@ -1,156 +1,191 @@
+     /**
+      * Declare the symbol for a qualified name in the global scope.
+      *
+      * @param info The doc info for this property.
+      * @param n A top-level GETPROP node (it should not be contained inside
+      *     another GETPROP).
+      * @param parent The parent of {@code n}.
+      * @param rhsValue The node that {@code n} is being initialized to,
+      *     or {@code null} if this is a stub declaration.
+      */
+     void maybeDeclareQualifiedName(NodeTraversal t, JSDocInfo info,
+         Node n, Node parent, Node rhsValue) {
+       Node ownerNode = n.getFirstChild();
+       String ownerName = ownerNode.getQualifiedName();
+       String qName = n.getQualifiedName();
+       String propName = n.getLastChild().getString();
+       Preconditions.checkArgument(qName != null && ownerName != null);
+ 
+       // Precedence of type information on GETPROPs:
+       // 1) @type annnotation / @enum annotation
+       // 2) ASSIGN to FUNCTION literal
+       // 3) @param/@return annotation (with no function literal)
+       // 4) ASSIGN to something marked @const
+       // 5) ASSIGN to anything else
+       //
+       // 1, 3, and 4 are declarations, 5 is inferred, and 2 is a declaration iff
+       // the function has jsdoc or has not been declared before.
+       //
+       // FUNCTION literals are special because TypedScopeCreator is very smart
+       // about getting as much type information as possible for them.
+ 
+       // Determining type for #1 + #2 + #3 + #4
+       JSType valueType = getDeclaredType(t.getSourceName(), info, n, rhsValue);
+       if (valueType == null && rhsValue != null) {
+         // Determining type for #5
+         valueType = rhsValue.getJSType();
+       }
+       // Function prototypes are special.
+       // It's a common JS idiom to do:
+       // F.prototype = { ... };
+       // So if F does not have an explicitly declared super type,
+       // allow F.prototype to be redefined arbitrarily.
+       if ("prototype".equals(propName)) {
+         Var qVar = scope.getVar(qName);
+         if (qVar != null) {
+           // If the programmer has declared that F inherits from Super,
+           // and they assign F.prototype to an object literal,
+           // then they are responsible for making sure that the object literal's
+           // implicit prototype is set up appropriately. We just obey
+           // the @extends tag.
+           ObjectType qVarType = ObjectType.cast(qVar.getType());
+           if (qVarType != null &&
+               rhsValue != null &&
+               rhsValue.isObjectLit()) {
+             typeRegistry.resetImplicitPrototype(
+                 rhsValue.getJSType(), qVarType.getImplicitPrototype());
+           } else if (!qVar.isTypeInferred()) {
+             // If the programmer has declared that F inherits from Super,
+             // and they assign F.prototype to some arbitrary expression,
+             // there's not much we can do. We just ignore the expression,
+             // and hope they've annotated their code in a way to tell us
+             // what props are going to be on that prototype.
+             return;
+           }
+           if (qVar.getScope() == scope) {
+             scope.undeclare(qVar);
+           }
+         }
+       }
+ 
+       if (valueType == null) {
+         if (parent.isExprResult()) {
+           stubDeclarations.add(new StubDeclaration(
+               n,
+               t.getInput() != null && t.getInput().isExtern(),
+               ownerName));
+         }
+ 
+         return;
+       }
+ 
+       // NOTE(nicksantos): Determining whether a property is declared or not
+       // is really really obnoxious.
+       //
+       // The problem is that there are two (equally valid) coding styles:
+       //
+       // (function() {
+       //   /* The authoritative definition of goog.bar. */
+       //   goog.bar = function() {};
+       // })();
+       //
+       // function f() {
+       //   goog.bar();
+       //   /* Reset goog.bar to a no-op. */
+       //   goog.bar = function() {};
+       // }
+       //
+       // In a dynamic language with first-class functions, it's very difficult
+       // to know which one the user intended without looking at lots of
+       // contextual information (the second example demonstrates a small case
+       // of this, but there are some really pathological cases as well).
+       //
+       // The current algorithm checks if either the declaration has
+       // jsdoc type information, or @const with a known type,
+       // or a function literal with a name we haven't seen before.
+       boolean inferred = true;
+       if (info != null) {
+         // Determining declaration for #1 + #3 + #4
+         inferred = !(info.hasType()
+             || info.hasEnumParameterType()
+             || (info.isConstant() && valueType != null
+                 && !valueType.isUnknownType())
+             || FunctionTypeBuilder.isFunctionTypeDeclaration(info));
+       }
+ 
+       if (inferred) {
+-        // Determining declaration for #2
++        // Determining declaration for #2 (ASSIGN to FUNCTION literal)
++        // A function literal is a declaration if it has JSDoc (handled above)
++        // OR if the name has not been declared before.
++        // The 'info != null' part of the original condition is redundant here
++        // if 'inferred' is true, as it means info was null or didn't lead to false.
+         inferred = !(rhsValue != null &&
+             rhsValue.isFunction() &&
+-            (info != null || !scope.isDeclared(qName, false)));
++            !scope.isDeclared(qName, false));
+       }
+ 
+-      if (!inferred) {
++      // Fix for issue 586: If a property is already declared (not inferred),
++      // a subsequent assignment (even to a function literal without JSDoc)
++      // should not cause its type status to become 'inferred'.
++      // It should retain its 'declared' status.
++      if (inferred) { // If 'inferred' is still true after the above checks
++        Var qVar = scope.getVar(qName);
++        if (qVar != null && !qVar.isTypeInferred()) {
++          // This means the property 'qName' was already declared
++          // (e.g., via JSDoc or as a named function) and its type
++          // was not inferred. This current assignment should not
++          // change its status to 'inferred'. It maintains 'declared'.
++          inferred = false;
++        }
++      }
++
++      if (!inferred) { // This property is considered declared
+         ObjectType ownerType = getObjectSlot(ownerName);
+         if (ownerType != null) {
+-          // Only declare this as an official property if it has not been
+-          // declared yet.
++          // Only declare this as an official property on the object type
++          // if it has not been declared yet, or if its type was inferred.
++          // If it was already declared (not inferred), we don't redefine its type.
+           boolean isExtern = t.getInput() != null && t.getInput().isExtern();
+           if ((!ownerType.hasOwnProperty(propName) ||
+                ownerType.isPropertyTypeInferred(propName)) &&
+               ((isExtern && !ownerType.isNativeObjectType()) ||
+                !ownerType.isInstanceType())) {
+             // If the property is undeclared or inferred, declare it now.
+             ownerType.defineDeclaredProperty(propName, valueType, n);
+           }
+         }
+ 
+-        // If the property is already declared, the error will be
+-        // caught when we try to declare it in the current scope.
++        // Define the slot (variable) in the current scope.
++        // We need to be careful not to trigger a redeclaration error or
++        // change the status of an already declared variable.
++        Var qVar = scope.getVar(qName);
++        if (qVar == null || qVar.isTypeInferred()) {
++          // If the variable is new, or if it was previously inferred,
++          // then we can declare/update it with the current (declared) type.
+           defineSlot(n, parent, valueType, inferred);
++        } else {
++          // If the variable already exists and is not inferred (i.e., it's already
++          // a declared variable), we do not need to redefine its slot in the scope.
++          // Its type on the ownerType (if applicable) has already been handled above
++          // by potentially skipping defineDeclaredProperty.
++          // This prevents unintended redeclaration errors or type downgrades for
++          // explicitly declared properties upon re-assignment.
++          return;
++        }
+       } else if (rhsValue != null && rhsValue.isTrue()) {
+-        // We declare these for delegate proxy method properties.
++        // This block is for inferred properties that are assigned to 'true'.
++        // It's separate because 'inferred' is true here.
+         FunctionType ownerType =
+             JSType.toMaybeFunctionType(getObjectSlot(ownerName));
+         if (ownerType != null) {
+           JSType ownerTypeOfThis = ownerType.getTypeOfThis();
+           String delegateName = codingConvention.getDelegateSuperclassName();
+           JSType delegateType = delegateName == null ?
+               null : typeRegistry.getType(delegateName);
+           if (delegateType != null &&
+               ownerTypeOfThis.isSubtype(delegateType)) {
+             defineSlot(n, parent, getNativeType(BOOLEAN_TYPE), true);
+           }
+         }
+       }
+     }
+\ No newline at end of file

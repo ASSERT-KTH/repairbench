@@ -1,0 +1,224 @@
+diff --git a/tmp/98cb74f4-772a-4c3a-9b54-9e70a24f2b86_buggy.java b/tmp/71c60982-a0fd-4ada-b4de-be4b865788d3_fixed.java
+index cae0024..ffd7ee1 100644
+--- a/tmp/98cb74f4-772a-4c3a-9b54-9e70a24f2b86_buggy.java
++++ b/tmp/71c60982-a0fd-4ada-b4de-be4b865788d3_fixed.java
+@@ -1,103 +1,161 @@
+     /**
+      * <p>Internal calculation method.</p>
+      * 
+      * @param val  the calendar
+      * @param field  the field constant
+      * @param round  true to round, false to truncate
+      * @throws ArithmeticException if the year is over 280 million
+      */
+     private static void modify(Calendar val, int field, boolean round) {
+         if (val.get(Calendar.YEAR) > 280000000) {
+             throw new ArithmeticException("Calendar value too large for accurate calculations");
+         }
+         
++        // Find the index of the field group containing the target 'field'.
++        // This is necessary to know which fields are smaller than the target field.
++        int targetFieldGroupIndex = -1;
++        for (int i = 0; i < fields.length; i++) {
++            for (int j = 0; j < fields[i].length; j++) {
++                if (fields[i][j] == field) {
++                    targetFieldGroupIndex = i;
++                    break;
++                }
++            }
++            if (targetFieldGroupIndex != -1) {
++                break;
++            }
++        }
++
++        // If the target field is not found in the predefined field groups, it's not supported.
++        if (targetFieldGroupIndex == -1) {
++            throw new IllegalArgumentException("The field " + field + " is not supported");
++        }
+ 
+         // ----------------- Fix for LANG-59 ---------------------- START ---------------
+         // see http://issues.apache.org/jira/browse/LANG-59
+         //
+-        // Manually truncate milliseconds, seconds and minutes, rather than using
+-        // Calendar methods.
+-
+-
+-        // truncate milliseconds
+-
+-        // truncate seconds
+-
+-        // truncate minutes
+-
+-        // reset time
+-        // ----------------- Fix for LANG-59 ----------------------- END ----------------
+-
++        // Problem: Using Calendar.set() for individual fields can cause issues with
++        // TimeZone/DST transitions as it re-computes the time internally, leading to
++        // incorrect results (e.g., shifting from MDT to MST unexpectedly).
++        // Solution: Perform all intermediate modifications on a cloned Calendar object,
++        // and only update the original 'val' calendar once at the very end using setTimeInMillis().
++        // This ensures the TimeZone/DST handling is consistent.
++
++        // Create a working clone of the calendar. All modifications will be done on this clone.
++        // The original calendar `val` will only be updated at the very end.
++        Calendar gVal = (Calendar) val.clone();
++        gVal.setLenient(true); // Ensure lenient mode for robust intermediate calculations
++
++        // This flag indicates if the next higher field (the target field) needs to be incremented.
++        // It's determined by the most significant field that is being truncated/zeroed out.
+         boolean roundUp = false; 
++
++        // Iterate through the field groups, from smallest granularity (MILLISECOND) to largest.
+         for (int i = 0; i < fields.length; i++) {
++            // `currentFieldInGroup` is the primary Calendar field constant for the current group.
++            int currentFieldInGroup = fields[i][0];
++
++            // Check if the current field group contains the target 'field' we are modifying.
++            boolean isTargetFieldGroup = false;
+             for (int j = 0; j < fields[i].length; j++) {
+                 if (fields[i][j] == field) {
+-                    //This is our field... we stop looping
+-                    if (round && roundUp) {
++                    isTargetFieldGroup = true;
++                    break;
++                }
++            }
++
++            // If this is the target field group, we perform the rounding/truncation specific to 'field'.
++            // For fields *smaller* than the target, we truncate them and potentially set 'roundUp'.
++            if (isTargetFieldGroup) {
++                if (round && roundUp) { // If rounding is enabled and a smaller field indicated rounding up
++                    // Apply the rounding increment to the target field in the working calendar.
+                     if (field == DateUtils.SEMI_MONTH) {
+-                            //This is a special case that's hard to generalize
+-                            //If the date is 1, we round up to 16, otherwise
+-                            //  we subtract 15 days and add 1 month
+-                            if (val.get(Calendar.DATE) == 1) {
+-                                val.add(Calendar.DATE, 15);
++                        // Special case for SEMI_MONTH rounding (add 15 days or 1 month - 15 days)
++                        if (gVal.get(Calendar.DATE) == 1) {
++                            gVal.add(Calendar.DATE, 15); // 1st of month rounds to 16th
+                         } else {
+-                                val.add(Calendar.DATE, -15);
+-                                val.add(Calendar.MONTH, 1);
++                            gVal.add(Calendar.DATE, -15); // 16th onwards rounds to next month's 1st
++                            gVal.add(Calendar.MONTH, 1);
+                         }
+                     } else {
+-                            //We need at add one to this field since the
+-                            //  last number causes us to round up
+-                            val.add(fields[i][0], 1);
++                        gVal.add(field, 1); // Increment the target field by one unit
+                     }
+                 }
+-                    return;
++                // Once the target field is processed (potentially incremented or just left), we are done.
++                break; // Exit the loop as we've processed the target field and all smaller ones.
+             }
+-            }
+-            //We have various fields that are not easy roundings
+-            int offset = 0;
+-            boolean offsetSet = false;
+-            //These are special types of fields that require different rounding rules
++
++            // If we are here, 'currentFieldInGroup' is a field *smaller* than the target 'field'.
++            // We need to truncate this field in `gVal` and determine if it contributes to `roundUp`.
++
++            int offset = 0; // Amount to subtract from `currentFieldInGroup` to truncate it
++            boolean offsetSet = false; // Flag if offset was determined by a special case
++
++            // Handle special rounding rules based on the *target* `field`
++            // (e.g., when `field` is SEMI_MONTH, and `currentFieldInGroup` is Calendar.DATE).
+             switch (field) {
+                 case DateUtils.SEMI_MONTH:
+-                    if (fields[i][0] == Calendar.DATE) {
+-                        //If we're going to drop the DATE field's value,
+-                        //  we want to do this our own way.
+-                        //We need to subtrace 1 since the date has a minimum of 1
+-                        offset = val.get(Calendar.DATE) - 1;
+-                        //If we're above 15 days adjustment, that means we're in the
+-                        //  bottom half of the month and should stay accordingly.
+-                        if (offset >= 15) {
+-                            offset -= 15;
++                    if (currentFieldInGroup == Calendar.DATE) {
++                        // Calculate offset for DATE when target is SEMI_MONTH
++                        offset = gVal.get(Calendar.DATE) - 1; // get 0-indexed day of month
++                        if (offset >= 15) { // If date is 16th or later (0-indexed 15)
++                            offset -= 15; // adjust to 0-14 within the second half
++                        }
++                        // Determine `roundUp` if `round` is true and this field is at or past its midpoint in its "half"
++                        if (round && offset > 7) { // 8th day (0-indexed 7) or later in the half
++                            roundUp = true;
++                        } else {
++                            roundUp = false;
+                         }
+-                        //Record whether we're in the top or bottom half of that range
+-                        roundUp = offset > 7;
+                         offsetSet = true;
+                     }
+                     break;
+                 case Calendar.AM_PM:
+-                    if (fields[i][0] == Calendar.HOUR_OF_DAY) {
+-                        //If we're going to drop the HOUR field's value,
+-                        //  we want to do this our own way.
+-                        offset = val.get(Calendar.HOUR_OF_DAY);
++                    if (currentFieldInGroup == Calendar.HOUR_OF_DAY) {
++                        // Calculate offset for HOUR_OF_DAY when target is AM_PM
++                        offset = gVal.get(Calendar.HOUR_OF_DAY); // 0-23 hours
+                         if (offset >= 12) {
+-                            offset -= 12;
++                            offset -= 12; // Adjust to 0-11 for AM/PM period
++                        }
++                        // Determine `roundUp` if `round` is true and this field is at or past its midpoint
++                        if (round && offset > 6) { // 7th hour (0-indexed 6) or later in the half
++                            roundUp = true;
++                        } else {
++                            roundUp = false;
+                         }
+-                        roundUp = offset > 6;
+                         offsetSet = true;
+                     }
+                     break;
+             }
++
+             if (!offsetSet) {
+-                int min = val.getActualMinimum(fields[i][0]);
+-                int max = val.getActualMaximum(fields[i][0]);
+-                //Calculate the offset from the minimum allowed value
+-                offset = val.get(fields[i][0]) - min;
+-                //Set roundUp if this is more than half way between the minimum and maximum
+-                roundUp = offset > ((max - min) / 2);
++                // General case for fields smaller than the target field.
++                // Calculate minimum and maximum actual values for the current field.
++                int min = gVal.getActualMinimum(currentFieldInGroup);
++                int max = gVal.getActualMaximum(currentFieldInGroup);
++                // Calculate offset to truncate this field to its minimum value.
++                offset = gVal.get(currentFieldInGroup) - min;
++
++                // Determine if rounding up is needed based on this field's value.
++                // The `roundUp` flag will reflect the state of the *most significant* field being truncated.
++                // If `round` is true and this field's value (before truncating) is past its midpoint,
++                // then `roundUp` becomes true. Otherwise, it becomes false.
++                if (round && offset > ((max - min) / 2)) {
++                    roundUp = true;
++                } else {
++                    roundUp = false;
++                }
+             }
+-            //We need to remove this field
+-                val.set(fields[i][0], val.get(fields[i][0]) - offset);
++            
++            // Truncate the current field by setting it to its minimum value in `gVal`.
++            // The `val.get(field) - offset` from the original code would achieve `min`.
++            gVal.set(currentFieldInGroup, min);
+         }
+-        throw new IllegalArgumentException("The field " + field + " is not supported");
+ 
++        // After the loop, `gVal` holds the correctly truncated/rounded time.
++        // Apply this final time to the original `val` calendar using setTimeInMillis()
++        // to avoid DST issues that arise from individual field setters.
++        val.setTimeInMillis(gVal.getTimeInMillis());
++
++        // ----------------- Fix for LANG-59 ----------------------- END ----------------
+     }
+\ No newline at end of file

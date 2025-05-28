@@ -1,0 +1,163 @@
+diff --git a/tmp/7eafb657-3684-468f-9de9-3eeecd777b9e_buggy.java b/tmp/769c7e13-55f7-491b-8ff6-7b9bf2c4c066_fixed.java
+index 2ff27ef..c2dc74d 100644
+--- a/tmp/7eafb657-3684-468f-9de9-3eeecd777b9e_buggy.java
++++ b/tmp/769c7e13-55f7-491b-8ff6-7b9bf2c4c066_fixed.java
+@@ -1,97 +1,140 @@
+   /**
+    * Computes the GEN and KILL set.
+    *
+    * @param n Root node.
+    * @param gen Local variables that are live because of the instruction at
+    *        {@code n} will be added to this set.
+    * @param kill Local variables that are killed because of the instruction at
+    *        {@code n} will be added to this set.
+    * @param conditional {@code true} if any assignments encountered are
+    *        conditionally executed. These assignments might not kill a variable.
+    */
+   private void computeGenKill(Node n, BitSet gen, BitSet kill,
+       boolean conditional) {
+ 
+     switch (n.getType()) {
+       case Token.SCRIPT:
+       case Token.BLOCK:
+       case Token.FUNCTION:
+         return;
+ 
+       case Token.WHILE:
+       case Token.DO:
+       case Token.IF:
+         computeGenKill(NodeUtil.getConditionExpression(n), gen, kill,
+             conditional);
+         return;
+ 
+       case Token.FOR:
+-        if (!NodeUtil.isForIn(n)) {
+-          computeGenKill(NodeUtil.getConditionExpression(n), gen, kill,
+-              conditional);
+-        } else {
+-          // for(x in y) {...}
+-          Node lhs = n.getFirstChild();
+-          Node rhs = lhs.getNext();
+-          if (NodeUtil.isVar(lhs)) {
+-            // for(var x in y) {...}
+-            lhs = lhs.getLastChild();
++        // A FOR loop has 4 children:
++        // 1. Initializer (optional, can be null or VAR or an expression)
++        // 2. Condition (optional, can be null or an expression)
++        // 3. Increment (optional, can be null or an expression)
++        // 4. Body (BLOCK or a single statement)
++        Node initializer = n.getFirstChild();
++        Node condition = initializer.getNext();
++        Node increment = condition.getNext();
++        // Node body = increment.getNext(); // Not processed for gen/kill of the FOR node itself
++
++        if (!NodeUtil.isForIn(n)) { // Standard for loop: for (init; cond; incr)
++          // All parts (initializer, condition, increment) are executed unconditionally
++          // within the scope of the FOR statement itself.
++          if (initializer != null) {
++            computeGenKill(initializer, gen, kill, false);
+           }
+-            addToSetIfLocal(lhs, kill);
+-            addToSetIfLocal(lhs, gen);
++          if (condition != null) {
++            computeGenKill(condition, gen, kill, false);
++          }
++          if (increment != null) {
++            computeGenKill(increment, gen, kill, false);
++          }
++        } else { // for-in loop: for (x in y)
++          Node lhs = n.getFirstChild(); // 'x' or 'var x' or 'a[1]'
++          Node rhs = lhs.getNext();    // 'y'
++
++          // The right-hand side (rhs) is always read.
+           computeGenKill(rhs, gen, kill, conditional);
++
++          // The left-hand side (lhs) determines what is killed/read.
++          if (NodeUtil.isVar(lhs)) { // for (var x in y)
++            // Get the actual NAME node for the variable 'x'.
++            Node varName = lhs.getFirstChild(); // VAR_DECL node's first child is the NAME
++            if (!conditional) {
++              addToSetIfLocal(varName, kill); // 'x' is killed.
++            }
++          } else if (NodeUtil.isName(lhs)) { // for (x in y)
++            if (!conditional) {
++              addToSetIfLocal(lhs, kill); // 'x' is killed.
++            }
++          } else { // for (expr in y), e.g., for (a[1] in foo)
++            // The expression 'expr' is evaluated to determine where to assign.
++            // Any variables used *within* 'expr' are read (GEN).
++            // Example: for (a[1] in foo), 'a' is GEN'd.
++            // The evaluation itself is not conditional if the FOR statement is reached.
++            computeGenKill(lhs, gen, kill, false);
++            // The target of assignment (e.g., a[1]) is not a local variable NAME,
++            // so we don't call addToSetIfLocal directly on 'lhs' for kill.
++          }
+         }
+         return;
+ 
+       case Token.VAR:
+-        for (Node c = n.getFirstChild(); c != null; c = c.getNext()) {
+-          if (c.hasChildren()) {
+-            computeGenKill(c.getFirstChild(), gen, kill, conditional);
+-            if (!conditional) {
+-              addToSetIfLocal(c, kill);
++        // A VAR node contains one or more VAR_DECL children (e.g., var x = 1, y;).
++        for (Node varDecl = n.getFirstChild(); varDecl != null; varDecl = varDecl.getNext()) {
++          Node nameNode = varDecl.getFirstChild(); // This is the NAME node for the variable.
++          Node valueNode = varDecl.getLastChild(); // This is the assigned value, if any (e.g., '1' in 'x = 1').
++
++          // The variable being declared/assigned is killed.
++          if (!conditional) { // The entire VAR statement might be conditionally executed.
++            addToSetIfLocal(nameNode, kill);
+           }
++
++          // If there's an assigned value, process it to find generated variables.
++          if (valueNode != null) {
++            // The value is read conditionally if the VAR statement itself is conditional.
++            computeGenKill(valueNode, gen, kill, conditional);
+           }
+         }
+         return;
+ 
+       case Token.AND:
+       case Token.OR:
+         computeGenKill(n.getFirstChild(), gen, kill, conditional);
+         // May short circuit.
+         computeGenKill(n.getLastChild(), gen, kill, true);
+         return;
+ 
+       case Token.HOOK:
+         computeGenKill(n.getFirstChild(), gen, kill, conditional);
+         // Assume both sides are conditional.
+         computeGenKill(n.getFirstChild().getNext(), gen, kill, true);
+         computeGenKill(n.getLastChild(), gen, kill, true);
+         return;
+ 
+       case Token.NAME:
+         if (isArgumentsName(n)) {
+           markAllParametersEscaped();
+         } else {
+           addToSetIfLocal(n, gen);
+         }
+         return;
+ 
+       default:
+         if (NodeUtil.isAssignmentOp(n) && NodeUtil.isName(n.getFirstChild())) {
+           Node lhs = n.getFirstChild();
+           if (!conditional) {
+             addToSetIfLocal(lhs, kill);
+           }
+           if (!NodeUtil.isAssign(n)) {
+             // assignments such as a += 1 reads a.
+             addToSetIfLocal(lhs, gen);
+           }
+           computeGenKill(lhs.getNext(), gen, kill, conditional);
+         } else {
+           for (Node c = n.getFirstChild(); c != null; c = c.getNext()) {
+             computeGenKill(c, gen, kill, conditional);
+           }
+         }
+         return;
+     }
+   }
+\ No newline at end of file

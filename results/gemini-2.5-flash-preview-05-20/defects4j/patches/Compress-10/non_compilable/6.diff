@@ -1,0 +1,100 @@
+diff --git a/tmp/8f3b2a77-d147-4128-983b-edefcc340574_buggy.java b/tmp/6bc2bdc9-9ad4-4f3b-8faa-6d3ccd933b55_fixed.java
+index 85e6a42..9036931 100644
+--- a/tmp/8f3b2a77-d147-4128-983b-edefcc340574_buggy.java
++++ b/tmp/6bc2bdc9-9ad4-4f3b-8faa-6d3ccd933b55_fixed.java
+@@ -1,50 +1,88 @@
+     /**
+      * Walks through all recorded entries and adds the data available
+      * from the local file header.
+      *
+      * <p>Also records the offsets for the data to read from the
+      * entries.</p>
+      */
+     private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                             entriesWithoutUTF8Flag)
+         throws IOException {
+         // changing the name of a ZipArchiveEntry is going to change
+         // the hashcode - see COMPRESS-164
+         // Map needs to be reconstructed in order to keep central
+-        // directory order
+-        for (ZipArchiveEntry ze : entries.keySet()) {
++        // directory order.
++        //
++        // If a ZipArchiveEntry's name changes, its hashCode and equals behavior also change.
++        // If this entry is a key in a HashMap (like 'entries'), the map's internal
++        // structure for that key becomes corrupted. Subsequent lookups (e.g., in
++        // ZipFile.getInputStream) might fail because the entry cannot be found.
++        // To fix this, we need to rebuild the 'entries' map.
++
++        // 1. Create a copy of the keys to iterate over to avoid ConcurrentModificationException
++        //    if we modify the 'entries' map directly within the loop (which we will by clearing/repopulating).
++        //    Also, to ensure the order is preserved for LinkedHashMap.
++        List<ZipArchiveEntry> entriesInOrder = new ArrayList<>(entries.keySet());
++
++        // 2. Create a temporary map to build the corrected set of entries.
++        //    Using LinkedHashMap ensures that the original central directory order is preserved.
++        Map<ZipArchiveEntry, OffsetEntry> tmpEntries = new LinkedHashMap<>(entries.size());
++
++        for (ZipArchiveEntry ze : entriesInOrder) {
++            // Retrieve the OffsetEntry associated with the current ZipArchiveEntry.
++            // This works because 'ze' is the exact instance from the original 'entries.keySet()'.
+             OffsetEntry offsetEntry = entries.get(ze);
++
+             long offset = offsetEntry.headerOffset;
+             archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+             byte[] b = new byte[SHORT];
+             archive.readFully(b);
+             int fileNameLen = ZipShort.getValue(b);
+             archive.readFully(b);
+             int extraFieldLen = ZipShort.getValue(b);
+             int lenToSkip = fileNameLen;
+             while (lenToSkip > 0) {
+                 int skipped = archive.skipBytes(lenToSkip);
+                 if (skipped <= 0) {
+                     throw new RuntimeException("failed to skip file name in"
+                                                + " local file header");
+                 }
+                 lenToSkip -= skipped;
+             }
+             byte[] localExtraData = new byte[extraFieldLen];
+             archive.readFully(localExtraData);
++            // Setting extra fields modifies the ZipArchiveEntry object in place.
+             ze.setExtra(localExtraData);
++
+             offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                 + SHORT + SHORT + fileNameLen + extraFieldLen;
+ 
++            // Store the original name before potential modification
++            String origName = ze.getName();
++
++            // If the entry was identified as potentially having UTF-8 name/comment in extra fields
+             if (entriesWithoutUTF8Flag.containsKey(ze)) {
+-                String orig = ze.getName();
+                 NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
++                // This call might change the name of 'ze' if UTF-8 encoding is found and preferred.
+                 ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                          nc.comment);
+-                if (!orig.equals(ze.getName())) {
+-                    nameMap.remove(orig);
++            }
++
++            // If the name of the entry changed, update the nameMap accordingly.
++            if (!origName.equals(ze.getName())) {
++                nameMap.remove(origName);
+                 nameMap.put(ze.getName(), ze);
+             }
++
++            // Add the (potentially modified) ZipArchiveEntry and its OffsetEntry to the temporary map.
++            // This ensures that the key in the new map correctly reflects the current state of 'ze'
++            // (including its potentially new name and thus new hashCode).
++            tmpEntries.put(ze, offsetEntry);
+         }
+-        }
++
++        // 3. Reconstruct the 'entries' map by clearing the old one and populating it
++        //    with the entries from the temporary map. This corrects any hash-related
++        //    corruption caused by in-place key modification while preserving order.
++        entries.clear();
++        entries.putAll(tmpEntries);
+     }
+\ No newline at end of file

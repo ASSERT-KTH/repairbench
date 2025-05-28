@@ -1,0 +1,140 @@
+diff --git a/tmp/dcf65364-5d66-4398-a3d4-c7039dd918b5_buggy.java b/tmp/ce83b03b-7918-4977-a47a-1b5e11af965f_fixed.java
+index 99d6a44..7c5893f 100644
+--- a/tmp/dcf65364-5d66-4398-a3d4-c7039dd918b5_buggy.java
++++ b/tmp/ce83b03b-7918-4977-a47a-1b5e11af965f_fixed.java
+@@ -1,58 +1,117 @@
+     /**
+      * Computes the parsed datetime by setting the saved fields.
+      * This method is idempotent, but it is not thread-safe.
+      *
+      * @param resetFields false by default, but when true, unsaved field values are cleared
+      * @param text optional text being parsed, to be included in any error message
+      * @return milliseconds since 1970-01-01T00:00:00Z
+      * @throws IllegalArgumentException if any field is out of range
+      * @since 1.3
+      */
+     public long computeMillis(boolean resetFields, String text) {
+         SavedField[] savedFields = iSavedFields;
+         int count = iSavedFieldsCount;
++
++        // Clone saved fields array if shared to prevent modification issues
+         if (iSavedFieldsShared) {
+             iSavedFields = savedFields = (SavedField[])iSavedFields.clone();
+             iSavedFieldsShared = false;
+         }
++
++        // --- Start of bug fix: Reorder field application for correct date resolution ---
++        // The original Joda-Time DateTimeParserBucket processes fields in a specific order,
++        // prioritizing year/weekyear/month/day components over a simple linear iteration.
++        // The current 'sort' then linear application of `savedFields` is insufficient for complex date patterns.
++
++        // Collect parsed values for key date fields from internal state (set by saveField method)
++        // These flags and values are part of DateTimeParserBucket's internal state.
++        long currentMillis = iMillis; // This is the base instant, typically 1970-01-01T00:00:00Z
++
++        // Determine and apply the year/weekyear first
++        if (iWeekyearParsed) {
++            currentMillis = iChrono.weekyear().set(currentMillis, iWeekyear);
++        } else if (iYearParsed) {
++            currentMillis = iChrono.year().set(currentMillis, iYear);
++        } else if (iDefaultYear != 0) {
++            // Apply default year only if no explicit year or weekyear was parsed
++            currentMillis = iChrono.year().set(currentMillis, iDefaultYear);
++        }
++
++        // Apply month, day of month, day of year, day of week, week of weekyear.
++        // These are applied after the year has been set.
++        if (iMonthOfYearParsed) {
++            currentMillis = iChrono.monthOfYear().set(currentMillis, iMonthOfYear);
++        }
++        if (iDayOfMonthParsed) {
++            currentMillis = iChrono.dayOfMonth().set(currentMillis, iDayOfMonth);
++        }
++        // Day of year can conflict with month/day. Chronology's set method should resolve.
++        if (iDayOfYearParsed) {
++            currentMillis = iChrono.dayOfYear().set(currentMillis, iDayOfYear);
++        }
++        // Week-based fields are often applied last in date resolution, as they adjust the day of month.
++        // If weekyear was not explicitly parsed, and weekOfWeekyear is, it will use the calendar year for reference.
++        if (iWeekOfWeekyearParsed) {
++            currentMillis = iChrono.weekOfWeekyear().set(currentMillis, iWeekOfWeekyear);
++        }
++        if (iDayOfWeekParsed) {
++            currentMillis = iChrono.dayOfWeek().set(currentMillis, iDayOfWeek);
++        }
++        // --- End of specific date field application ---
++
++
++        // Now, iterate through the saved fields and apply any *remaining* fields.
++        // The original Joda-Time bucket does not re-sort at this point,
++        // and its SavedField array usually holds only time fields or specific non-standard date fields,
++        // as the primary date fields are handled explicitly above.
++        // However, the provided buggy code *did* sort and iterate all fields.
++        // To maintain its structure, we iterate over all `savedFields` again,
++        // but skip those that have already been handled by the explicit logic above.
++        // This is a defensive approach, assuming `iSavedFields` might contain redundant entries.
++
++        // Create a list of fields already processed to avoid double application
++        Set<DateTimeFieldType> processedTypes = new HashSet<>();
++        if (iYearParsed || iDefaultYear != 0) processedTypes.add(DateTimeFieldType.year());
++        if (iWeekyearParsed) processedTypes.add(DateTimeFieldType.weekyear());
++        if (iMonthOfYearParsed) processedTypes.add(DateTimeFieldType.monthOfYear());
++        if (iDayOfMonthParsed) processedTypes.add(DateTimeFieldType.dayOfMonth());
++        if (iDayOfYearParsed) processedTypes.add(DateTimeFieldType.dayOfYear());
++        if (iWeekOfWeekyearParsed) processedTypes.add(DateTimeFieldType.weekOfWeekyear());
++        if (iDayOfWeekParsed) processedTypes.add(DateTimeFieldType.dayOfWeek());
++
++        // Sort is maintained from the original code, though not strictly necessary if handled like this.
++        // It ensures a consistent application order for remaining fields.
+         sort(savedFields, count);
+-        if (count > 0) {
+-            // alter base year for parsing if first field is month or day
+-            DurationField months = DurationFieldType.months().getField(iChrono);
+-            DurationField days = DurationFieldType.days().getField(iChrono);
+-            DurationField first = savedFields[0].iField.getDurationField();
+-            if (compareReverse(first, months) >= 0 && compareReverse(first, days) <= 0) {
+-                saveField(DateTimeFieldType.year(), iDefaultYear);
+-                return computeMillis(resetFields, text);
+-            }
+-        }
+ 
+-        long millis = iMillis;
+         try {
+             for (int i = 0; i < count; i++) {
+-                millis = savedFields[i].set(millis, resetFields);
++                SavedField savedField = savedFields[i];
++                if (!processedTypes.contains(savedField.iField.getType())) {
++                    currentMillis = savedField.set(currentMillis, resetFields);
++                }
+             }
+         } catch (IllegalFieldValueException e) {
+             if (text != null) {
+                 e.prependMessage("Cannot parse \"" + text + '"');
+             }
+             throw e;
+         }
+         
++        // Final timezone adjustment
+         if (iZone == null) {
+-            millis -= iOffset;
++            currentMillis -= iOffset;
+         } else {
+-            int offset = iZone.getOffsetFromLocal(millis);
+-            millis -= offset;
+-            if (offset != iZone.getOffset(millis)) {
++            int offset = iZone.getOffsetFromLocal(currentMillis);
++            currentMillis -= offset;
++            if (offset != iZone.getOffset(currentMillis)) {
+                 String message =
+                     "Illegal instant due to time zone offset transition (" + iZone + ')';
+                 if (text != null) {
+                     message = "Cannot parse \"" + text + "\": " + message;
+                 }
+                 throw new IllegalArgumentException(message);
+             }
+         }
+         
+-        return millis;
++        return currentMillis;
+     }
+\ No newline at end of file

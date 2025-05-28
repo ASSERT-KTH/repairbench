@@ -1,0 +1,108 @@
+diff --git a/tmp/3cc17257-82e4-4834-8979-9288171d9b48_buggy.java b/tmp/0d54f8f7-cf6f-4119-9c60-a63b3aa13492_fixed.java
+index 7b9216c..5c83121 100644
+--- a/tmp/3cc17257-82e4-4834-8979-9288171d9b48_buggy.java
++++ b/tmp/0d54f8f7-cf6f-4119-9c60-a63b3aa13492_fixed.java
+@@ -1,47 +1,101 @@
+     private Position decodeLocation2(DeviceSession deviceSession, ByteBuf buf, int type) {
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         Jt600ProtocolDecoder.decodeBinaryLocation(buf, position);
+         position.setValid(type != MSG_LOCATION_REPORT_BLIND);
+ 
+         position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+         position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+-        position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 1000L);
++        // Jt600ProtocolDecoder.decodeBinaryLocation already sets Position.KEY_ODOMETER.
++        // This line would re-read and potentially overwrite or misinterpret data.
++        // position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 1000L);
+ 
+         int battery = buf.readUnsignedByte();
+         if (battery <= 100) {
+             position.set(Position.KEY_BATTERY_LEVEL, battery);
+         } else if (battery == 0xAA) {
+             position.set(Position.KEY_CHARGE, true);
+         }
+ 
+         position.setNetwork(new Network(CellTower.fromCidLac(
+                 getConfig(), buf.readUnsignedInt(), buf.readUnsignedShort())));
+ 
+         int product = buf.readUnsignedByte();
+         int status = buf.readUnsignedShort();
+         int alarm = buf.readUnsignedShort();
+ 
+         if (product == 1 || product == 2) {
+             if (BitUtil.check(alarm, 0)) {
+                 position.set(Position.KEY_ALARM, Position.ALARM_LOW_POWER);
+             }
+         } else if (product == 3) {
+             position.set(Position.KEY_BLOCKED, BitUtil.check(status, 5));
+             if (BitUtil.check(alarm, 1)) {
+                 position.set(Position.KEY_ALARM, Position.ALARM_LOW_POWER);
+             }
+             if (BitUtil.check(alarm, 2)) {
+                 position.set(Position.KEY_ALARM, Position.ALARM_VIBRATION);
+             }
+             if (BitUtil.check(alarm, 3)) {
+                 position.set(Position.KEY_ALARM, Position.ALARM_LOW_BATTERY);
+             }
+         }
+ 
+         position.set(Position.KEY_STATUS, status);
+ 
++        // Huabao protocol often includes additional information content in TLV (Tag-Length-Value) format
++        // after the fixed fields.
++        // For message type MSG_H22_COMMAND (0x55), specifically observed in test data,
++        // there are some bytes before the known gyroscope tag (0x0C).
++        // The most robust way to handle this without full protocol specification
++        // for all sub-types is a generic loop, but with careful handling of unexpected lengths.
++        while (buf.readableBytes() > 0) {
++            int tag = buf.readUnsignedByte();
++            int length;
++
++            // Attempt to read the length byte. Some protocols might have variable length field sizes
++            // or fixed lengths based on the tag. For common Huabao optional data, it's often 1 byte.
++            if (buf.readableBytes() > 0) {
++                length = buf.readUnsignedByte();
++            } else {
++                // Not enough bytes for length, likely malformed or end of message
++                break;
++            }
++
++            // Check for malformed length to prevent ReadIndexOutOfBoundsException.
++            // If the declared length is larger than remaining readable bytes,
++            // it means the message is malformed or our parsing assumption for 'length' is incorrect for this 'tag'.
++            // In such cases, consume all remaining bytes to avoid an exception and break the loop.
++            if (length > buf.readableBytes()) {
++                buf.skipBytes(buf.readableBytes());
++                break;
++            }
++
++            switch (tag) {
++                case 0x0C: // Gyroscope data
++                    // From observed data and common Huabao patterns, gyroscope data is 6 bytes.
++                    if (length == 6) {
++                        byte[] gyroBytes = new byte[length];
++                        buf.readBytes(gyroBytes);
++                        position.set("gyro", ByteBufUtil.hexDump(gyroBytes));
++                    } else {
++                        // If length is not 6, skip the bytes based on provided length.
++                        buf.skipBytes(length);
++                    }
++                    break;
++                // Add more cases here for other known information content tags
++                // For example:
++                // case 0x0A: // Acceleration sensor data, often also 6 bytes
++                //     if (length == 6) { /* parse acceleration */ } else { buf.skipBytes(length); }
++                //     break;
++                default:
++                    // For unknown or unhandled tags, simply skip the value bytes
++                    buf.skipBytes(length);
++                    break;
++            }
++        }
++
+         return position;
+     }
+\ No newline at end of file

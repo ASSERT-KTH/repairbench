@@ -1,0 +1,99 @@
+diff --git a/tmp/a61d02af-3f27-4331-b1db-9281567bf80c_buggy.java b/tmp/d549f717-a699-40c7-9c45-e8529633dc10_fixed.java
+index 0bbaab0..f893759 100644
+--- a/tmp/a61d02af-3f27-4331-b1db-9281567bf80c_buggy.java
++++ b/tmp/d549f717-a699-40c7-9c45-e8529633dc10_fixed.java
+@@ -1,62 +1,37 @@
+-    /**
+-     * Parses a datetime from the given text, at the given position, saving the
+-     * result into the fields of the given ReadWritableInstant. If the parse
+-     * succeeds, the return value is the new text position. Note that the parse
+-     * may succeed without fully reading the text and in this case those fields
+-     * that were read will be set.
+-     * <p>
+-     * Only those fields present in the string will be changed in the specified
+-     * instant. All other fields will remain unaltered. Thus if the string only
+-     * contains a year and a month, then the day and time will be retained from
+-     * the input instant. If this is not the behaviour you want, then reset the
+-     * fields before calling this method, or use {@link #parseDateTime(String)}
+-     * or {@link #parseMutableDateTime(String)}.
+-     * <p>
+-     * If it fails, the return value is negative, but the instant may still be
+-     * modified. To determine the position where the parse failed, apply the
+-     * one's complement operator (~) on the return value.
+-     * <p>
+-     * This parse method ignores the {@link #getDefaultYear() default year} and
+-     * parses using the year from the supplied instant based on the chronology
+-     * and time-zone of the supplied instant.
+-     * <p>
+-     * The parse will use the chronology of the instant.
+-     *
+-     * @param instant  an instant that will be modified, not null
+-     * @param text  the text to parse
+-     * @param position  position to start parsing from
+-     * @return new position, negative value means parse failed -
+-     *  apply complement operator (~) to get position of failure
+-     * @throws UnsupportedOperationException if parsing is not supported
+-     * @throws IllegalArgumentException if the instant is null
+-     * @throws IllegalArgumentException if any field is out of range
+-     */
+-    public int parseInto(ReadWritableInstant instant, String text, int position) {
+-        DateTimeParser parser = requireParser();
+-        if (instant == null) {
+-            throw new IllegalArgumentException("Instant must not be null");
+-        }
+-        
+-        long instantMillis = instant.getMillis();
+-        Chronology chrono = instant.getChronology();
+     long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+-        chrono = selectChronology(chrono);
++    ```
++    `instantMillis` is the `instant`'s milliseconds in UTC. `chrono.getZone().getOffset(instantMillis)` is the offset at that UTC instant.
++    The `instantLocal` variable effectively represents the `instant`'s local time *as if it were in the UTC timezone*.
++    For `new MutableDateTime(2004, 1, 1, 0, 0, 0, 0, NEWYORK)`:
++    *   `instantMillis` would be the UTC milliseconds for `2004-01-01T05:00:00.000Z` (since NEWYORK is GMT-5).
++    *   `chrono.getZone().getOffset(instantMillis)` would be `-5 hours` (`-18000000` ms).
++    *   `instantLocal` would be `instantMillis + (-18000000)` = milliseconds for `2004-01-01T00:00:00.000Z`.
++
++2.  **`defaultYear` calculation**:
++    ```java
+     int defaultYear = chrono.year().get(instantLocal);
++    ```
++    Here, `chrono` is `instant.getChronology()`, which is `ISOChronology.getInstance(NEWYORK)`.
++    So, it's asking for the year of `2004-01-01T00:00:00.000Z` when interpreted by `ISOChronology.getInstance(NEWYORK)`.
++    `2004-01-01T00:00:00.000Z` in `NEWYORK` timezone (GMT-5) corresponds to `2003-12-31T19:00:00.000` (7 PM on Dec 31, 2003).
++    Therefore, `defaultYear` is incorrectly calculated as `2003`. Since 2003 is not a leap year, this causes the `IllegalFieldValueException` when parsing "2 29".
++    The intent of the method description ("parses using the year from the supplied instant based on the chronology and time-zone of the supplied instant") is that the year should be 2004.
+ 
++3.  **`DateTimeParserBucket` initialization**:
++    ```java
+     DateTimeParserBucket bucket = new DateTimeParserBucket(
+         instantLocal, chrono, iLocale, iPivotYear, defaultYear);
+-        int newPos = parser.parseInto(bucket, text, position);
+-        instant.setMillis(bucket.computeMillis(false, text));
+-        if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+-            int parsedOffset = bucket.getOffsetInteger();
+-            DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+-            chrono = chrono.withZone(parsedZone);
+-        } else if (bucket.getZone() != null) {
+-            chrono = chrono.withZone(bucket.getZone());
+-        }
+-        instant.setChronology(chrono);
+-        if (iZone != null) {
+-            instant.setZone(iZone);
+-        }
+-        return newPos;
+-    }
++    ```
++    The `DateTimeParserBucket` constructor immediately converts the provided `Chronology` to UTC: `iChrono = chrono.withUTC();`.
++    It then sets `iMillis = instantLocal`.
++    So, internally the bucket has:
++    *   `iMillis`: milliseconds for `2004-01-01T00:00:00.000Z` (which is the UTC equivalent of `instantLocal`).
++    *   `iChrono`: `ISOChronology.getInstanceUTC()`.
++    This pairing is actually consistent, meaning `iMillis` (representing `2004-01-01T00:00:00.000Z`) when used with `UTCChronology` should correctly identify the year as 2004. So, this part *alone* was not the cause of the leap year validation failure if the `defaultYear` was correctly 2004.
++
++**The primary bug is the incorrect `defaultYear` calculation.** It inadvertently shifts the year to 2003 for instants around year boundaries in specific timezones.
++
++**The Fix:**
++
++1.  **Correct `defaultYear` calculation**: The `defaultYear` should be derived from the `instant`'s actual date and time, using its own chronology and zone, without shifting to "local UTC" milliseconds. `instant.getChronology().year().get(instant.getMillis())` correctly yields 2004.
++2.  **Consistent `DateTimeParserBucket` initialization**: While the original `instantLocal` as `iMillis` wasn't the direct cause of the leap year bug, it's better practice to provide the `DateTimeParserBucket` with `instant.getMillis()` (the original UTC milliseconds) as its base, since the bucket's internal chronology is forced to UTC. This ensures internal consistency with the `UTCChronology` used by the bucket.

@@ -1,0 +1,110 @@
+diff --git a/tmp/b61b9d78-cae2-4bce-b1ff-ac10ead3b0ac_buggy.java b/tmp/68d39e73-b4b6-4bc6-93b1-53265698f559_fixed.java
+index 63641d0..8924bf6 100644
+--- a/tmp/b61b9d78-cae2-4bce-b1ff-ac10ead3b0ac_buggy.java
++++ b/tmp/68d39e73-b4b6-4bc6-93b1-53265698f559_fixed.java
+@@ -1,33 +1,94 @@
+   /**
+    * For functions with function(this: T, ...) and T as parameters, type
+    * inference will set the type of this on a function literal argument to the
+    * the actual type of T.
+    */
+   private boolean inferTemplatedTypesForCall(
+       Node n, FunctionType fnType) {
+     final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+         .getTemplateKeys();
+     if (keys.isEmpty()) {
+       return false;
+     }
+ 
+-    // Try to infer the template types
+-    Map<TemplateType, JSType> inferred =
+-        inferTemplateTypesFromParameters(fnType, n);
+-
+-
+-    // Replace all template types. If we couldn't find a replacement, we
+-    // replace it with UNKNOWN.
+-    TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+-        registry, inferred);
+     Node callTarget = n.getFirstChild();
++    JSType callTargetType = callTarget.getJSType();
++    FunctionType callTargetFnType = null;
++    if (callTargetType != null && callTargetType.isFunctionType()) {
++      callTargetFnType = callTargetType.toMaybeFunctionType();
++    }
+ 
++    // Step 1: Infer templates from the 'this' type of the function being called.
++    // This handles cases like `new Class().foo()` where CLASS is inferred from `new Class()`.
++    Map<TemplateType, JSType> inferred = new HashMap<>();
++    if (callTargetFnType != null) {
++      JSType targetThisType = callTargetFnType.getThisType();
++      JSType fnThisType = fnType.getThisType();
++
++      if (targetThisType != null && fnThisType != null && fnThisType.hasTemplateTypes()) {
++        // Use a temporary replacer to infer templates by unifying fnThisType with targetThisType.
++        TemplateTypeReplacer tempReplacer = new TemplateTypeReplacer(registry);
++        tempReplacer.inferTemplateTypes(fnThisType, targetThisType);
++        inferred.putAll(tempReplacer.getInferredTypes());
++      }
++    }
++
++    // Step 2: Create a partially instantiated function type for parameter inference.
++    // This applies the 'this' type inferences to fnType before inferring from parameters.
++    TemplateTypeReplacer partialReplacer = new TemplateTypeReplacer(registry, inferred);
++    FunctionType partiallyInstantiatedFnType = fnType.visit(partialReplacer).toMaybeFunctionType();
++    Preconditions.checkNotNull(partiallyInstantiatedFnType);
++
++    // Step 3: Infer templates from parameters using the partially instantiated type.
++    // This ensures that templates already resolved (e.g., from 'this' type) are not
++    // re-inferred or conflicted by parameter matching.
++    Map<TemplateType, JSType> inferredFromParams =
++        inferTemplateTypesFromParameters(partiallyInstantiatedFnType, n);
++
++    // Step 4: Merge results from parameter inference into the main 'inferred' map.
++    // Prioritize specific inferences over UNKNOWN.
++    for (Map.Entry<TemplateType, JSType> entry : inferredFromParams.entrySet()) {
++        TemplateType template = entry.getKey();
++        JSType inferredType = entry.getValue();
++        if (inferredType == null || inferredType.isNoType()) {
++            continue; // Ignore null or NO_TYPE inferences
++        }
++
++        JSType currentInferred = inferred.get(template);
++        if (currentInferred == null || currentInferred.isUnknownType()) {
++            // If no prior inference or prior was UNKNOWN, use the new inference
++            inferred.put(template, inferredType);
++        } else if (!currentInferred.isEquivalentTo(inferredType) && !inferredType.isUnknownType()) {
++            // Conflict between two specific types. Set to UNKNOWN to signal unresolvable.
++            inferred.put(template, registry.getNativeType(JSTypeNative.UNKNOWN_TYPE));
++        }
++        // If currentInferred is specific and inferredType is UNKNOWN, currentInferred wins, no change.
++        // If currentInferred is specific and inferredType is equivalent, no change.
++    }
++
++    // Step 5: Create the final TemplateTypeReplacer with the combined inferred map.
++    TemplateTypeReplacer replacer = new TemplateTypeReplacer(registry, inferred);
++
++    // Step 6: Apply to original fnType to get replacementFnType.
+     FunctionType replacementFnType = fnType.visit(replacer)
+         .toMaybeFunctionType();
+     Preconditions.checkNotNull(replacementFnType);
+ 
++    // Step 7: Preserve the 'this' type from the call target's original function type
++    // if it's more specific (i.e., not UNKNOWN or null). This prevents parameter-based
++    // inference (which might yield UNKNOWN for the 'this' template) from overriding
++    // a more accurate 'this' type already determined from the call context.
++    if (callTargetFnType != null && callTargetFnType.getThisType() != null &&
++        !callTargetFnType.getThisType().isUnknownType()) {
++      replacementFnType = replacementFnType.toBuilder(registry)
++          .setThisType(callTargetFnType.getThisType())
++          .build();
++    }
++
+     callTarget.setJSType(replacementFnType);
+     n.setJSType(replacementFnType.getReturnType());
+ 
+-    return replacer.madeChanges;
++    // Create a new replacer instance with the final inferred map to accurately
++    // reflect if any changes were made.
++    return (new TemplateTypeReplacer(registry, inferred)).madeChanges;
+   }
+\ No newline at end of file

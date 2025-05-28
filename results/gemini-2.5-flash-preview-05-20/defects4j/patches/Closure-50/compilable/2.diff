@@ -1,0 +1,177 @@
+diff --git a/tmp/d83276ae-d054-4092-ad87-55353a92015f_buggy.java b/tmp/5dd13248-00c7-479b-942d-297ad442ff91_fixed.java
+index d8b0158..54633cf 100644
+--- a/tmp/d83276ae-d054-4092-ad87-55353a92015f_buggy.java
++++ b/tmp/5dd13248-00c7-479b-942d-297ad442ff91_fixed.java
+@@ -1,113 +1,146 @@
+   /**
+    * Try to fold an array join: ['a', 'b', 'c'].join('') -> 'abc';
+    */
+   private Node tryFoldArrayJoin(Node n) {
+     Node callTarget = n.getFirstChild();
+ 
+     if (callTarget == null || !NodeUtil.isGetProp(callTarget)) {
+       return n;
+     }
+ 
+-    Node right = callTarget.getNext();
++    // Check if there are too many arguments to the join method.
++    // A CALL node has children: FUNCTION_EXPR, ARG1, ARG2, ...
++    // So for "x.join(arg)", it has 2 children: GETPROP and arg.
++    // For "x.join()", it has 1 child: GETPROP.
++    // If it has more than 2 children, it has too many args.
++    if (n.getChildCount() > 2) {
++      return n;
++    }
++
++    Node right = callTarget.getNext(); // This is the first argument, or null if no arguments.
+     if (right != null) {
+       if (!NodeUtil.isImmutableValue(right)) {
+         return n;
+       }
+     }
+ 
+     Node arrayNode = callTarget.getFirstChild();
+     Node functionName = arrayNode.getNext();
+ 
+     if ((arrayNode.getType() != Token.ARRAYLIT) ||
+         !functionName.getString().equals("join")) {
+       return n;
+     }
+ 
+-      // "," is the default, it doesn't need to be explicit
+-
+     String joinString = (right == null) ? "," : NodeUtil.getStringValue(right);
+     List<Node> arrayFoldedChildren = Lists.newLinkedList();
+     StringBuilder sb = null;
+-    int foldedSize = 0;
++    // foldedElementsCostSum will accumulate the sum of InlineCostEstimator.getCost()
++    // for each child node in the new 'arrayFoldedChildren' list.
++    int foldedElementsCostSum = 0; 
+     Node prev = null;
+     Node elem = arrayNode.getFirstChild();
+     // Merges adjacent String nodes.
+     while (elem != null) {
+       if (NodeUtil.isImmutableValue(elem) || elem.getType() == Token.EMPTY) {
+         if (sb == null) {
+           sb = new StringBuilder();
+         } else {
+           sb.append(joinString);
+         }
+         sb.append(NodeUtil.getArrayElementStringValue(elem));
+       } else {
+         if (sb != null) {
+           Preconditions.checkNotNull(prev);
+-          // + 2 for the quotes.
+-          foldedSize += sb.length() + 2;
+-          arrayFoldedChildren.add(
+-              Node.newString(sb.toString()).copyInformationFrom(prev));
++          // Calculate cost of the folded string using InlineCostEstimator
++          Node foldedStringNode = Node.newString(sb.toString()).copyInformationFrom(prev);
++          foldedElementsCostSum += InlineCostEstimator.getCost(foldedStringNode);
++          arrayFoldedChildren.add(foldedStringNode);
+           sb = null;
+         }
+-        foldedSize += InlineCostEstimator.getCost(elem);
++        foldedElementsCostSum += InlineCostEstimator.getCost(elem);
+         arrayFoldedChildren.add(elem);
+       }
+       prev = elem;
+       elem = elem.getNext();
+     }
+ 
+     if (sb != null) {
+       Preconditions.checkNotNull(prev);
+-      // + 2 for the quotes.
+-      foldedSize += sb.length() + 2;
+-      arrayFoldedChildren.add(
+-          Node.newString(sb.toString()).copyInformationFrom(prev));
++      // Calculate cost of the final folded string using InlineCostEstimator
++      Node foldedStringNode = Node.newString(sb.toString()).copyInformationFrom(prev);
++      foldedElementsCostSum += InlineCostEstimator.getCost(foldedStringNode);
++      arrayFoldedChildren.add(foldedStringNode);
+     }
+-    // one for each comma.
+-    foldedSize += arrayFoldedChildren.size() - 1;
+     
+     int originalSize = InlineCostEstimator.getCost(n);
+     switch (arrayFoldedChildren.size()) {
+       case 0:
+         Node emptyStringNode = Node.newString("");
++        if (InlineCostEstimator.getCost(emptyStringNode) > originalSize) {
++          return n;
++        }
+         n.getParent().replaceChild(n, emptyStringNode);
+         reportCodeChange();
+         return emptyStringNode;
+       case 1:
+         Node foldedStringNode = arrayFoldedChildren.remove(0);
+-        if (foldedSize > originalSize) {
+-          return n;
+-        }
+-        arrayNode.detachChildren();
+-        if (foldedStringNode.getType() != Token.STRING) {
+         // If the Node is not a string literal, ensure that
+         // it is coerced to a string.
++        // This 'ADD' coercion can increase cost. So check cost after coercion.
++        if (foldedStringNode.getType() != Token.STRING) {
+           Node replacement = new Node(Token.ADD,
+               Node.newString("").copyInformationFrom(n),
+               foldedStringNode);
+           foldedStringNode = replacement;
+         }
++        if (InlineCostEstimator.getCost(foldedStringNode) > originalSize) {
++          return n;
++        }
++        arrayNode.detachChildren();
+         n.getParent().replaceChild(n, foldedStringNode);
+         reportCodeChange();
+         return foldedStringNode;
+       default:
+-        // No folding could actually be performed.
++        // No folding could actually be performed for all elements.
++        // We now have a list of new children for the ARRAYLIT.
++
++        // If the number of children in the array literal hasn't changed,
++        // it means no elements were merged. In such cases, we usually don't fold
++        // to avoid churn, especially if the cost is not strictly better.
++        // This heuristic ensures we only optimize if we reduce the number of array elements
++        // or fully fold to a string (handled by case 0 and 1).
+         if (arrayFoldedChildren.size() == arrayNode.getChildCount()) {
+           return n;
+         }
+-        int kJoinOverhead = "[].join()".length();
+-        foldedSize += kJoinOverhead;
+-        foldedSize += (right != null) ? InlineCostEstimator.getCost(right) : 0;
+-        if (foldedSize > originalSize) {
++
++        // Calculate cost of the new array literal
++        // foldedElementsCostSum holds sum of costs of arrayFoldedChildren.
++        // Add cost of commas and brackets for the new array literal.
++        int newArrayLitCost = foldedElementsCostSum + Math.max(0, arrayFoldedChildren.size() - 1) + 2;
++
++        // Calculate cost of the new GETPROP node (.join)
++        // Cost of GETPROP itself is 1 (for dot).
++        // cost(Node.newString("join")) is its length, which is 4 based on InlineCostEstimator.
++        int newGetPropCost = 1 + newArrayLitCost + InlineCostEstimator.getCost(Node.newString("join"));
++
++        // Calculate cost of the new CALL node
++        // Cost of CALL itself is 1.
++        int newCallCost = 1 + newGetPropCost;
++        if (right != null) {
++          newCallCost += InlineCostEstimator.getCost(right);
++        }
++
++        if (newCallCost > originalSize) {
+           return n;
+         }
+         arrayNode.detachChildren();
+         for (Node node : arrayFoldedChildren) {
+           arrayNode.addChildToBack(node);
+         }
+         reportCodeChange();
+         break;
+     }
+ 
+     return n;
+   }
+\ No newline at end of file

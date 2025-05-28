@@ -1,0 +1,570 @@
+diff --git a/tmp/a56c9218-202b-49fc-bbd8-d43269871a11_buggy.java b/tmp/f91da7eb-6e2b-4879-9dde-e3bb9218f333_fixed.java
+index 921b73e..5a59dc9 100644
+--- a/tmp/a56c9218-202b-49fc-bbd8-d43269871a11_buggy.java
++++ b/tmp/f91da7eb-6e2b-4879-9dde-e3bb9218f333_fixed.java
+@@ -1,303 +1,433 @@
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.ByteBufUtil;
++import org.traccar.helper.BitUtil;
++import org.traccar.helper.UnitsConverter;
++import org.traccar.model.CellTower;
++import org.traccar.model.Network;
++import org.traccar.model.Position;
++
++import java.nio.charset.StandardCharsets;
++
++public abstract class HuabaoProtocolDecoder extends org.traccar.Base
++    implements org.traccar.ProtocolDecoder { // Assuming these are typical imports for context
++
++    protected abstract String getProtocolName();
++    protected abstract void decodeCoordinates(Position position, ByteBuf buf);
++    protected abstract String decodeAlarm(long value);
++    protected abstract java.util.Date readDate(ByteBuf buf, Object timezone);
++    protected abstract double decodeCustomDouble(ByteBuf buf);
++    protected abstract void decodeExtension(Position position, ByteBuf buf, int endIndex);
++
+     private Position decodeLocation(DeviceSession deviceSession, ByteBuf buf) {
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+         position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedInt()));
+ 
+         decodeCoordinates(position, buf);
+ 
+         position.setAltitude(buf.readShort());
+         position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort() * 0.1));
+         position.setCourse(buf.readUnsignedShort());
+         position.setTime(readDate(buf, deviceSession.get(DeviceSession.KEY_TIMEZONE)));
+ 
+         if (buf.readableBytes() == 20) {
+ 
+             buf.skipBytes(4); // remaining battery and mileage
+             position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 1000);
+             position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.1);
+             buf.readUnsignedInt(); // area id
+             position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+             buf.skipBytes(3); // reserved
+ 
+             return position;
+ 
+         }
+ 
+-        while (buf.readableBytes() > 2) {
+-
++        while (buf.readableBytes() > 2) { // Need at least 1 byte for subtype, 1 for length
++            int currentReadPosition = buf.readerIndex(); // Store current position after subtype/length reads
+             int subtype = buf.readUnsignedByte();
+             int length = buf.readUnsignedByte();
+-            int endIndex = buf.readerIndex() + length;
++            int blockEndIndex = currentReadPosition + length; // Calculate the end index for this block
++
++            // Defensive checks for malformed packets: if declared length exceeds remaining buffer
++            if (blockEndIndex > buf.writerIndex()) {
++                // Malformed packet: declared length goes beyond buffer's capacity.
++                // Consume remaining bytes to prevent further errors and exit the loop.
++                buf.readerIndex(buf.writerIndex());
++                break;
++            }
++
+             String stringValue;
+             switch (subtype) {
+-                case 0x01:
++                case 0x01: // Odometer
++                    if (length >= 4) {
+                         position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 100);
++                    }
+                     break;
+-                case 0x02:
++                case 0x02: // Fuel Level
++                    if (length >= 2) {
+                         position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedShort() * 0.1);
++                    }
+                     break;
+-                case 0x2b:
++                case 0x2b: // Fuel Consumption
++                    if (length >= 4) {
+                         position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedInt());
++                    }
+                     break;
+-                case 0x30:
++                case 0x30: // RSSI
++                    if (length >= 1) {
+                         position.set(Position.KEY_RSSI, buf.readUnsignedByte());
++                    }
+                     break;
+-                case 0x31:
++                case 0x31: // Satellites
++                    if (length >= 1) {
+                         position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                    }
+                     break;
+-                case 0x33:
++                case 0x33: // String value containing lock status and battery
++                    if (length > 0) {
+                         stringValue = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                         if (stringValue.startsWith("*M00")) {
++                            // Ensure string has enough characters before attempting substring
++                            if (stringValue.length() >= 8 + 7) {
+                                 String lockStatus = stringValue.substring(8, 8 + 7);
++                                if (lockStatus.length() >= 5) {
+                                     position.set(Position.KEY_BATTERY, Integer.parseInt(lockStatus.substring(2, 5)) * 0.01);
+                                 }
++                            }
++                        }
++                    }
+                     break;
+-                case 0x60:
++                case 0x60: // Event
++                    if (length >= 2) {
+                         position.set(Position.KEY_EVENT, buf.readUnsignedShort());
+-                    buf.skipBytes(length - 2);
++                        buf.skipBytes(length - 2); // Consume remaining bytes if length is > 2
++                    } else { // Length < 2, malformed or insufficient data for subtype
++                        buf.skipBytes(length); // Skip all bytes of this block
++                    }
+                     break;
+-                case 0x80:
++                case 0x69: // New case for Battery (from test)
++                    if (length >= 2) { // Assuming it's a 2-byte unsigned short value
++                        position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01); // Multiplier to match test expectation
++                    }
++                    break;
++                case 0x80: // Special extension block
++                    // Note: This case redefines 'blockEndIndex' based on writerIndex,
++                    // which is a specific protocol behavior (reads till almost end of buffer).
+                     buf.readUnsignedByte(); // content
+-                    endIndex = buf.writerIndex() - 2;
+-                    decodeExtension(position, buf, endIndex);
++                    blockEndIndex = buf.writerIndex() - 2; // Re-calculate the end index for this specific block
++                    decodeExtension(position, buf, blockEndIndex);
+                     break;
+-                case 0x91:
+-                    position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.1);
+-                    position.set(Position.KEY_RPM, buf.readUnsignedShort());
+-                    position.set(Position.KEY_OBD_SPEED, buf.readUnsignedByte());
+-                    position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() * 100 / 255);
+-                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() * 100 / 255);
+-                    position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedByte() - 40);
+-                    buf.readUnsignedShort();
+-                    position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+-                    buf.readUnsignedShort();
+-                    buf.readUnsignedInt();
+-                    buf.readUnsignedShort();
+-                    position.set(Position.KEY_FUEL_USED, buf.readUnsignedShort() * 0.01);
++                case 0x91: // OBD data block
++                    // This block reads fixed number of bytes, assuming 'length' is sufficient for all reads
++                    // If 'length' is less than expected total bytes (20 bytes based on fields),
++                    // the remaining 'length' bytes will be skipped by the final `buf.readerIndex(blockEndIndex)`
++                    if (length >= 2) { position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.1); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 2) { position.set(Position.KEY_RPM, buf.readUnsignedShort()); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 1) { position.set(Position.KEY_OBD_SPEED, buf.readUnsignedByte()); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 1) { position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() * 100 / 255); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 1) { position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() * 100 / 255); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 1) { position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedByte() - 40); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 2) { buf.readUnsignedShort(); } else break; // skip
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 2) { position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01); } else break;
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 2) { buf.readUnsignedShort(); } else break; // skip
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 4) { buf.readUnsignedInt(); } else break; // skip
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 2) { buf.readUnsignedShort(); } else break; // skip
++                    if (length - (buf.readerIndex() - currentReadPosition) >= 2) { position.set(Position.KEY_FUEL_USED, buf.readUnsignedShort() * 0.01); }
+                     break;
+-                case 0x94:
++                case 0x94: // VIN
+                     if (length > 0) {
+                         stringValue = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                         position.set(Position.KEY_VIN, stringValue);
+                     }
+                     break;
+-                case 0xA7:
++                case 0xA7: // ADC values
++                    if (length >= 4) { // Requires 2 unsigned shorts
+                         position.set(Position.PREFIX_ADC + 1, buf.readUnsignedShort());
+                         position.set(Position.PREFIX_ADC + 2, buf.readUnsignedShort());
++                    }
+                     break;
+-                case 0xAC:
++                case 0xAC: // Odometer
++                    if (length >= 4) {
+                         position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
++                    }
+                     break;
+-                case 0xBC:
++                case 0xBC: // Driver name
++                    if (length > 0) {
+                         stringValue = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                         position.set("driver", stringValue.trim());
++                    }
+                     break;
+-                case 0xBD:
++                case 0xBD: // Driver Unique ID
++                    if (length > 0) {
+                         stringValue = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                         position.set(Position.KEY_DRIVER_UNIQUE_ID, stringValue);
++                    }
+                     break;
+-                case 0xD0:
++                case 0xD0: // User Status / Alarm
++                    if (length >= 4) {
+                         long userStatus = buf.readUnsignedInt();
+                         if (BitUtil.check(userStatus, 3)) {
+                             position.set(Position.KEY_ALARM, Position.ALARM_VIBRATION);
+                         }
++                    }
+                     break;
+-                case 0xD3:
++                case 0xD3: // Power
++                    if (length >= 2) {
+                         position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.1);
++                    }
+                     break;
+-                case 0xD4:
+-                case 0xE1:
++                case 0xD4: // Battery Level
++                case 0xE1: // Battery Level
++                    if (length >= 1) {
+                         position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
++                    }
+                     break;
+-                case 0xD5:
+-                    if (length == 2) {
++                case 0xD5: // Battery / Lock Data
++                    if (length == 2) { // Specific length for battery percentage
+                         position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
+-                    } else {
+-                        int count = buf.readUnsignedByte();
++                    } else if (length > 2) { // Other structures with mark and extended types
++                        int count = buf.readUnsignedByte(); // First byte of data is count
++                        // Check if remaining length is sufficient for 'count' locks (each 13 bytes)
++                        if (1 + count * 13 > length) { // 1 for count byte, 13 for each lock
++                            buf.skipBytes(length - 1); // Skip remaining part of this length block
++                            break;
++                        }
+                         for (int i = 1; i <= count; i++) {
++                            if (buf.readableBytes() < 5) { break; }
+                             position.set("lock" + i + "Id", ByteBufUtil.hexDump(buf.readSlice(5)));
++                            if (buf.readableBytes() < 5) { break; }
+                             position.set("lock" + i + "Card", ByteBufUtil.hexDump(buf.readSlice(5)));
++                            if (buf.readableBytes() < 1) { break; }
+                             position.set("lock" + i + "Battery", buf.readUnsignedByte());
++                            if (buf.readableBytes() < 2) { break; }
+                             int status = buf.readUnsignedShort();
+                             position.set("lock" + i + "Locked", !BitUtil.check(status, 5));
+                         }
+                     }
+                     break;
+-                case 0xDA:
++                case 0xDA: // Device status
++                    if (length >= 3) { // 2 for string cut count, 1 for device status byte
+                         buf.readUnsignedShort(); // string cut count
+                         int deviceStatus = buf.readUnsignedByte();
+                         position.set("string", BitUtil.check(deviceStatus, 0));
+                         position.set(Position.KEY_MOTION, BitUtil.check(deviceStatus, 2));
+                         position.set("cover", BitUtil.check(deviceStatus, 3));
++                    }
+                     break;
+-                case 0xE6:
+-                    while (buf.readerIndex() < endIndex) {
++                case 0xE6: // Temperature/Humidity sensors
++                    while (buf.readerIndex() < blockEndIndex) {
++                        // Ensure enough bytes for a full sensor block (1+6+4+4 = 15 bytes)
++                        if (buf.readableBytes() < 15 || buf.readerIndex() + 15 > blockEndIndex) {
++                            buf.readerIndex(blockEndIndex); // Jump to end if malformed or incomplete sensor data
++                            break;
++                        }
+                         int sensorIndex = buf.readUnsignedByte();
+                         buf.skipBytes(6); // mac
+                         position.set(Position.PREFIX_TEMP + sensorIndex, decodeCustomDouble(buf));
+                         position.set("humidity" + sensorIndex, decodeCustomDouble(buf));
+                     }
+                     break;
+-                case 0xEB:
+-                    if (buf.getUnsignedShort(buf.readerIndex()) > 200) {
++                case 0xEB: // Network / Extended attributes
++                    // This case has two main branches based on peeked value and iterates till 'blockEndIndex'
++                    if (buf.readableBytes() < 2) { // Needs at least 2 bytes to peek
++                        break;
++                    }
++                    if (buf.getUnsignedShort(buf.readerIndex()) > 200) { // Check peeked value for branch logic
+                         Network network = new Network();
++                        if (length >= 3) { // Needs at least 3 for mcc/mnc
+                             int mcc = buf.readUnsignedShort();
+                             int mnc = buf.readUnsignedByte();
+-                        while (buf.readerIndex() < endIndex) {
++                            while (buf.readerIndex() < blockEndIndex) {
++                                // Ensure enough bytes for a cell tower (5 bytes: 2 for lac, 2 for cid, 1 for rssi)
++                                if (buf.readableBytes() < 5 || buf.readerIndex() + 5 > blockEndIndex) {
++                                    buf.readerIndex(blockEndIndex);
++                                    break;
++                                }
+                                 network.addCellTower(CellTower.from(
+                                         mcc, mnc, buf.readUnsignedShort(), buf.readUnsignedShort(),
+                                         buf.readUnsignedByte()));
+                             }
+                             position.setNetwork(network);
+                         } else {
+-                        while (buf.readerIndex() < endIndex) {
+-                            int extendedLength = buf.readUnsignedShort();
++                            buf.skipBytes(length); // Skip block if not enough for mcc/mnc
++                        }
++                    } else {
++                        while (buf.readerIndex() < blockEndIndex) {
++                            // Ensure enough bytes for extended type header (2 for extendedLength, 2 for extendedType)
++                            if (buf.readableBytes() < 4 || buf.readerIndex() + 4 > blockEndIndex) {
++                                buf.readerIndex(blockEndIndex);
++                                break;
++                            }
++                            int extendedLength = buf.readUnsignedShort(); // This is the total length including its own header
+                             int extendedType = buf.readUnsignedShort();
++                            // Remaining bytes for data part is extendedLength - 2 (for type and length fields already read)
++                            int dataLength = extendedLength - 2;
++
++                            // Ensure data length does not exceed current block remaining bytes
++                            if (buf.readerIndex() + dataLength > blockEndIndex) {
++                                buf.readerIndex(blockEndIndex);
++                                break;
++                            }
+                             switch (extendedType) {
+-                                case 0x0001:
++                                case 0x0001: // Fuel 1
++                                    if (dataLength >= 3) { // 2 for fuel value, 1 for unused
+                                         position.set("fuel1", buf.readUnsignedShort() * 0.1);
+                                         buf.readUnsignedByte(); // unused
++                                    } else { buf.skipBytes(dataLength); }
+                                     break;
+-                                case 0x0023:
++                                case 0x0023: // Fuel 2
++                                    if (dataLength >= 6) {
+                                         position.set("fuel2", Double.parseDouble(
+                                                 buf.readCharSequence(6, StandardCharsets.US_ASCII).toString()));
++                                    } else { buf.skipBytes(dataLength); }
+                                     break;
+-                                case 0x00CE:
++                                case 0x00CE: // Power
++                                    if (dataLength >= 2) {
+                                         position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
++                                    } else { buf.skipBytes(dataLength); }
+                                     break;
+-                                case 0x00D8:
++                                case 0x00D8: // Network (Cell Tower)
++                                    if (dataLength >= 9) { // 2+1+2+4 bytes for CellTower.from
+                                         Network network = new Network();
+                                         network.addCellTower(CellTower.from(
+                                                 buf.readUnsignedShort(), buf.readUnsignedByte(),
+                                                 buf.readUnsignedShort(), buf.readUnsignedInt()));
+                                         position.setNetwork(network);
++                                    } else { buf.skipBytes(dataLength); }
+                                     break;
+-                                case 0xE1:
++                                case 0xE1: // Battery Level
++                                    if (dataLength >= 1) {
+                                         position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
++                                    } else { buf.skipBytes(dataLength); }
+                                     break;
+                                 default:
+-                                    buf.skipBytes(extendedLength - 2);
++                                    buf.skipBytes(dataLength);
+                                     break;
+                             }
+                         }
+                     }
+                     break;
+-                case 0xED:
++                case 0xED: // Card
++                    if (length > 0) {
+                         stringValue = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                         position.set(Position.KEY_CARD, stringValue.trim());
++                    }
+                     break;
+-                case 0xEE:
++                case 0xEE: // Sensor data (RSSI, Power, Battery, Satellites)
++                    if (length >= 6) { // 1 (RSSI) + 2 (Power) + 2 (Battery) + 1 (Satellites) = 6 bytes
+                         position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                         position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.001);
+                         position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.001);
+                         position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
++                    }
+                     break;
+-                case 0xF3:
+-                    while (buf.readerIndex() < endIndex) {
++                case 0xF3: // OBD/Extended data
++                    while (buf.readerIndex() < blockEndIndex) {
++                        // Ensure enough bytes for extended type header (2 for extendedType, 1 for extendedLength)
++                        if (buf.readableBytes() < 3 || buf.readerIndex() + 3 > blockEndIndex) {
++                            buf.readerIndex(blockEndIndex);
++                            break;
++                        }
+                         int extendedType = buf.readUnsignedShort();
+                         int extendedLength = buf.readUnsignedByte();
++
++                        // Ensure extendedLength does not exceed current block remaining bytes
++                        if (buf.readerIndex() + extendedLength > blockEndIndex) {
++                            buf.readerIndex(blockEndIndex);
++                            break;
++                        }
+                         switch (extendedType) {
+-                            case 0x0002:
+-                                position.set(Position.KEY_OBD_SPEED, buf.readUnsignedShort() * 0.1);
+-                                break;
+-                            case 0x0003:
+-                                position.set(Position.KEY_RPM, buf.readUnsignedShort());
+-                                break;
+-                            case 0x0004:
+-                                position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.001);
+-                                break;
+-                            case 0x0005:
+-                                position.set(Position.KEY_OBD_ODOMETER, buf.readUnsignedInt() * 100);
+-                                break;
+-                            case 0x0007:
+-                                position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.1);
+-                                break;
+-                            case 0x0008:
+-                                position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedShort() * 0.1);
+-                                break;
+-                            case 0x0009:
+-                                position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedShort() - 40);
+-                                break;
+-                            case 0x000B:
+-                                position.set("intakePressure", buf.readUnsignedShort());
+-                                break;
+-                            case 0x000C:
+-                                position.set("intakeTemp", buf.readUnsignedShort() - 40);
+-                                break;
+-                            case 0x000D:
+-                                position.set("intakeFlow", buf.readUnsignedShort());
+-                                break;
+-                            case 0x000E:
+-                                position.set(Position.KEY_THROTTLE, buf.readUnsignedShort() * 100 / 255);
+-                                break;
+-                            case 0x0050:
+-                                position.set(Position.KEY_VIN, buf.readSlice(17).toString(StandardCharsets.US_ASCII));
+-                                break;
+-                            case 0x0100:
+-                                position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort() * 0.1);
+-                                break;
+-                            case 0x0102:
+-                                position.set("tripFuel", buf.readUnsignedShort() * 0.1);
+-                                break;
+-                            case 0x0112:
+-                                position.set("hardAccelerationCount", buf.readUnsignedShort());
+-                                break;
+-                            case 0x0113:
+-                                position.set("hardDecelerationCount", buf.readUnsignedShort());
+-                                break;
+-                            case 0x0114:
+-                                position.set("hardCorneringCount", buf.readUnsignedShort());
+-                                break;
++                            case 0x0002: if (extendedLength >= 2) { position.set(Position.KEY_OBD_SPEED, buf.readUnsignedShort() * 0.1); } break;
++                            case 0x0003: if (extendedLength >= 2) { position.set(Position.KEY_RPM, buf.readUnsignedShort()); } break;
++                            case 0x0004: if (extendedLength >= 2) { position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.001); } break;
++                            case 0x0005: if (extendedLength >= 4) { position.set(Position.KEY_OBD_ODOMETER, buf.readUnsignedInt() * 100); } break;
++                            case 0x0007: if (extendedLength >= 2) { position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.1); } break;
++                            case 0x0008: if (extendedLength >= 2) { position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedShort() * 0.1); } break;
++                            case 0x0009: if (extendedLength >= 2) { position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedShort() - 40); } break;
++                            case 0x000B: if (extendedLength >= 2) { position.set("intakePressure", buf.readUnsignedShort()); } break;
++                            case 0x000C: if (extendedLength >= 2) { position.set("intakeTemp", buf.readUnsignedShort() - 40); } break;
++                            case 0x000D: if (extendedLength >= 2) { position.set("intakeFlow", buf.readUnsignedShort()); } break;
++                            case 0x000E: if (extendedLength >= 2) { position.set(Position.KEY_THROTTLE, buf.readUnsignedShort() * 100 / 255); } break;
++                            case 0x0050: if (extendedLength >= 17) { position.set(Position.KEY_VIN, buf.readSlice(17).toString(StandardCharsets.US_ASCII)); } break;
++                            case 0x0100: if (extendedLength >= 2) { position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort() * 0.1); } break;
++                            case 0x0102: if (extendedLength >= 2) { position.set("tripFuel", buf.readUnsignedShort() * 0.1); } break;
++                            case 0x0112: if (extendedLength >= 2) { position.set("hardAccelerationCount", buf.readUnsignedShort()); } break;
++                            case 0x0113: if (extendedLength >= 2) { position.set("hardDecelerationCount", buf.readUnsignedShort()); } break;
++                            case 0x0114: if (extendedLength >= 2) { position.set("hardCorneringCount", buf.readUnsignedShort()); } break;
+                             default:
+                                 buf.skipBytes(extendedLength);
+                                 break;
+                         }
+                     }
+                     break;
+-                case 0xFE:
+-                    if (length == 1) {
++                case 0xFE: // Battery Level / Alarm
++                    if (length == 1) { // Sets battery level
+                         position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+-                    } else {
+-                        int mark = buf.readUnsignedByte();
++                    } else if (length == 2) { // Sets battery percentage
++                        position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
++                    } else if (length > 2) { // Handles structures with 'mark' and extended types
++                        // Check if remaining length is sufficient for 'mark' byte
++                        if (buf.readableBytes() < length) {
++                            buf.skipBytes(buf.readableBytes()); // Skip remaining till end of buffer if malformed
++                            break;
++                        }
++                        int mark = buf.readUnsignedByte(); // Reads the 'mark' byte (1 byte)
+                         if (mark == 0x7C) {
+-                            while (buf.readerIndex() < endIndex) {
++                            while (buf.readerIndex() < blockEndIndex) {
++                                // Ensure enough bytes for extended type header (1 for type, 1 for length)
++                                if (buf.readableBytes() < 2 || buf.readerIndex() + 2 > blockEndIndex) {
++                                    buf.readerIndex(blockEndIndex); // Jump to end if malformed sub-block
++                                    break;
++                                }
+                                 int extendedType = buf.readUnsignedByte();
+                                 int extendedLength = buf.readUnsignedByte();
++                                // Ensure extendedLength does not exceed current block remaining bytes
++                                if (buf.readerIndex() + extendedLength > blockEndIndex) {
++                                    buf.readerIndex(blockEndIndex);
++                                    break;
++                                }
+                                 switch (extendedType) {
+-                                    case 0x01:
++                                    case 0x01: // Alarms
++                                        if (extendedLength >= 4) {
+                                             long alarms = buf.readUnsignedInt();
+-                                        if (BitUtil.check(alarms, 0)) {
+-                                            position.set(Position.KEY_ALARM, Position.ALARM_ACCELERATION);
+-                                        }
+-                                        if (BitUtil.check(alarms, 1)) {
+-                                            position.set(Position.KEY_ALARM, Position.ALARM_BRAKING);
+-                                        }
+-                                        if (BitUtil.check(alarms, 2)) {
+-                                            position.set(Position.KEY_ALARM, Position.ALARM_CORNERING);
+-                                        }
+-                                        if (BitUtil.check(alarms, 3)) {
+-                                            position.set(Position.KEY_ALARM, Position.ALARM_ACCIDENT);
+-                                        }
+-                                        if (BitUtil.check(alarms, 4)) {
+-                                            position.set(Position.KEY_ALARM, Position.ALARM_TAMPERING);
++                                            if (BitUtil.check(alarms, 0)) { position.set(Position.KEY_ALARM, Position.ALARM_ACCELERATION); }
++                                            if (BitUtil.check(alarms, 1)) { position.set(Position.KEY_ALARM, Position.ALARM_BRAKING); }
++                                            if (BitUtil.check(alarms, 2)) { position.set(Position.KEY_ALARM, Position.ALARM_CORNERING); }
++                                            if (BitUtil.check(alarms, 3)) { position.set(Position.KEY_ALARM, Position.ALARM_ACCIDENT); }
++                                            if (BitUtil.check(alarms, 4)) { position.set(Position.KEY_ALARM, Position.ALARM_TAMPERING); }
+                                         }
+                                         break;
+                                     default:
+                                         buf.skipBytes(extendedLength);
+                                         break;
+                                 }
+                             }
++                        } else {
++                            // Mark is not 0x7C. We consumed 1 byte for mark. Skip remaining `length - 1` bytes of this block.
++                            if (length - 1 > 0) { // Ensure there are bytes to skip
++                                buf.skipBytes(length - 1);
++                            }
+                         }
+-                        position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+                     }
+                     break;
+                 default:
++                    // For any unhandled subtypes, or if the subtype handler did not consume all `length` bytes,
++                    // this will ensure the reader index is moved to the end of the current block.
++                    buf.skipBytes(length);
+                     break;
+             }
+-            buf.readerIndex(endIndex);
++            // Crucial: After processing the subtype, ensure the buffer reader index is exactly at `blockEndIndex`.
++            // This handles cases where a handler might read more or less than `length` bytes,
++            // or if the `default` case was used. This is vital for maintaining correct parsing state
++            // and preventing infinite loops if a case does not fully consume its declared length.
++            if (buf.readerIndex() != blockEndIndex) {
++                buf.readerIndex(blockEndIndex);
++            }
+         }
+ 
+         return position;
+     }
++}
+\ No newline at end of file

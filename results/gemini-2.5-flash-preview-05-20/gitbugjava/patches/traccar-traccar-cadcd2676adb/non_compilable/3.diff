@@ -1,0 +1,242 @@
+diff --git a/tmp/f929d2fa-da5e-42cd-83a5-a6f00d48f6d3_buggy.java b/tmp/0fa29e81-1d3f-4f92-bc08-aab85af7cf25_fixed.java
+index 9e4d15c..43e17e3 100644
+--- a/tmp/f929d2fa-da5e-42cd-83a5-a6f00d48f6d3_buggy.java
++++ b/tmp/0fa29e81-1d3f-4f92-bc08-aab85af7cf25_fixed.java
+@@ -1,137 +1,197 @@
+     @Override
+     protected Object decode(
+             Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+         ByteBuf buf = (ByteBuf) msg;
+ 
+-        buf.skipBytes(2); // header
++        buf.skipBytes(2); // header (0x29 0x29)
+         int type = buf.readUnsignedByte();
+         buf.readUnsignedShort(); // size
+ 
++        // Confirmation response for certain message types
+         if (type == MSG_LOGIN || type == MSG_ADMIN_NUMBER || type == MSG_SEND_TEXT
+                 || type == MSG_SMS_ALARM_SWITCH || type == MSG_POSITION_REUPLOAD) {
+ 
+             ByteBuf response = Unpooled.buffer();
+             response.writeByte(0x29);
+             response.writeByte(0x29); // header
+             response.writeByte(MSG_CONFIRMATION);
+-            response.writeShort(5); // size
+-            response.writeByte(buf.getByte(buf.writerIndex() - 2));
+-            response.writeByte(type);
+-            response.writeByte(buf.writerIndex() > 9 ? buf.getByte(9) : 0); // 10th byte
++            response.writeShort(5); // size (protocol specific, often fixed for confirmation)
++            // The following bytes are often derived from the original message's unique identifier or checksum,
++            // or specific sequence numbers. The original implementation relies on writerIndex and fixed offset 9,
++            // which might be fragile but is outside the scope of the current bug fix.
++            response.writeByte(buf.getByte(buf.writerIndex() - 2)); // Assuming this is for a checksum/sequence from original msg
++            response.writeByte(type); // Original message type
++            response.writeByte(buf.writerIndex() > 9 ? buf.getByte(9) : 0); // Assuming 10th byte of original message (e.g., last ID byte)
+             response.writeByte(Checksum.xor(response.nioBuffer()));
+             response.writeByte(0x0D); // ending
+ 
+             if (channel != null) {
+                 channel.writeAndFlush(new NetworkMessage(response, remoteAddress));
+             }
+-
+         }
+ 
+-        if (type == MSG_ON_DEMAND || type == MSG_POSITION_UPLOAD || type == MSG_POSITION_REUPLOAD
+-                || type == MSG_ALARM || type == MSG_REPLY || type == MSG_PERIPHERAL) {
+-
+-            Position position = new Position(getProtocolName());
+-
++        // All position/alarm/peripheral messages start with device ID after header, type, and size.
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, readIdentifiers(buf));
+         if (deviceSession == null) {
+             return null;
+         }
++
++        Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
++        if (type == MSG_ON_DEMAND || type == MSG_POSITION_UPLOAD || type == MSG_REPLY || type == MSG_POSITION_REUPLOAD) {
++            // This block handles standard position reports.
++            // These messages typically contain full date, coordinates, speed, course, and other attributes.
++
++            DateBuilder dateBuilder = new DateBuilder()
++                    .setYear(BcdUtil.readInteger(buf, 2))
++                    .setMonth(BcdUtil.readInteger(buf, 2))
++                    .setDay(BcdUtil.readInteger(buf, 2))
++                    .setHour(BcdUtil.readInteger(buf, 2))
++                    .setMinute(BcdUtil.readInteger(buf, 2))
++                    .setSecond(BcdUtil.readInteger(buf, 2));
++            position.setTime(dateBuilder.getDate());
++
++            position.setLatitude(BcdUtil.readCoordinate(buf));
++            position.setLongitude(BcdUtil.readCoordinate(buf));
++            position.setSpeed(UnitsConverter.knotsFromKph(BcdUtil.readInteger(buf, 4)));
++            position.setCourse(BcdUtil.readInteger(buf, 4)); // Standard 4 bytes for course
++            position.setValid((buf.readUnsignedByte() & 0x80) != 0);
++
++            int odometer = buf.readUnsignedMedium();
++            if (BitUtil.to(odometer, 16) > 0) {
++                position.set(Position.KEY_ODOMETER, odometer);
++            } else if (odometer > 0) {
++                position.set(Position.KEY_FUEL_LEVEL, BitUtil.from(odometer, 16));
++            }
++
++            position.set(Position.KEY_STATUS, buf.readUnsignedInt());
++
++            buf.readUnsignedShort(); // Reserved/Unknown bytes
++            buf.readUnsignedByte();
++            buf.readUnsignedByte();
++            buf.readUnsignedByte();
++            buf.readUnsignedByte();
++            buf.readUnsignedByte();
++
++            position.set(Position.KEY_RESULT, String.valueOf(buf.readUnsignedByte()));
++
++        } else if (type == MSG_ALARM) {
++            // Dedicated parsing for MSG_ALARM.
++            // These messages also contain position data but with a specific format for some fields
++            // and additional alarm-related bytes including battery level.
++
++            DateBuilder dateBuilder = new DateBuilder()
++                    .setYear(BcdUtil.readInteger(buf, 2))
++                    .setMonth(BcdUtil.readInteger(buf, 2))
++                    .setDay(BcdUtil.readInteger(buf, 2))
++                    .setHour(BcdUtil.readInteger(buf, 2))
++                    .setMinute(BcdUtil.readInteger(buf, 2))
++                    .setSecond(BcdUtil.readInteger(buf, 2));
++            position.setTime(dateBuilder.getDate());
++
++            position.setLatitude(BcdUtil.readCoordinate(buf));
++            position.setLongitude(BcdUtil.readCoordinate(buf));
++            position.setSpeed(UnitsConverter.knotsFromKph(BcdUtil.readInteger(buf, 4)));
++
++            // For MSG_ALARM, the 'course' might be 2 bytes, and the following byte is battery level.
++            position.setCourse(BcdUtil.readInteger(buf, 2)); // Read 2 bytes for course
++            position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte()); // Read 1 byte for battery level (0x64 = 100)
++
++            // The 'valid' byte is implied or handled by other fields in alarm messages,
++            // or consumed by the subsequent reads like 'overloaded state'.
++            // Based on test data, the original 'valid' byte's position is now used for battery.
++
++            buf.readUnsignedByte(); // overloaded state
++            buf.readUnsignedByte(); // logging status
++
++            byte[] alarmStatus = new byte[8];
++            buf.readBytes(alarmStatus); // Read 8 bytes for alarm status
++
++            decodeAlarmStatus(position, alarmStatus); // External helper to decode alarm bits
++
++        } else if (type == MSG_PERIPHERAL) {
++            // This block handles peripheral data messages.
++            // These also start with position data and then have additional peripheral-specific fields.
++
+             DateBuilder dateBuilder = new DateBuilder()
+                     .setYear(BcdUtil.readInteger(buf, 2))
+                     .setMonth(BcdUtil.readInteger(buf, 2))
+                     .setDay(BcdUtil.readInteger(buf, 2))
+                     .setHour(BcdUtil.readInteger(buf, 2))
+                     .setMinute(BcdUtil.readInteger(buf, 2))
+                     .setSecond(BcdUtil.readInteger(buf, 2));
+             position.setTime(dateBuilder.getDate());
+ 
+             position.setLatitude(BcdUtil.readCoordinate(buf));
+             position.setLongitude(BcdUtil.readCoordinate(buf));
+             position.setSpeed(UnitsConverter.knotsFromKph(BcdUtil.readInteger(buf, 4)));
+             position.setCourse(BcdUtil.readInteger(buf, 4));
+             position.setValid((buf.readUnsignedByte() & 0x80) != 0);
+ 
+-            if (type != MSG_ALARM) {
+-
+             int odometer = buf.readUnsignedMedium();
+             if (BitUtil.to(odometer, 16) > 0) {
+                 position.set(Position.KEY_ODOMETER, odometer);
+             } else if (odometer > 0) {
+                 position.set(Position.KEY_FUEL_LEVEL, BitUtil.from(odometer, 16));
+             }
+ 
+             position.set(Position.KEY_STATUS, buf.readUnsignedInt());
+ 
+             buf.readUnsignedShort();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+             buf.readUnsignedByte();
+ 
+             position.set(Position.KEY_RESULT, String.valueOf(buf.readUnsignedByte()));
+ 
+-                if (type == MSG_PERIPHERAL) {
++            buf.readUnsignedShort(); // data length (for peripheral block)
+ 
+-                    buf.readUnsignedShort(); // data length
++            int dataType = buf.readUnsignedByte(); // Type of peripheral data
+ 
+-                    int dataType = buf.readUnsignedByte();
+-
+-                    buf.readUnsignedByte(); // content length
++            buf.readUnsignedByte(); // content length (for peripheral data)
+ 
+             switch (dataType) {
+-                        case 0x01:
++                case 0x01: // Fuel level
+                     position.set(Position.KEY_FUEL_LEVEL,
+                             buf.readUnsignedByte() * 100 + buf.readUnsignedByte());
+                     break;
+-                        case 0x02:
++                case 0x02: // Temperature
+                     position.set(Position.PREFIX_TEMP + 1,
+                             buf.readUnsignedByte() * 100 + buf.readUnsignedByte());
+                     break;
+-                        case 0x18:
++                case 0x18: // Fuel sensors (multiple)
+                     for (int i = 1; i <= 4; i++) {
+                         double value = buf.readUnsignedShort();
+                         if (value > 0x0000 && value < 0xFFFF) {
+                             position.set("fuel" + i, value / 0xFFFE);
+                         }
+                     }
+                     break;
+-                        case 0x23:
++                case 0x23: // Cell towers
+                     Network network = new Network();
+                     int count = buf.readUnsignedByte();
+                     for (int i = 0; i < count; i++) {
+                         network.addCellTower(CellTower.from(
+-                                        buf.readUnsignedShort(), buf.readUnsignedByte(),
+-                                        buf.readUnsignedShort(), buf.readUnsignedShort(), buf.readUnsignedByte()));
++                                buf.readUnsignedShort(), buf.readUnsignedByte(), // mobile country code, mobile network code
++                                buf.readUnsignedShort(), buf.readUnsignedShort(), buf.readUnsignedByte())); // location area code, cell id, signal strength
+                     }
+                     if (count > 0) {
+                         position.setNetwork(network);
+                     }
+                     break;
+                 default:
++                    // Unknown peripheral data type, skip or log
+                     break;
+             }
+ 
+-                }
+-
+         } else {
+-
+-                buf.readUnsignedByte(); // overloaded state
+-                buf.readUnsignedByte(); // logging status
+-
+-                byte[] alarmStatus = new byte[8];
+-                buf.readBytes(alarmStatus);
+-
+-                decodeAlarmStatus(position, alarmStatus);
+-
++            // Message type not handled or unknown, return null.
++            return null;
+         }
+ 
+         return position;
+-
+-        }
+-
+-        return null;
+     }
+\ No newline at end of file

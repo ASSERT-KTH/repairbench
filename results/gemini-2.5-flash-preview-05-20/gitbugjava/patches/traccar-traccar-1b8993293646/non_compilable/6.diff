@@ -1,0 +1,171 @@
+diff --git a/tmp/5b1029d1-4583-4330-9ebd-16bb69cbd7ce_buggy.java b/tmp/d36285cd-838d-46e9-b99f-74c05de9d5b0_fixed.java
+index 7374e5f..60642da 100644
+--- a/tmp/5b1029d1-4583-4330-9ebd-16bb69cbd7ce_buggy.java
++++ b/tmp/d36285cd-838d-46e9-b99f-74c05de9d5b0_fixed.java
+@@ -1,61 +1,145 @@
+     private Object decodeLocationNew(
+             Channel channel, SocketAddress remoteAddress, String sentence) {
+ 
+         Parser parser = new Parser(PATTERN_NEW, sentence);
+         if (!parser.matches()) {
+             return null;
+         }
+ 
+-        String imei = parser.next();
++        // Fix 1: Correctly assign packet length and imei variables
++        String packetLength = parser.next(); // G1: Packet length (e.g., "99")
++        String imei = parser.next();         // G2: IMEI (e.g., "865413050150407")
+         DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+         if (deviceSession == null) {
+             return null;
+         }
+ 
+-        String index = parser.next();
++        String index = parser.next(); // G3: Status/index for response (e.g., "7F")
+ 
+         Position position = new Position(getProtocolName());
+         position.setDeviceId(deviceSession.getDeviceId());
+ 
+-        position.set(Position.KEY_ALARM, decodeAlarm(parser.nextInt()));
++        // Fix 2: Handle alarm as a string and parse the numeric part
++        String alarmString = parser.next(); // G4: Alarm (e.g., "A03")
++        if (alarmString != null && alarmString.length() > 1) {
++            try {
++                position.set(Position.KEY_ALARM, decodeAlarm(Integer.parseInt(alarmString.substring(1))));
++            } catch (NumberFormatException e) {
++                // Handle cases where substring(1) might not be an int, or set a default alarm
++                position.set(Position.KEY_ALARM, decodeAlarm(0));
++            }
++        } else {
++            position.set(Position.KEY_ALARM, decodeAlarm(0)); // Default if alarm is empty or invalid
++        }
+ 
+-        position.setDeviceTime(parser.nextDateTime());
++        // Fix 3: Explicitly consume optional driverId (G5) before deviceTime (G6)
++        // This ensures subsequent `parser.next()` calls are aligned.
++        String driverId = parser.next(); // G5: Optional driver ID (could be null or empty string if `,,` was present)
++        if (driverId != null && !driverId.isEmpty()) {
++            position.set(Position.KEY_DRIVER_UNIQUE_ID, driverId);
++        }
++
++        position.setDeviceTime(parser.nextDateTime()); // G6: Device time
+ 
+         Network network = new Network();
++
++        // Fix 4: Manually parse cell tower data as a single string (G18)
++        // Original code assumed 4 separate integer fields, which is incorrect for this pattern variant.
++        String networkData = parser.next(); // G7-G18: Can be GPS parts or a network string
++        if (networkData != null) {
++            // Check if it's a cell tower string (e.g., "MCC|MNC|LAC|CID")
++            if (networkData.contains("|")) {
++                String[] cellTowerParts = networkData.split("\\|");
++                if (cellTowerParts.length >= 4) {
++                    try {
+                         network.addCellTower(CellTower.from(
+-                parser.nextInt(), parser.nextInt(), parser.nextHexInt(), parser.nextHexInt()));
+-
+-        position.set(Position.KEY_BATTERY, parser.nextDouble());
+-        position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt());
+-        position.set(Position.KEY_STATUS, parser.nextHexInt());
+-
+-        if (parser.hasNext(5)) {
+-
+-            position.setValid(parser.next().equals("A"));
+-            position.setFixTime(position.getDeviceTime());
+-            position.set(Position.KEY_SATELLITES, parser.nextInt());
+-            position.setSpeed(UnitsConverter.knotsFromKph(parser.nextInt()));
+-            position.setLatitude(parser.nextDouble());
+-            position.setLongitude(parser.nextDouble());
+-
++                                Integer.parseInt(cellTowerParts[0]),
++                                Integer.parseInt(cellTowerParts[1]),
++                                Integer.parseInt(cellTowerParts[2], 16),
++                                Integer.parseInt(cellTowerParts[3], 16)));
++                    } catch (NumberFormatException e) {
++                        // Log or handle parsing error for cell tower parts
++                    }
++                }
+             } else {
++                // If it's not a cell tower, it might be the start of a GPS block (G7 'A'/'V')
++                // This part of the pattern logic is ambiguous and handled by the original code as an alternative
++                // However, given the test data, the network string is matched first, then GPS comes in `ioData`.
++                // So, if it's not a pipe-separated string, it might be a single GPS field (e.g., valid flag 'A' or 'V')
++                // For now, let's assume `networkData` is either a cell tower string or needs to be handled later.
++                // The current pattern usually matches the `([^,]+)` part if it's not a full GPS block.
++                // So, the above cell tower parsing should cover the G18 case.
++            }
++        }
+ 
+-            String[] points = parser.next().split("\\|");
++        position.set(Position.KEY_BATTERY, parser.nextDouble()); // G19: Battery
++        position.set(Position.KEY_BATTERY_LEVEL, parser.nextInt()); // G20: Battery level
++        position.set(Position.KEY_STATUS, parser.nextHexInt()); // G21: General status
++
++        // Fix 5: Handle the optional trailing GPS/Wifi data explicitly (G22)
++        // The original `if (parser.hasNext(5))` fails because G22 is one group, not 5.
++        String ioData = null;
++        if (parser.hasNext()) { // Check if the optional `io` group (G22) exists
++            ioData = parser.next();
++        }
++
++        if (ioData != null && !ioData.isEmpty()) {
++            if (ioData.contains(":")) { // If it contains ':', assume it's Wifi Access Point data
++                String[] points = ioData.split("\\|");
+                 for (String point : points) {
+                     String[] wifi = point.split(":");
++                    if (wifi.length >= 2) {
+                         String mac = wifi[0].replaceAll("(..)", "$1:");
+                         network.addWifiAccessPoint(WifiAccessPoint.from(
+                                 mac.substring(0, mac.length() - 1), Integer.parseInt(wifi[1])));
+                     }
++                }
++            } else { // Assume it's GPS data if not Wifi format
++                String[] gpsParts = ioData.split(",");
++                if (gpsParts.length >= 6) { // Expecting at least 6 parts: valid, speed, course, satellites, lat, lon
++                    position.setValid(gpsParts[0].equals("A")); // '0' in test means invalid GPS, 'A' means active
++                    position.setFixTime(position.getDeviceTime()); // Fix time is usually device time if GPS is valid
+ 
++                    try {
++                        position.set(Position.KEY_SATELLITES, Integer.parseInt(gpsParts[3])); // Satellites (e.g., "13")
++                    } catch (NumberFormatException e) {
++                        position.set(Position.KEY_SATELLITES, 0); // Default to 0 if parsing fails
++                    }
++
++                    int speedKph = 0;
++                    try {
++                        // Speed (e.g., "A", "0") - handle non-numeric if necessary
++                        // If 'A' means valid but 0 speed, handle it. Assuming it should be numeric.
++                        speedKph = Integer.parseInt(gpsParts[1]);
++                    } catch (NumberFormatException e) {
++                        // Keep speedKph as 0 if "A" or other non-numeric
++                    }
++                    position.setSpeed(UnitsConverter.knotsFromKph(speedKph));
++
++
++                    try {
++                        position.setLatitude(Double.parseDouble(gpsParts[4]));
++                    } catch (NumberFormatException e) {
++                        // Handle invalid latitude
++                    }
++
++                    try {
++                        position.setLongitude(Double.parseDouble(gpsParts[5]));
++                    } catch (NumberFormatException e) {
++                        // Handle invalid longitude
++                    }
++                    // Note: gpsParts[2] is 'course' but is not used in the original block.
++                }
++            }
+         }
+ 
+         position.setNetwork(network);
+ 
+         DateFormat dateFormat = new SimpleDateFormat("yyMMddHHmmss");
+         dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
++        // The `index` variable now correctly holds the value for the response (e.g., "7F")
+         String response = index + ",A03," + dateFormat.format(new Date());
+         sendResponse(channel, remoteAddress, imei, response);
+ 
+         return position;
+     }
+\ No newline at end of file

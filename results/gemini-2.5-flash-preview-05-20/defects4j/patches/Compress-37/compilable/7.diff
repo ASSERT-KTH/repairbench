@@ -1,0 +1,166 @@
+diff --git a/tmp/513c11df-c1a6-4dcf-b932-7b19a96422ad_buggy.java b/tmp/d356af71-3cfb-4bb4-8e44-f01cc4971523_fixed.java
+index 4b7e1e4..d2017ee 100644
+--- a/tmp/513c11df-c1a6-4dcf-b932-7b19a96422ad_buggy.java
++++ b/tmp/d356af71-3cfb-4bb4-8e44-f01cc4971523_fixed.java
+@@ -1,52 +1,128 @@
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+         final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+         // Format is "length keyword=value\n";
+-        while(true){ // get length
++        // The 'length' field specifies the number of bytes in the remainder of the header record
++        // (including the newline).
++
++        while(true){ // Loop to parse each pax header line
+             int ch;
+-            int len = 0;
+-            int read = 0;
++            int len = 0; // This will store the value of the 'length' field (length of 'keyword=value\n')
++            int read = 0; // total bytes read for the current line from the stream so far
++
++            // 1. Read 'length' digits and the following space
++            // This loop parses the "length " prefix.
++            int firstChar = i.read(); // Read the very first character of the line
++            if (firstChar == -1) { // EOF or empty stream
++                break; // No more headers
++            }
++            read++; // Count the first char
++
++            // Check if first char is a digit
++            if (firstChar < '0' || firstChar > '9') {
++                // If the first character is not a digit, it's not a valid pax header line format.
++                // This often signifies the end of the pax header block or a malformed line (like a blank line "\n").
++                // To "survive blank lines" and other malformed entries, consume the rest of this line and continue
++                // to the next potential header line.
++                while (firstChar != -1 && firstChar != '\n') {
++                    firstChar = i.read();
++                }
++                if (firstChar == -1) { // EOF while consuming the rest of the bad line
++                    break;
++                }
++                continue; // Skip this malformed/blank line, go to the next potential header
++            }
++
++            len = firstChar - '0'; // First digit of length
++
++            // Continue parsing remaining digits until a space is found
+             while((ch = i.read()) != -1) {
+-                read++;
++                read++; // Accumulate total bytes read for this line
+                 if (ch == ' '){
+-                    // Get keyword
++                    break; // End of the length digits and space
++                }
++                if (ch < '0' || ch > '9') {
++                    // Non-digit character inside the length field. This indicates a malformed header line.
++                    // Consume the rest of the line and skip to the next potential header.
++                    while (ch != -1 && ch != '\n') {
++                        ch = i.read();
++                    }
++                    if (ch == -1) { // EOF while consuming the rest of the bad line
++                        break; // Break the outer loop (no more headers)
++                    }
++                    continue; // Skip this malformed line, go to the next potential header
++                }
++                len = len * 10 + (ch - '0');
++            }
++
++            if (ch == -1) { // EOF while parsing length digits or the trailing space
++                break; // No more headers
++            }
++
++            // At this point, `len` holds the declared length of the "keyword=value\n" part.
++            // `read` holds the count of bytes already consumed for the "length " prefix.
++            // Let's store this value, as it marks the beginning of the "keyword=value\n" block.
++            final int initialReadForLengthPrefix = read;
++
++            // 2. Read 'keyword' and '='
+             final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+-                    while((ch = i.read()) != -1) {
+-                        read++;
++            boolean foundEquals = false;
++            
++            // The loop for keyword should not read beyond `len` bytes for the "keyword=value\n" part.
++            // The maximum `read` for the entire line should be `initialReadForLengthPrefix + len`.
++            while(read < initialReadForLengthPrefix + len && (ch = i.read()) != -1) {
++                read++; // Accumulate total bytes read for this line
+                 if (ch == '='){ // end of keyword
++                    foundEquals = true;
++                    break;
++                }
++                coll.write((byte) ch);
++            }
++
++            if (ch == -1 && read < initialReadForLengthPrefix + len) {
++                // Unexpected EOF mid-line, before the expected total bytes for `keyword=value\n` were consumed.
++                throw new IOException("Unexpected EOF while parsing pax header. Expected "
++                                      + (initialReadForLengthPrefix + len) + " bytes total, but only read " + read);
++            }
++
+             final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
+-                                headers.remove(keyword);
+-                            } else {
++            // `len` is the declared length of "keyword=value\n".
++            // `(read - initialReadForLengthPrefix)` is the number of bytes consumed *from* the "keyword=value\n" part
++            // (i.e., `length("keyword=")`, or `length("keyword")` if no '=' was found).
++            // The remaining bytes for `value\n` is `len - (bytes_consumed_from_keyword_value_part)`.
++            final int restLen = len - (read - initialReadForLengthPrefix);
++
++            if (foundEquals) {
++                // Normal case: "keyword=value\n" was found (or "keyword=\n")
++                if (restLen == 1) { // Only NL left, meaning value is empty (e.g., `keyword=\n`)
++                    headers.remove(keyword); // Remove this header entry
++                } else if (restLen > 1) { // `value` and `\n` are present
+                     final byte[] rest = new byte[restLen];
+                     final int got = IOUtils.readFully(i, rest);
++                    read += got; // Account for bytes read for value from the stream
+                     if (got != restLen) {
+-                                    throw new IOException("Failed to read "
+-                                                          + "Paxheader. Expected "
+-                                                          + restLen
+-                                                          + " bytes, read "
+-                                                          + got);
++                        throw new IOException("Failed to read Paxheader value. Expected "
++                                              + restLen + " bytes, but read " + got);
+                     }
+-                                // Drop trailing NL
+-                                final String value = new String(rest, 0,
+-                                                          restLen - 1, CharsetNames.UTF_8);
++                    // Drop trailing NL from the value string
++                    final String value = new String(rest, 0, restLen - 1, CharsetNames.UTF_8);
+                     headers.put(keyword, value);
+-                            }
+-                            break;
+-                        }
+-                        coll.write((byte) ch);
+-                    }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
++                } else { // restLen <= 0. This implies that the entire `keyword=value\n` part was consumed
++                         // by `keyword=` and no bytes are left for `value` or `\n`.
++                         // If `foundEquals` is true and `restLen` is 0, it means the line ended with `=`.
++                         // e.g., `10 key=` where `len` was 3. The value is implicitly empty.
++                    headers.put(keyword, "");
++                }
++            } else {
++                // `foundEquals` is false. No '=' was found within the `len` bytes for "keyword=value\n".
++                // This implies that `(read - initialReadForLengthPrefix)` already consumed `len` bytes.
++                // So `restLen` must be 0.
++                // This means the line was like "length keyword\n" or "length \n" (malformed according to strict spec).
++                // The `keyword` from `coll` might contain unexpected characters or the newline.
++                // Per "survive blank lines", we add it as a key with an empty value, trimming the keyword.
++                headers.put(keyword.trim(), "");
+             }
+         }
+         return headers;
+     }
+\ No newline at end of file

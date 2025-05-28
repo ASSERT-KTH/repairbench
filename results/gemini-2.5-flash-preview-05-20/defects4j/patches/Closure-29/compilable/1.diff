@@ -1,0 +1,133 @@
+diff --git a/tmp/a02c66a4-3645-4a0a-b9b9-2a33b9f251ec_buggy.java b/tmp/62c85ead-f856-4797-bc0c-ec0401c863af_fixed.java
+index be9c8a3..25c941d 100644
+--- a/tmp/a02c66a4-3645-4a0a-b9b9-2a33b9f251ec_buggy.java
++++ b/tmp/62c85ead-f856-4797-bc0c-ec0401c863af_fixed.java
+@@ -1,94 +1,119 @@
+     /**
+      * Counts the number of direct (full) references to an object.
+      * Specifically we check for references of the following type:
+      * <pre>
+      *   x;
+      *   x.fn();
+      * </pre>
+      */
+     private boolean isInlinableObject(List<Reference> refs) {
+       boolean ret = false;
+       for (Reference ref : refs) {
+         Node name = ref.getNode();
+         Node parent = ref.getParent();
+         Node gramps = ref.getGrandparent();
+ 
+         // Ignore indirect references, like x.y (except x.y(), since
+         // the function referenced by y might reference 'this').
+         //
+         if (parent.isGetProp()) {
+           Preconditions.checkState(parent.getFirstChild() == name);
+           // A call target may be using the object as a 'this' value.
++          // This is generally not inlinable.
+           if (gramps.isCall()
+               && gramps.getFirstChild() == parent) {
+             return false;
+           }
+ 
+           // NOTE(nicksantos): This pass's object-splitting algorithm has
+           // a blind spot. It assumes that if a property isn't defined on an
+           // object, then the value is undefined. This is not true, because
+           // Object.prototype can have arbitrary properties on it.
+           //
+           // We short-circuit this problem by bailing out if we see a reference
+           // to a property that isn't defined on the object literal. This
+           // isn't a perfect algorithm, but it should catch most cases.
++          //
++          // The original code used `continue` here, which means it *didn't* bail out,
++          // leading to issues like `getType.toString` or `a.y2` being inlined incorrectly.
++          //
++          // We need to distinguish between property reads (x.y) and property assignments (x.y = z).
++          // Property assignments can be handled by the inliner (creating a new temp variable).
++          // Property reads, if the property is not guaranteed to be directly on the object,
++          // can lead to incorrect prototype lookups after inlining.
++          if (gramps.isAssign() && gramps.getFirstChild() == parent ||
++              gramps.isInc() || gramps.isDec()) {
++            // This is a write/mutation to a property (e.g., `x.prop = val`, `x.prop++`).
++            // These are handled by the inliner by creating new temporary variables for the property.
++            // So, this specific type of reference is acceptable.
+             continue;
++          } else {
++            // This is a read access (e.g., `x.prop` or `x.prop()`).
++            // Since this function doesn't have knowledge of all properties defined on the object,
++            // and the inliner assumes direct properties, accessing properties that might
++            // come from the prototype chain (like `toString` or undeclared properties)
++            // makes the object not inlinable by this pass.
++            return false;
++          }
+         }
+ 
+         // Only rewrite VAR declarations or simple assignment statements
++        // References to the object that are not direct assignments or declarations
++        // (and not the special GetProp cases handled above) disqualify inlining.
+         if (!isVarOrAssignExprLhs(name)) {
+            return false;
+         }
+ 
+         Node val = ref.getAssignedValue();
+         if (val == null) {
+-          // A var with no assignment.
++          // A var with no assignment, e.g., `var x;`. This is an acceptable type of reference.
+           continue;
+         }
+ 
+         // We're looking for object literal assignments only.
++        // If the variable is assigned something other than an object literal,
++        // it cannot be inlined by this pass.
+         if (!val.isObjectLit()) {
+           return false;
+         }
+ 
+-        // Make sure that the value is not self-refential. IOW,
++        // If we reach here, we've found an acceptable object literal assignment.
++        ret = true;
++
++        // Make sure that the value is not self-referential. IOW,
+         // disallow things like x = {b: x.a}.
+         //
+         // TODO: Only exclude unorderable self-referential
+         // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+         // but x = {a: 1, b: x.a} is.
+         //
+         // Also, ES5 getters/setters aren't handled by this pass.
+         for (Node child = val.getFirstChild(); child != null;
+              child = child.getNext()) {
+           if (child.isGetterDef() ||
+               child.isSetterDef()) {
+-            // ES5 get/set not supported.
++            // ES5 get/set not supported for inlining.
+             return false;
+           }
+ 
+ 
+           Node childVal = child.getFirstChild();
+           // Check if childVal is the parent of any of the passed in
+           // references, as that is how self-referential assignments
+           // will happen.
+           for (Reference t : refs) {
+             Node refNode = t.getParent();
+             while (!NodeUtil.isStatementBlock(refNode)) {
+               if (refNode == childVal) {
+                 // There's a self-referential assignment
+                 return false;
+               }
+               refNode = refNode.getParent();
+             }
+           }
+         }
+-
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+-        ret = true;
+       }
++      // Return true only if at least one acceptable object literal assignment was found,
++      // and no disqualifying references were encountered throughout the loop.
+       return ret;
+     }

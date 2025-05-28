@@ -1,0 +1,91 @@
+diff --git a/tmp/4da28136-df6c-4227-be5b-90740c4f0556_buggy.java b/tmp/d804d38e-1731-4305-bd95-c8673302ffe2_fixed.java
+index ee599aa..939676e 100644
+--- a/tmp/4da28136-df6c-4227-be5b-90740c4f0556_buggy.java
++++ b/tmp/d804d38e-1731-4305-bd95-c8673302ffe2_fixed.java
+@@ -1,50 +1,83 @@
+     private boolean decodeLbs(Position position, ByteBuf buf, int type, boolean hasLength) {
+ 
+         int length = 0;
+         if (hasLength) {
+             length = buf.readUnsignedByte();
+             if (length == 0) {
+                 boolean zeroedData = true;
++                // This block handles a specific protocol quirk where a 0-length LBS block
++                // might be followed by a fixed number of zeroed bytes that need to be consumed.
++                // The `readerIndex()` here is after reading the `length` byte.
++                // The loop checks for zero values in a specific range (9 to 44 bytes relative to the current readerIndex).
+                 for (int i = buf.readerIndex() + 9; i < buf.readerIndex() + 45 && i < buf.writerIndex(); i++) {
+                     if (buf.getByte(i) != 0) {
+                         zeroedData = false;
+                         break;
+                     }
+                 }
+                 if (zeroedData) {
++                    // If the data is zeroed, skip up to 45 bytes from the current reader index.
+                     buf.skipBytes(Math.min(buf.readableBytes(), 45));
+                 }
++                // If length is 0, no valid LBS data can be decoded from this entry.
+                 return false;
+             }
+         }
+ 
++        // Store the reader index before parsing LBS fields to calculate the actual consumed bytes.
++        int startReaderIndex = buf.readerIndex();
++
+         int mcc = buf.readUnsignedShort();
+         int mnc;
++        // Constants like MSG_GPS_LBS_6, MSG_LBS_ALARM, MSG_GPS_LBS_7 are assumed to be accessible
++        // (e.g., as static final fields in the enclosing class or through static import).
+         if (BitUtil.check(mcc, 15) || type == MSG_GPS_LBS_6) {
+             mnc = buf.readUnsignedShort();
+         } else {
+             mnc = buf.readUnsignedByte();
+         }
+         int lac;
+         if (type == MSG_LBS_ALARM) {
+             lac = buf.readInt();
+         } else {
+             lac = buf.readUnsignedShort();
+         }
+         long cid;
+         if (type == MSG_LBS_ALARM || type == MSG_GPS_LBS_7) {
+             cid = buf.readLong();
+         } else if (type == MSG_GPS_LBS_6) {
+             cid = buf.readUnsignedInt();
+         } else {
+             cid = buf.readUnsignedMedium();
+         }
+ 
++        // Calculate the actual number of bytes consumed by the LBS fields (MCC, MNC, LAC, CID).
++        int parsedLbsLength = buf.readerIndex() - startReaderIndex;
++
+         position.setNetwork(new Network(CellTower.from(BitUtil.to(mcc, 15), mnc, lac, cid)));
+ 
+-        if (length > 9) {
+-            buf.skipBytes(length - 9);
++        // If 'hasLength' is true, the 'length' variable contains the declared total length of the LBS data block.
++        // We must ensure that we consume exactly 'length' bytes for this LBS block.
++        if (hasLength) {
++            int remainingBytesToSkip = length - parsedLbsLength;
++
++            if (remainingBytesToSkip < 0) {
++                // This means the actually parsed LBS data (parsedLbsLength) is greater than
++                // the declared 'length' in the protocol. This indicates a malformed packet
++                // where we've read past the expected end of the LBS block.
++                // In such cases, it's safer to return false to indicate a parsing failure
++                // and prevent misinterpretation of subsequent data in the buffer.
++                return false;
++            } else if (remainingBytesToSkip > 0) {
++                // If the declared 'length' is greater than the parsed fields' length,
++                // there are additional bytes in the LBS block that we need to skip.
++                // This handles cases where the LBS block contains protocol-specific data
++                // that is not mapped to standard position attributes.
++                buf.skipBytes(remainingBytesToSkip);
++            }
++            // If remainingBytesToSkip is 0, it means we have consumed exactly the declared length,
++            // so no additional skipping is needed.
+         }
+ 
+         return true;
+     }
+\ No newline at end of file

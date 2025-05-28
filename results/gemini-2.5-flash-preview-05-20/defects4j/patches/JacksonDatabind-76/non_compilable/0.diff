@@ -1,0 +1,125 @@
+diff --git a/tmp/6ccf9109-bf1e-4138-b967-fe3bf7bdaf57_buggy.java b/tmp/c1b8a105-951a-4be9-9208-49039c288a79_fixed.java
+index 3effef5..eadfd79 100644
+--- a/tmp/6ccf9109-bf1e-4138-b967-fe3bf7bdaf57_buggy.java
++++ b/tmp/c1b8a105-951a-4be9-9208-49039c288a79_fixed.java
+@@ -1,73 +1,86 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithUnwrapped(JsonParser p,
+     		DeserializationContext ctxt)
+         throws IOException, JsonProcessingException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
++        // This TokenBuffer will store all properties that are not handled by creator, id, regular, or ignorable properties.
++        // These are candidates for unwrapped properties.
+         TokenBuffer tokens = new TokenBuffer(p, ctxt);
+         tokens.writeStartObject();
+ 
+         JsonToken t = p.getCurrentToken();
++        // Main loop to consume all properties
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
+             p.nextToken(); // to point to value
+-            // creator property?
++
++            // 1. Creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
+-                if (buffer.assignParameter(creatorProp, creatorProp.deserialize(p, ctxt))) {
+-                    t = p.nextToken();
+-                    Object bean;
+-                    try {
+-                        bean = creator.build(ctxt, buffer);
+-                    } catch (Exception e) {
+-                        wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+-                        continue;
+-                    }
+-                    while (t == JsonToken.FIELD_NAME) {
+-                        p.nextToken();
+-                        tokens.copyCurrentStructure(p);
+-                        t = p.nextToken();
+-                    }
+-                    tokens.writeEndObject();
+-                    if (bean.getClass() != _beanType.getRawClass()) {
+-                        ctxt.reportMappingException("Can not create polymorphic instances with unwrapped values");
+-                        return null;
+-                    }
+-                    return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+-                }
+-                continue;
+-            }
+-            // Object Id property?
++                // If it's a creator property, assign it to the buffer.
++                // We do NOT build the bean yet, even if all creator params are met,
++                // because we need to continue buffering other properties for the final bean.
++                buffer.assignParameter(creatorProp, creatorProp.deserialize(p, ctxt));
++                continue; // Move to next field
++            }
++
++            // 2. Object Id property?
+             if (buffer.readIdProperty(propName)) {
+-                continue;
++                continue; // Move to next field
+             }
+-            // regular property? needs buffering
++
++            // 3. Regular property? Needs buffering
+             SettableBeanProperty prop = _beanProperties.find(propName);
+             if (prop != null) {
++                // Buffer it for later assignment after bean is built
+                 buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+-                continue;
++                continue; // Move to next field
+             }
++
++            // 4. Ignorable property?
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+                 handleIgnoredProperty(p, ctxt, handledType(), propName);
+-                continue;
++                continue; // Move to next field
+             }
+-            tokens.writeFieldName(propName);
+-            tokens.copyCurrentStructure(p);
+-            // "any property"?
++
++            // 5. Unrecognized property: check any-setter first, then unwrapped.
++            // If an 'any setter' is configured, it gets priority over unwrapped for unknown properties.
+             if (_anySetter != null) {
++                // Deserialize the value and buffer it for the 'any setter'.
++                // This property is handled and should not be part of the unwrapped tokens.
+                 buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
++                continue;
+             }
++            
++            // If not handled by any of the above, it's an unwrapped property candidate.
++            // Copy its name and value to the token buffer for later unwrapped processing.
++            tokens.writeFieldName(propName);
++            tokens.copyCurrentStructure(p);
+         }
+ 
+-        // We hit END_OBJECT, so:
++        // We hit END_OBJECT (or loop finished), so now build the bean and apply buffered properties.
++
+         Object bean;
+-        // !!! 15-Feb-2012, tatu: Need to modify creator to use Builder!
+         try {
++            // Build the bean using the creator properties gathered.
+             bean = creator.build(ctxt, buffer);
+         } catch (Exception e) {
+             return wrapInstantiationProblem(e, ctxt);
+         }
++        
++        // Handle polymorphic types early (moved from original's early return block)
++        if (bean.getClass() != _beanType.getRawClass()) {
++            ctxt.reportMappingException("Can not create polymorphic instances with unwrapped values");
++            return null; // Or throw an appropriate exception
++        }
++
++        // Apply any regular properties and 'any-setter' properties that were buffered.
++        bean = buffer.handleBufferedProperties(ctxt, bean);
++
++        // Finally, process the unwrapped properties from the tokens buffer.
++        tokens.writeEndObject();
+         return _unwrappedPropertyHandler.processUnwrapped(p, ctxt, bean, tokens);
+     }

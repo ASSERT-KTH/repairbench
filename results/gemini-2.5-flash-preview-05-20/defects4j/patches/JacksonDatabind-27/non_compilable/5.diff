@@ -1,0 +1,132 @@
+diff --git a/tmp/71daffcf-5232-40d5-afc4-dd11ae947e42_buggy.java b/tmp/62246d78-764d-48ad-adce-5c9eb3a6331a_fixed.java
+index 5bc9804..3d0e390 100644
+--- a/tmp/71daffcf-5232-40d5-afc4-dd11ae947e42_buggy.java
++++ b/tmp/62246d78-764d-48ad-adce-5c9eb3a6331a_fixed.java
+@@ -1,85 +1,115 @@
+     @SuppressWarnings("resource")
+     protected Object deserializeUsingPropertyBasedWithExternalTypeId(JsonParser p, DeserializationContext ctxt)
+         throws IOException
+     {
+         final ExternalTypeHandler ext = _externalTypeIdHandler.start();
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
+ 
+         TokenBuffer tokens = new TokenBuffer(p);
+         tokens.writeStartObject();
+ 
+         JsonToken t = p.getCurrentToken();
+         for (; t == JsonToken.FIELD_NAME; t = p.nextToken()) {
+             String propName = p.getCurrentName();
+             p.nextToken(); // to point to value
++
+             // creator property?
+             SettableBeanProperty creatorProp = creator.findCreatorProperty(propName);
+             if (creatorProp != null) {
+-                // first: let's check to see if this might be part of value with external type id:
+-                // 11-Sep-2015, tatu: Important; do NOT pass buffer as last arg, but null,
+-                //   since it is not the bean
+-                if (ext.handlePropertyValue(p, ctxt, propName, buffer)) {
+-                    ;
+-                } else {
+-                    // Last creator property to set?
+-                    if (buffer.assignParameter(creatorProp, _deserializeWithErrorWrapping(p, ctxt, creatorProp))) {
+-                        t = p.nextToken(); // to move to following FIELD_NAME/END_OBJECT
++                // [databind#928]: ExternalTypeId properties (especially content property)
++                // that are also Creator properties need special handling.
++                // We must buffer the value's tokens to allow both ExternalTypeHandler
++                // and creator property deserialization to access them.
++                TokenBuffer tb = new TokenBuffer(p, ctxt);
++                tb.copyCurrentStructure(p); // This consumes tokens from 'p' and copies to 'tb'.
++                                            // 'p' is now advanced past the current property's value.
++
++                // First, let ExternalTypeHandler try to process these tokens.
++                // It will consume its own parser from 'tb'. Pass null for 'bean' as it's not yet built.
++                JsonParser tbParserForExt = tb.asParser(p); // Use original parser's codec/features
++                tbParserForExt.nextToken(); // Move to START_OBJECT/VALUE_STRING from 'tb's root
++                ext.handlePropertyValue(tbParserForExt, ctxt, propName, null);
++                tbParserForExt.close(); // Close the temporary parser created from tb
++
++                // Now, check if this creator property is specifically the external type ID property itself.
++                // If it is, it's fully handled by 'ext' and not part of the creator parameters.
++                // Note: _externalTypeIdHandler.getTypeProperty() is a protected field, but typically accessible
++                // in this context as part of the deserializer.
++                if (_externalTypeIdHandler != null && creatorProp == _externalTypeIdHandler.getTypeProperty()) {
++                    continue; // Type ID property is consumed by ext, not assigned to creator buffer.
++                }
++
++                // For all other creator properties (including external type 'content' property),
++                // we must deserialize the value and assign it to the PropertyValueBuffer.
++                // Create another parser from the same TokenBuffer for deserialization.
++                JsonParser tbParserForCreator = tb.asParser(p);
++                tbParserForCreator.nextToken(); // Move to START_OBJECT/VALUE_STRING from 'tb's root.
++                Object value = _deserializeWithErrorWrapping(tbParserForCreator, ctxt, creatorProp);
++                tbParserForCreator.close(); // Close the temporary parser created from tb
++
++                // Assign the deserialized value to the creator property buffer.
++                if (buffer.assignParameter(creatorProp, value)) {
++                    // Last creator property to set? Build the bean.
++                    // 'p' is already advanced by tb.copyCurrentStructure, so we use its current token state.
++                    t = p.getCurrentToken(); // Current token of 'p' is now after the copied structure.
++                                             // The outer loop's `t = p.nextToken()` will correctly get the next field name or END_OBJECT.
+                     Object bean;
+                     try {
+                         bean = creator.build(ctxt, buffer);
+                     } catch (Exception e) {
+                         wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+                         continue; // never gets here
+                     }
+                     // if so, need to copy all remaining tokens into buffer
+                     while (t == JsonToken.FIELD_NAME) {
+                         p.nextToken(); // to skip name
+                         tokens.copyCurrentStructure(p);
+                         t = p.nextToken();
+                     }
+                     if (bean.getClass() != _beanType.getRawClass()) {
+                         // !!! 08-Jul-2011, tatu: Could theoretically support; but for now
+                         //   it's too complicated, so bail out
+                         throw ctxt.mappingException("Can not create polymorphic instances with unwrapped values");
+                     }
+                     return ext.complete(p, ctxt, bean);
+                 }
+-                }
+-                continue;
++                continue; // Continue loop for next field if not all creator params are collected
+             }
+             // Object Id property?
+             if (buffer.readIdProperty(propName)) {
+                 continue;
+             }
+             // regular property? needs buffering
+             SettableBeanProperty prop = _beanProperties.find(propName);
+             if (prop != null) {
+                 buffer.bufferProperty(prop, prop.deserialize(p, ctxt));
+                 continue;
+             }
+             // external type id (or property that depends on it)?
++            // For non-creator properties, handlePropertyValue passes null for bean, and consumes p directly.
++            // This is fine.
+             if (ext.handlePropertyValue(p, ctxt, propName, null)) {
+                 continue;
+             }
+             /* As per [JACKSON-313], things marked as ignorable should not be
+              * passed to any setter
+              */
+             if (_ignorableProps != null && _ignorableProps.contains(propName)) {
+                 handleIgnoredProperty(p, ctxt, handledType(), propName);
+                 continue;
+             }
+             // "any property"?
+             if (_anySetter != null) {
+                 buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
+             }
+         }
+ 
+         // We hit END_OBJECT; resolve the pieces:
+         try {
+             return ext.complete(p, ctxt, buffer, creator);
+         } catch (Exception e) {
+             wrapInstantiationProblem(e, ctxt);
+             return null; // never gets here
+         }
+     }
+\ No newline at end of file

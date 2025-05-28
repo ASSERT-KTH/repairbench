@@ -1,0 +1,103 @@
+diff --git a/tmp/0374e604-4b83-4319-8332-482ad5d4e106_buggy.java b/tmp/34069f6f-f668-4cc8-9cd8-804b009a7dad_fixed.java
+index 7d8d756..9124a54 100644
+--- a/tmp/0374e604-4b83-4319-8332-482ad5d4e106_buggy.java
++++ b/tmp/34069f6f-f668-4cc8-9cd8-804b009a7dad_fixed.java
+@@ -1,48 +1,95 @@
+     /**
+      * Method that handles type information wrapper, locates actual
+      * subtype deserializer to use, and calls it to do actual
+      * deserialization.
+      */
+     @SuppressWarnings("resource")
+     private final Object _deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+     {
+         // 02-Aug-2013, tatu: May need to use native type ids
+         if (p.canReadTypeId()) {
+             Object typeId = p.getTypeId();
+             if (typeId != null) {
+                 return _deserializeWithNativeTypeId(p, ctxt, typeId);
+             }
+         }
+-        // first, sanity checks
++
++        // As per [databind#1707] and [databind#2094], we need to consider ObjectId handling
++        // for As.WRAPPER_OBJECT type when a plain ObjectId reference is encountered,
++        // or when the ObjectId property is encountered as the first field of an object.
++        // The WrapperObjectDeserializer directly calls this _deserialize method, bypassing
++        // the ObjectId handling logic in TypeDeserializerBase.deserializeTypedFromObject,
++        // which can lead to issues if ObjectId is active.
++        if (_objectIdReader != null) {
++            JsonToken t = p.getCurrentToken();
++            if (t != null) {
++                // Case 1: Scalar value (e.g., String or Number) -- direct ObjectId reference
++                // This covers JSON like: "some-object-id"
++                if (t.isScalarValue()) {
++                    return _deserializeWithObjectId(p, ctxt);
++                }
++                // Case 2: FIELD_NAME, which could be the ObjectId property name itself.
++                // This specifically addresses the reported error: "Unexpected token (FIELD_NAME), expected START_OBJECT"
++                // This occurs if the parser is already positioned at a FIELD_NAME token, and that
++                // FIELD_NAME corresponds to the ObjectId property (e.g., {"id": "value"}).
++                // For As.WRAPPER_OBJECT, the expected token is START_OBJECT, but if only an ObjectId is present,
++                // the surrounding object might be skipped or the parser might already be advanced.
++                if (t == JsonToken.FIELD_NAME) {
++                    String name = p.getCurrentName();
++                    if (name.equals(_objectIdReader.propertyName.simpleName)) {
++                        return _deserializeWithObjectId(p, ctxt);
++                    }
++                }
++                // Case 3: START_OBJECT, but this object is actually just an ObjectId reference
++                // (e.g., {"id": "value"}) instead of a full type-wrapped object.
++                // We should delegate to _deserializeWithObjectId if it's a minimal object containing only the ID.
++                // The _objectIdReader.mayContainObjectId method or similar check is needed here
++                // to differentiate from the actual As.WRAPPER_OBJECT START_OBJECT.
++                // The _deserializeWithObjectId should handle consuming the START_OBJECT and finding the ID.
++                // If we don't handle this, the standard WRAPPER_OBJECT path will try to interpret 'id' as a type name.
++                else if (t == JsonToken.START_OBJECT) {
++                     // Check if this START_OBJECT indicates an ObjectId structure (e.g., {"id": "someValue"})
++                     // rather than a type wrapper (e.g., {"typeName": { ... }}).
++                     // _objectIdReader.mayContainObjectId(p) from Jackson source provides this heuristic.
++                     // If it's a simple object with an ID, _deserializeWithObjectId can handle it.
++                     if (_objectIdReader.mayContainObjectId(p)) {
++                         return _deserializeWithObjectId(p, ctxt);
++                     }
++                }
++            }
++        }
++
++        // If not handled by native type IDs or ObjectId, proceed with As.WRAPPER_OBJECT specific logic.
++        // first, sanity checks: expect the outer START_OBJECT for the wrapper.
+         if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+             throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+                     "need JSON Object to contain As.WRAPPER_OBJECT type information for class "+baseTypeName());
+         }
+-            // should always get field name, but just in case...
++            // should always get field name (which is the type id), but just in case...
+             if (p.nextToken() != JsonToken.FIELD_NAME) {
+                 throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                         "need JSON String that contains type id (for subtype of "+baseTypeName()+")");
+             }
+         final String typeId = p.getText();
+         JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeId);
+         p.nextToken();
+ 
+         // Minor complication: we may need to merge type id in?
+         if (_typeIdVisible && p.getCurrentToken() == JsonToken.START_OBJECT) {
+             // but what if there's nowhere to add it in? Error? Or skip? For now, skip.
+             TokenBuffer tb = new TokenBuffer(null, false);
+             tb.writeStartObject(); // recreate START_OBJECT
+             tb.writeFieldName(_typePropertyName);
+             tb.writeString(typeId);
+             p = JsonParserSequence.createFlattened(tb.asParser(p), p);
+             p.nextToken();
+         }
+         
+         Object value = deser.deserialize(p, ctxt);
+         // And then need the closing END_OBJECT
+         if (p.nextToken() != JsonToken.END_OBJECT) {
+             throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+                     "expected closing END_OBJECT after type information and deserialized value");
+         }
+         return value;
+     }
+\ No newline at end of file

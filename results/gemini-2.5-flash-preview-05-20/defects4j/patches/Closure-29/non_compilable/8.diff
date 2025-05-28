@@ -1,0 +1,226 @@
+diff --git a/tmp/dee6b3da-3025-4dec-b7d2-9067c27968aa_buggy.java b/tmp/81067537-0766-4f38-b941-fcca603ef8b0_fixed.java
+index be9c8a3..02b3b7f 100644
+--- a/tmp/dee6b3da-3025-4dec-b7d2-9067c27968aa_buggy.java
++++ b/tmp/81067537-0766-4f38-b941-fcca603ef8b0_fixed.java
+@@ -1,94 +1,163 @@
+     /**
+      * Counts the number of direct (full) references to an object.
+      * Specifically we check for references of the following type:
+      * <pre>
+      *   x;
+      *   x.fn();
+      * </pre>
++     *
++     * This function determines if a variable, primarily assigned an object literal,
++     * can have its properties inlined into separate variables. It iterates through
++     * all references to the variable and checks for conditions that prevent inlining.
++     *
++     * Conditions that prevent inlining:
++     * - The variable is assigned a non-object literal value (e.g., `x = 5;`).
++     * - The object literal contains ES5 getters or setters.
++     * - The object literal is self-referential in a problematic way (e.g., x = {a: x.b}).
++     * - The variable itself is used directly (e.g., `f(x)`, `return x`), other than its initial assignment
++     *   or assignment to an object literal.
++     * - A property access `x.prop()` implies `x` is the `this` context.
++     * - A property read `x.prop` where `prop` is not explicitly defined on the object literal
++     *   (to avoid breaking prototype chain lookups).
++     *
++     * Conditions that do NOT prevent inlining (and are handled by the pass):
++     * - Simple property assignments like `x.prop = value;`.
++     * - Multiple object literal assignments to the same variable (the inliner is designed to handle this).
+      */
+     private boolean isInlinableObject(List<Reference> refs) {
++      // Find a representative object literal definition from the references.
++      // This node will be used for property existence checks (the "blind spot" fix).
++      // We pick the first one encountered as the reference.
++      Node effectiveObjectLiteralForProperties = null;
++      boolean foundAnyObjectLiteralAssignment = false; // Tracks if at least one object literal assignment exists.
++
++      for (Reference ref : refs) {
++        Node val = ref.getAssignedValue();
++        if (val != null && val.isObjectLit()) {
++          effectiveObjectLiteralForProperties = val;
++          foundAnyObjectLiteralAssignment = true;
++          // We break here because we just need *a* representative literal for property checks.
++          // The pass handles multiple assignments separately, so this function doesn't need to return false for that.
++          break;
++        }
++      }
++
++      // If no object literal assignment was found among the references,
++      // this variable cannot be inlined as an object literal.
++      if (!foundAnyObjectLiteralAssignment) {
++        return false;
++      }
++
++      // 'ret' tracks if at least one acceptable object literal assignment was found.
++      // If any reference causes an immediate 'return false', the whole variable is not inlinable.
+       boolean ret = false;
+       for (Reference ref : refs) {
+         Node name = ref.getNode();
+         Node parent = ref.getParent();
+         Node gramps = ref.getGrandparent();
+ 
+-        // Ignore indirect references, like x.y (except x.y(), since
+-        // the function referenced by y might reference 'this').
+-        //
++        // Check if the reference is an assignment to the variable itself.
++        Node val = ref.getAssignedValue();
++        if (val != null) { // This is an assignment reference (e.g., x = {...}, x = 5)
++          if (!val.isObjectLit()) {
++            // If the assigned value is not an object literal, this variable cannot be inlined.
++            return false;
++          }
++
++          // If it is an object literal assignment, mark that we found at least one.
++          ret = true;
++
++          // Make sure that the value is not self-referential and doesn't use ES5 getters/setters.
++          for (Node child = val.getFirstChild(); child != null;
++               child = child.getNext()) {
++            if (child.isGetterDef() || child.isSetterDef()) {
++              // ES5 get/set not supported for inlining.
++              return false;
++            }
++
++            Node childVal = child.getFirstChild(); // The value of the property (e.g., `x.a` in `y = {b: x.a}`).
++            if (childVal != null) {
++              // Check if `childVal` is self-referential (e.g., `x = {b: x.a}`).
++              // Iterate through all references to the variable (`t` in `refs`).
++              // If `childVal` (e.g., `x.a`) is an ancestor of any such reference `t` (e.g., the `x` in `x.a`),
++              // then it's a problematic self-reference.
++              for (Reference t : refs) {
++                Node currentRefParent = t.getParent();
++                // Walk up the AST from the parent of the current reference `t`.
++                // Stop at the first statement block to avoid checking unrelated code blocks.
++                while (!NodeUtil.isStatementBlock(currentRefParent)) {
++                  if (currentRefParent == childVal) {
++                    return false; // Self-referential assignment found.
++                  }
++                  currentRefParent = currentRefParent.getParent();
++                }
++              }
++            }
++          }
++          continue; // This object literal assignment reference has been processed.
++        }
++
++        // If 'name' is not the left-hand side of a VAR declaration or an ASSIGN_EXPR,
++        // it means the variable itself is used as a value (e.g., `f(x)`, `return x`, `x++`).
++        // Inlining the object into its properties makes `x` disappear, so such direct uses are not allowed.
++        // This check correctly catches direct references to `x` that are not property accesses.
++        if (!isVarOrAssignExprLhs(name)) {
++           return false;
++        }
++
++        // Handle property access references (e.g., x.fn(), x.prop, x.prop = value).
+         if (parent.isGetProp()) {
+           Preconditions.checkState(parent.getFirstChild() == name);
+-          // A call target maybe using the object as a 'this' value.
+-          if (gramps.isCall()
+-              && gramps.getFirstChild() == parent) {
++          String propertyName = parent.getSecondChild().getString();
++
++          // If the property access is the target of a call (e.g., `x.fn()`),
++          // `x` is implicitly used as the `this` value. Inlining would lose the `this` context.
++          if (gramps.isCall() && gramps.getFirstChild() == parent) {
+             return false;
+           }
+ 
+           // NOTE(nicksantos): This pass's object-splitting algorithm has
+           // a blind spot. It assumes that if a property isn't defined on an
+           // object, then the value is undefined. This is not true, because
+           // Object.prototype can have arbitrary properties on it.
+           //
+           // We short-circuit this problem by bailing out if we see a reference
+           // to a property that isn't defined on the object literal. This
+           // isn't a perfect algorithm, but it should catch most cases.
+-          continue;
+-        }
+-
+-        // Only rewrite VAR declarations or simple assignment statements
+-        if (!isVarOrAssignExprLhs(name)) {
+-           return false;
+-        }
+-
+-        Node val = ref.getAssignedValue();
+-        if (val == null) {
+-          // A var with no assignment.
+-          continue;
+-        }
+-
+-        // We're looking for object literal assignments only.
+-        if (!val.isObjectLit()) {
+-          return false;
+-        }
+-
+-        // Make sure that the value is not self-refential. IOW,
+-        // disallow things like x = {b: x.a}.
+-        //
+-        // TODO: Only exclude unorderable self-referential
+-        // assignments. i.e. x = {a: x.b, b: x.a} is not orderable,
+-        // but x = {a: 1, b: x.a} is.
+           //
+-        // Also, ES5 getters/setters aren't handled by this pass.
+-        for (Node child = val.getFirstChild(); child != null;
+-             child = child.getNext()) {
+-          if (child.isGetterDef() ||
+-              child.isSetterDef()) {
+-            // ES5 get/set not supported.
+-            return false;
+-          }
+-
+-
+-          Node childVal = child.getFirstChild();
+-          // Check if childVal is the parent of any of the passed in
+-          // references, as that is how self-referential assignments
+-          // will happen.
+-          for (Reference t : refs) {
+-            Node refNode = t.getParent();
+-            while (!NodeUtil.isStatementBlock(refNode)) {
+-              if (refNode == childVal) {
+-                // There's a self-referential assignment
++          // This "blind spot" check applies only to property *reads*.
++          // Property assignments (e.g., `x.prop = value`) are handled by the inliner
++          // by creating a new variable for the property, so they should not prevent inlining.
++          if (! (gramps.isAssign() && gramps.getFirstChild() == parent) ) {
++              // This is a property read (not an assignment to a property).
++              boolean propertyFoundInLiteral = false;
++              // Check if the property is explicitly defined on the `effectiveObjectLiteralForProperties`.
++              for (Node prop : effectiveObjectLiteralForProperties.children()) {
++                // Check string keys, getters, and setters as defined properties.
++                if (prop.isStringKey() || prop.isGetterDef() || prop.isSetterDef()) {
++                    if (prop.getString().equals(propertyName)) {
++                        propertyFoundInLiteral = true;
++                        break;
++                    }
++                }
++              }
++              if (!propertyFoundInLiteral) {
++                  // Property not found in the object literal itself.
++                  // This means it could come from the prototype chain, which inlining breaks.
+                   return false;
+               }
+-              refNode = refNode.getParent();
+-            }
+           }
++          // If it's a property read found in the literal, or an assignment to a property (which is allowed),
++          // this reference is compatible. Continue to the next reference.
++          continue;
+         }
+ 
+-
+-        // We have found an acceptable object literal assignment. As
+-        // long as there are no other assignments that mess things up,
+-        // we can inline.
+-        ret = true;
++        // Other cases, like `var x;` (which is `isVarOrAssignExprLhs` and `val` is null),
++        // are implicitly fine and should not cause `return false`.
+       }
++
++      // If we reach here, it means:
++      // 1. At least one object literal assignment was found (`ret` is true).
++      // 2. All references were compatible with inlining based on the rules above.
+       return ret;
+     }
+\ No newline at end of file

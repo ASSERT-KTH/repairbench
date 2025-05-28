@@ -1,0 +1,196 @@
+diff --git a/tmp/37a15b0f-6495-4da8-85b4-56fd2ace7535_buggy.java b/tmp/dd3d90cc-74ef-478c-aa6f-8214b055db55_fixed.java
+index 4b7e1e4..b5910a1 100644
+--- a/tmp/37a15b0f-6495-4da8-85b4-56fd2ace7535_buggy.java
++++ b/tmp/dd3d90cc-74ef-478c-aa6f-8214b055db55_fixed.java
+@@ -1,52 +1,153 @@
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.HashMap;
++import java.util.Map;
++
++// Assuming CharsetNames and IOUtils are available in the context.
++// For a standalone fix, these would need to be provided or imported.
++// import org.apache.commons.compress.utils.CharsetNames;
++// import org.apache.commons.compress.utils.IOUtils;
++
++class CharsetNames {
++    public static final String UTF_8 = "UTF-8";
++}
++
++class IOUtils {
++    // Simplified version for context. Real IOUtils.readFully handles EOF differently.
++    public static int readFully(InputStream in, byte[] b) throws IOException {
++        return readFully(in, b, 0, b.length);
++    }
++
++    public static int readFully(InputStream in, byte[] b, int off, int len) throws IOException {
++        if (len < 0) {
++            throw new IndexOutOfBoundsException("len is negative");
++        }
++        int n = 0;
++        while (n < len) {
++            int count = in.read(b, off + n, len - n);
++            if (count < 0) {
++                // If EOF is reached before reading 'len' bytes, return what was read.
++                // The caller will check if 'got != expected'.
++                return n;
++            }
++            n += count;
++        }
++        return n;
++    }
++}
++
++
++// The original code was part of TarArchiveInputStream.
++// This fix assumes globalPaxHeaders is a field accessible by this function.
++// For the purpose of providing only the function, we'll assume its existence or
++// provide a dummy one if it helps compilation.
++// Map<String, String> globalPaxHeaders; // Placeholder if not in scope
++
++// Placeholder for globalPaxHeaders if it's not defined in the provided snippet
++// In the actual Apache Commons Compress library, this is a field in TarArchiveInputStream.
++// private final Map<String, String> globalPaxHeaders = new HashMap<>(); // For testing purposes
++
++public class TarArchiveInputStream_Fixed { // Class name for compilation purposes
++
++    // Assuming globalPaxHeaders is a field accessible by this function.
++    // For this context, we will use a dummy static map.
++    private static final Map<String, String> globalPaxHeaders = new HashMap<>();
++
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
+         final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+         // Format is "length keyword=value\n";
+-        while(true){ // get length
++        while(true){
+             int ch;
+             int len = 0;
+-            int read = 0;
++            int bytesReadForPrefix = 0; // Tracks bytes read for the "length " part of the line
++
++            // 1. Read length digits and the following space
+             while((ch = i.read()) != -1) {
+-                read++;
+-                if (ch == ' '){
+-                    // Get keyword
+-                    final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+-                    while((ch = i.read()) != -1) {
+-                        read++;
+-                        if (ch == '='){ // end of keyword
+-                            final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
+-                            final int restLen = len - read;
+-                            if (restLen == 1) { // only NL
++                bytesReadForPrefix++;
++                if (ch == ' '){ // End of length digits
++                    break;
++                }
++                // Check if char is a digit to ensure valid format
++                if (ch < '0' || ch > '9') {
++                    // Malformed header: expected digit or space. Consume remainder of line and skip.
++                    // To consume the rest of the line, we could read until '\n' or EOF.
++                    // For now, we will throw as it's a clear format violation.
++                    throw new IOException("Invalid PAX header. Expected digit or space, got: " + (char)ch + " at position " + bytesReadForPrefix);
++                }
++                len *= 10;
++                len += ch - '0';
++            }
++            if (ch == -1){ // EOF while reading length, means no more headers
++                break;
++            }
++
++            // At this point:
++            // 'len' holds the total length of the line as specified (e.g., 27 for "27 ctime=...")
++            // 'bytesReadForPrefix' holds the count of digits + 1 (for the space)
++
++            // Calculate how many bytes are left to read for "keyword=value\n"
++            final int remainingBytesToRead = len - bytesReadForPrefix;
++
++            if (remainingBytesToRead < 0) {
++                // Malformed PAX header: stated length is less than the bytes already read for the prefix itself.
++                // This indicates a corrupt header entry.
++                throw new IOException("Invalid PAX header. Stated length " + len +
++                                      " is less than bytes already read for prefix: " + bytesReadForPrefix);
++            }
++            
++            if (remainingBytesToRead == 0) {
++                // This means the line ends right after the "length " part, which is not "keyword=value\n".
++                // This implies a malformed or empty header line like "X ".
++                // Per COMPRESS-355, "blank lines" should be handled gracefully, likely by skipping.
++                continue; 
++            }
++
++            // Read the rest of the line (keyword=value\n) into a buffer
++            final byte[] lineRemainder = new byte[remainingBytesToRead];
++            final int got = IOUtils.readFully(i, lineRemainder);
++            if (got != remainingBytesToRead) {
++                // This indicates an unexpected EOF or stream issue before reading the full declared length.
++                throw new IOException("Failed to read Paxheader. Expected "
++                                      + remainingBytesToRead
++                                      + " bytes, read "
++                                      + got + " for line remainder.");
++            }
++
++            // Now parse the lineRemainder buffer (keyword=value\n)
++            int keywordEnd = -1; // Index of '='
++            int valueEnd = -1;   // Index of '\n'
++
++            for (int k = 0; k < remainingBytesToRead; k++) {
++                if (lineRemainder[k] == '=' && keywordEnd == -1) {
++                    keywordEnd = k;
++                } else if (lineRemainder[k] == '\n') {
++                    valueEnd = k;
++                    break; // Found newline, done scanning lineRemainder
++                }
++            }
++
++            // Validate the parsed line remainder: must contain '=' and '\n' at the end.
++            if (keywordEnd == -1 || valueEnd == -1 || valueEnd != remainingBytesToRead - 1) {
++                // Malformed lineRemainder: missing '=' or missing '\n' at the very end.
++                // This covers cases like "3 \n" where '=' is absent.
++                // These lines don't conform to the "keyword=value\n" format and should be skipped.
++                continue;
++            }
++
++            final String keyword = new String(lineRemainder, 0, keywordEnd, CharsetNames.UTF_8);
++            // The value starts after '=' (keywordEnd + 1) and ends before '\n' (valueEnd).
++            final String value = new String(lineRemainder, keywordEnd + 1, valueEnd - (keywordEnd + 1), CharsetNames.UTF_8);
++
++            // According to the specification, if value is an empty string, the variable is unset.
++            if (value.isEmpty()){
+                 headers.remove(keyword);
+             } else {
+-                                final byte[] rest = new byte[restLen];
+-                                final int got = IOUtils.readFully(i, rest);
+-                                if (got != restLen) {
+-                                    throw new IOException("Failed to read "
+-                                                          + "Paxheader. Expected "
+-                                                          + restLen
+-                                                          + " bytes, read "
+-                                                          + got);
+-                                }
+-                                // Drop trailing NL
+-                                final String value = new String(rest, 0,
+-                                                          restLen - 1, CharsetNames.UTF_8);
+                 headers.put(keyword, value);
+             }
+-                            break;
+-                        }
+-                        coll.write((byte) ch);
+-                    }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
+-            }
+         }
+         return headers;
+     }
++}
+\ No newline at end of file

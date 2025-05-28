@@ -1,0 +1,147 @@
+diff --git a/tmp/28ab32e2-1686-42eb-b243-f8c2f5eb7c8e_buggy.java b/tmp/7ecae198-0eb9-4d6b-9a16-c1c30f88866c_fixed.java
+index 4b7e1e4..0549ac7 100644
+--- a/tmp/28ab32e2-1686-42eb-b243-f8c2f5eb7c8e_buggy.java
++++ b/tmp/7ecae198-0eb9-4d6b-9a16-c1c30f88866c_fixed.java
+@@ -1,52 +1,121 @@
+     // https://www.gnu.org/software/tar/manual/html_section/tar_92.html#SEC188
+     Map<String, String> parsePaxHeaders(final InputStream i)
+         throws IOException {
++        // globalPaxHeaders and CharsetNames are assumed to be defined elsewhere in the class or package.
++        // For the purpose of this fix, their existence and typical usage are assumed.
+         final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+         // Format is "length keyword=value\n";
+-        while(true){ // get length
+-            int ch;
++        while(true){ // Process each header entry
++            int ch = -1; // Initialize ch to -1 to distinguish between initial state and EOF
+             int len = 0;
+-            int read = 0;
++            int read = 0; // Tracks bytes read for the current header entry *before* the value part
++            boolean foundSpaceAfterLength = false;
++
++            // 1. Parse length part: "length "
+             while((ch = i.read()) != -1) {
+-                read++;
++                read++; // Account for the character just read for this header line
+                 if (ch == ' '){
+-                    // Get keyword
++                    foundSpaceAfterLength = true;
++                    break; // End of length digits
++                }
++                if (ch == '\n') {
++                    // This is a special case: a blank line or a malformed length line ending in newline.
++                    // If it's a blank line (no digits read, first char is '\n'):
++                    if (len == 0 && read == 1) { // len=0 means no digits were processed, read=1 means only '\n' was read
++                        // It's a blank line. Skip it and try to read the next header.
++                        // Reset len and read for the next iteration of the outer loop.
++                        len = 0; // Reset length for the next iteration
++                        read = 0; // Reset read count for the next iteration
++                        break; // Break the inner loop; outer loop will handle continuation.
++                    } else {
++                        // Malformed line (e.g., "123\n" missing space, or "abc\n" where 'a' is not a digit).
++                        // If we got here, it's not a simple blank line, but a faulty length format.
++                        throw new IOException("Invalid Pax header: Missing space after length, found newline instead. Read: " + (read - 1) + " chars before newline.");
++                    }
++                }
++                // If it's not a space and not a newline, it must be a digit.
++                if (ch < '0' || ch > '9') {
++                    // This is the primary cause of NegativeArraySizeException: non-digit character
++                    // in length part causes `len` to become negative.
++                    throw new IOException("Invalid character '"+ (char)ch +"' in Pax header length. Expected digit, space or newline.");
++                }
++                len *= 10;
++                len += ch - '0';
++            }
++
++            // Check how the inner loop (length parsing) terminated
++            if (ch == -1){ // EOF encountered while reading length part
++                break; // No more headers to parse
++            }
++
++            // If the inner loop broke because a blank line was consumed (len=0, read=0)
++            if (len == 0 && read == 0) {
++                continue; // Skip this iteration and try to parse the next header line
++            }
++
++            if (!foundSpaceAfterLength) {
++                // This means the inner loop broke, but not because ' ' was found,
++                // and not because '\n' was handled as a blank line, and not EOF.
++                // This implies an error in the input stream format (e.g., "123ABC", or "123" then EOF).
++                throw new IOException("Pax header length part not terminated by space.");
++            }
++
++            // At this point:
++            // - `ch` is ' ' (the space character after the length)
++            // - `len` contains the parsed total length of the entry
++            // - `read` contains the count of bytes for the "length " part
++
++            // 2. Parse keyword and '=': "keyword="
+             final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+             while((ch = i.read()) != -1) {
+-                        read++;
++                read++; // Increment read for each character of the keyword
+                 if (ch == '='){ // end of keyword
+                     final String keyword = coll.toString(CharsetNames.UTF_8);
+-                            // Get rest of entry
++                    
++                    // 3. Get value and trailing NL: "value\n"
++                    // `restLen` is the number of bytes remaining for the value and the trailing newline.
+                     final int restLen = len - read; 
+-                            if (restLen == 1) { // only NL
++
++                    if (restLen < 0) {
++                        // This indicates that the stated 'len' is less than the bytes already read
++                        // for the length, space, keyword, and equals sign. This is a malformed header.
++                        throw new IOException("Pax header length "+ len +" is shorter than already read bytes "+ read + " for keyword '"+keyword+"'.");
++                    }
++                    // A Pax header entry must end with a newline, so `restLen` should be at least 1.
++                    if (restLen == 0) { 
++                        throw new IOException("Invalid Paxheader: restLen is 0, missing newline or value for keyword '" + keyword + "'.");
++                    } else if (restLen == 1) { // Expected: only NL (empty value)
++                        int lastCh = i.read(); // Consume the trailing NL
++                        read++; // Increment read to account for the NL
++                        if (lastCh != '\n') {
++                            throw new IOException("Invalid Paxheader: Expected \\n, got " + (char)lastCh + " after length "+ len +" keyword "+ keyword);
++                        }
+                         headers.remove(keyword);
+-                            } else {
++                    } else { // Expected: value + NL
+                         final byte[] rest = new byte[restLen];
+-                                final int got = IOUtils.readFully(i, rest);
++                        final int got = IOUtils.readFully(i, rest); // IOUtils.readFully is assumed to be available
+                         if (got != restLen) {
+                             throw new IOException("Failed to read "
+                                                   + "Paxheader. Expected "
+                                                   + restLen
+                                                   + " bytes, read "
+-                                                          + got);
++                                                  + got + " for keyword " + keyword);
++                        }
++                        // Drop trailing NL (which is the last byte of `rest`)
++                        if (rest[restLen - 1] != '\n') {
++                            throw new IOException("Invalid Paxheader: Expected \\n at end of value for keyword " + keyword);
+                         }
+-                                // Drop trailing NL
+                         final String value = new String(rest, 0,
+                                                   restLen - 1, CharsetNames.UTF_8);
+                         headers.put(keyword, value);
+                     }
+-                            break;
++                    break; // Processed single header, break from keyword loop to next header entry
+                 }
+                 coll.write((byte) ch);
+             }
+-                    break; // Processed single header
+-                }
+-                len *= 10;
+-                len += ch - '0';
+-            }
+-            if (ch == -1){ // EOF
+-                break;
++            if (ch == -1){ // EOF encountered while reading keyword part
++                throw new IOException("Pax header truncated. EOF while reading keyword for length " + len);
+             }
+         }
+         return headers;
+     }
+\ No newline at end of file

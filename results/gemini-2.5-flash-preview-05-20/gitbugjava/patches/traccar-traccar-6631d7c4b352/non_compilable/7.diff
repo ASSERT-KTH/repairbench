@@ -1,0 +1,148 @@
+diff --git a/tmp/a752bb9f-c4b7-4408-b6df-2704e4f339d8_buggy.java b/tmp/c25066ab-1dde-4e37-acc4-b079dd39fa1e_fixed.java
+index d87dd79..9defd0c 100644
+--- a/tmp/a752bb9f-c4b7-4408-b6df-2704e4f339d8_buggy.java
++++ b/tmp/c25066ab-1dde-4e37-acc4-b079dd39fa1e_fixed.java
+@@ -1,47 +1,114 @@
+     @Override
+     protected Object decode(
+             ChannelHandlerContext ctx, Channel channel, ByteBuf buf) throws Exception {
+ 
+-        int endIndex = -1;
+-        for (int i = buf.writerIndex() - 1; i >= buf.readerIndex(); i--) {
+-            if (buf.getByte(i) == ']') {
+-                endIndex = i + 1;
++        int originalReaderIndex = buf.readerIndex();
++        int writerIndex = buf.writerIndex();
++        int nestingLevel = 0;
++        int frameEndPosition = -1; // This will store the absolute index of the byte *after* the closing ']'
++
++        // Step 1: Find the end of the first complete frame in the buffer
++        // Iterate from the current readerIndex to find the unescaped top-level ']'
++        for (int i = originalReaderIndex; i < writerIndex; i++) {
++            byte currentByte = buf.getByte(i);
++
++            if (currentByte == '}') {
++                // If '}' is encountered, check if it's an escape prefix.
++                if (i + 1 < writerIndex) {
++                    byte nextByte = buf.getByte(i + 1);
++                    // Check if nextByte is one of the defined escape codes (0x01-0x05)
++                    switch (nextByte) {
++                        case 0x01: // }
++                        case 0x02: // [
++                        case 0x03: // ]
++                        case 0x04: // ,
++                        case 0x05: // *
++                            // This is an escaped character. Skip both bytes as they form a single logical character.
++                            i++;
++                            break;
++                        default:
++                            // nextByte is not an escape code. This means currentByte '}' is a literal.
++                            // Do nothing special; the loop will proceed to the next byte normally.
+                             break;
+                     }
++                } else {
++                    // '}' is the last byte in the buffer, and there's no byte following it for an escape sequence.
++                    // Treat '}' as a literal. The loop will naturally end after processing this byte.
++                }
++            } else if (currentByte == '[') {
++                nestingLevel++;
++            } else if (currentByte == ']') {
++                if (nestingLevel == 0) {
++                    // Found the unescaped closing bracket for the current frame at the top level.
++                    frameEndPosition = i + 1; // Mark the position *after* the closing bracket.
++                    break; // Frame found, stop searching.
++                } else {
++                    // Found a closing bracket for a nested structure.
++                    nestingLevel--;
++                }
++            }
+         }
+ 
+-        if (endIndex > 0) {
+-            ByteBuf frame = Unpooled.buffer();
+-            while (buf.readerIndex() < endIndex) {
+-                byte b1 = buf.readByte();
++        if (frameEndPosition == -1) {
++            // No complete frame found in the buffer. Return null to wait for more data.
++            return null;
++        }
++
++        // Step 2: Extract and decode the identified frame
++        ByteBuf frame = Unpooled.buffer(frameEndPosition - originalReaderIndex); // Allocate efficiently
++
++        // Mark the current readerIndex. This allows resetting the buffer's readerIndex
++        // if an unexpected error occurs during frame decoding (e.g., malformed data).
++        buf.markReaderIndex(); 
++
++        try {
++            // Read bytes from the input buffer up to the determined frameEndPosition
++            while (buf.readerIndex() < frameEndPosition) {
++                byte b1 = buf.readByte(); // Read current byte and advance buf.readerIndex()
++
+                 if (b1 == '}') {
+-                    byte b2 = buf.readByte();
++                    // Check if there's a byte following '}' within the frame bounds
++                    if (buf.readerIndex() < frameEndPosition) {
++                        // Peek the next byte without consuming it yet to determine if it's an escape code.
++                        byte b2 = buf.getByte(buf.readerIndex()); 
+                         switch (b2) {
+-                        case 0x01:
+-                            frame.writeByte('}');
+-                            break;
+-                        case 0x02:
+-                            frame.writeByte('[');
+-                            break;
+-                        case 0x03:
+-                            frame.writeByte(']');
+-                            break;
+-                        case 0x04:
+-                            frame.writeByte(',');
+-                            break;
+-                        case 0x05:
+-                            frame.writeByte('*');
++                            case 0x01: // }
++                            case 0x02: // [
++                            case 0x03: // ]
++                            case 0x04: // ,
++                            case 0x05: // *
++                                // It's an escaped character. Consume b2 and write the unescaped form.
++                                buf.readByte(); // Consume b2, advances buf.readerIndex()
++                                switch (b2) { // Write the actual unescaped character
++                                    case 0x01: frame.writeByte('}'); break;
++                                    case 0x02: frame.writeByte('['); break;
++                                    case 0x03: frame.writeByte(']'); break;
++                                    case 0x04: frame.writeByte(','); break;
++                                    case 0x05: frame.writeByte('*'); break;
++                                }
+                                 break;
+                             default:
+-                            throw new IllegalArgumentException(String.format(
+-                                    "unexpected byte at %d: 0x%02x", buf.readerIndex() - 1, b2));
++                                // b2 is not a defined escape code. This means b1 ('}') was a literal.
++                                // We've already read b1. Just write b1 as a literal.
++                                // b2 will be processed as the next b1 in the subsequent loop iteration.
++                                frame.writeByte(b1);
++                                break;
++                        }
++                    } else {
++                        // '}' is the last byte of the frame, but no byte followed for an escape sequence.
++                        // Treat '}' as a literal character.
++                        frame.writeByte(b1);
+                     }
+                 } else {
++                    // Not an escape sequence, just write the byte as is.
+                     frame.writeByte(b1);
+                 }
+             }
+-            return frame;
++            return frame; // Return the successfully decoded frame
++        } catch (Exception e) {
++            // If any error occurs during parsing (e.g., malformed data that wasn't caught by frame boundary detection),
++            // reset the readerIndex to its original position before throwing to ensure buffer state consistency.
++            buf.resetReaderIndex();
++            throw e; // Re-throw the exception
+         }
+-
+-        return null;
+     }
+\ No newline at end of file
