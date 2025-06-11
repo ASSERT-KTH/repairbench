@@ -1,0 +1,244 @@
+diff --git a/tmp/3f9f1580-4179-41b4-af1c-26700ab324e4_buggy.java b/tmp/eeaa0428-5694-4af5-8ae2-521544f42ceb_fixed.java
+index 4722599..1f385c9 100644
+--- a/tmp/3f9f1580-4179-41b4-af1c-26700ab324e4_buggy.java
++++ b/tmp/eeaa0428-5694-4af5-8ae2-521544f42ceb_fixed.java
+@@ -1,194 +1,229 @@
+ @Override
+ protected Object decode(
+         Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+ 
+     ByteBuf buf = (ByteBuf) msg;
+ 
+     buf.readUnsignedByte(); // header
+     int flags = buf.readUnsignedByte();
+     buf.readUnsignedShortLE(); // length
+     buf.readUnsignedShortLE(); // checksum
+     int index = buf.readUnsignedShortLE();
+     int type = buf.readUnsignedByte();
+ 
+     if (BitUtil.check(flags, 4)) {
+         sendResponse(channel, remoteAddress, index, type, buf.slice());
+     }
+ 
+     if (type == MSG_DATA || type == MSG_SERVICES) {
+ 
+         List<Position> positions = new LinkedList<>();
+         Set<Integer> keys = new HashSet<>();
+         boolean hasLocation = false;
+         Position position = new Position(getProtocolName());
+ 
+         DeviceSession deviceSession = null;
+ 
+         while (buf.isReadable()) {
++            if (buf.readableBytes() < 1) break; // Check if we can read the endIndex byte
+             int endIndex = buf.readUnsignedByte() + buf.readerIndex();
++
++            if (buf.readableBytes() < 1) break; // Check if we can read the key byte
+             int key = buf.readUnsignedByte();
+ 
+             if (keys.contains(key)) {
+                 if (!hasLocation) {
+                     getLastLocation(position, null);
+                 }
+                 positions.add(position);
+                 keys.clear();
+                 hasLocation = false;
+                 position = new Position(getProtocolName());
+             }
+             keys.add(key);
+ 
++            // Ensure we don't read past the endIndex
++            if (buf.readerIndex() + (endIndex - buf.readerIndex()) > buf.writerIndex()) {
++                break;
++            }
++
+             switch (key) {
+                 case 0x01:
++                    if (buf.readableBytes() < 15) break; // Need 15 bytes for ASCII string
+                     deviceSession = getDeviceSession(
+                             channel, remoteAddress, buf.readCharSequence(15, StandardCharsets.US_ASCII).toString());
+                     if (deviceSession == null) {
+                         return null;
+                     }
+                     break;
+                 case 0x02:
++                    if (buf.readableBytes() < 4) break; // Need 4 bytes for unsigned int
+                     long alarm = buf.readUnsignedIntLE();
+                     position.set(Position.KEY_ALARM, decodeAlarm(alarm));
+                     if (BitUtil.check(alarm, 31)) {
+                         position.set("bark", true);
+                     }
+                     break;
+                 case 0x14:
++                    if (buf.readableBytes() < 3) break; // Need 1 byte + 2 bytes
+                     position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+                     position.set(Position.KEY_BATTERY, buf.readUnsignedShortLE() * 0.001);
+                     break;
+                 case 0x20:
++                    if (buf.readableBytes() < 16) break; // Need 16 bytes for this block
+                     hasLocation = true;
+                     position.setLatitude(buf.readIntLE() * 0.0000001);
+                     position.setLongitude(buf.readIntLE() * 0.0000001);
+                     position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShortLE()));
+                     position.setCourse(buf.readUnsignedShortLE());
+                     position.setAltitude(buf.readShortLE());
+                     int hdop = buf.readUnsignedShortLE();
+                     position.setValid(hdop > 0);
+                     position.set(Position.KEY_HDOP, hdop * 0.1);
+                     position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
+                     position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+                     break;
+                 case 0x21:
++                    if (buf.readableBytes() < 3) break; // Need at least 3 bytes (mcc, mnc, and potential data)
+                     int mcc = buf.readUnsignedShortLE();
+                     int mnc = buf.readUnsignedByte();
+                     if (position.getNetwork() == null) {
+                         position.setNetwork(new Network());
+                     }
+-                        while (buf.readerIndex() < endIndex) {
++                    while (buf.readerIndex() < endIndex && buf.isReadable()) {
++                        if (buf.readableBytes() < 7) break; // Need at least 7 bytes for cell tower
+                         int rssi = buf.readByte();
+                         position.getNetwork().addCellTower(CellTower.from(
+                                 mcc, mnc, buf.readUnsignedShortLE(), buf.readUnsignedShortLE(), rssi));
+                     }
+                     break;
+                 case 0x22:
+                     if (position.getNetwork() == null) {
+                         position.setNetwork(new Network());
+                     }
+-                        while (buf.readerIndex() < endIndex) {
++                    while (buf.readerIndex() < endIndex && buf.isReadable()) {
++                        if (buf.readableBytes() < 7) break; // Need 1 byte + 6 bytes for MAC
+                         int rssi = buf.readByte();
+                         String mac = ByteBufUtil.hexDump(buf.readSlice(6)).replaceAll("(..)", "$1:");
+                         position.getNetwork().addWifiAccessPoint(WifiAccessPoint.from(
+                                 mac.substring(0, mac.length() - 1), rssi));
+                     }
+                     break;
+                 case 0x23:
++                    if (buf.readableBytes() < 10) break; // Need 8 bytes (2 ints) + 2 for readTagId
+                     position.set("tagId", readTagId(buf));
+                     position.setLatitude(buf.readIntLE() * 0.0000001);
+                     position.setLongitude(buf.readIntLE() * 0.0000001);
+                     position.setValid(true);
+                     hasLocation = true;
+                     break;
+                 case 0x24:
++                    if (buf.readableBytes() < 12) break; // Need 4 + 4 + 4 bytes
+                     position.setTime(new Date(buf.readUnsignedIntLE() * 1000));
+                     long status = buf.readUnsignedIntLE();
+                     if (BitUtil.check(status, 4)) {
+                         position.set(Position.KEY_CHARGE, true);
+                     }
+                     if (BitUtil.check(status, 7)) {
+                         position.set(Position.KEY_ARCHIVE, true);
+                     }
+                     position.set(Position.KEY_MOTION, BitUtil.check(status, 9));
+                     position.set(Position.KEY_RSSI, BitUtil.between(status, 19, 24));
+                     position.set(Position.KEY_BATTERY_LEVEL, BitUtil.from(status, 24));
+                     position.set(Position.KEY_STATUS, status);
+                     break;
+                 case 0x28:
++                    if (buf.readableBytes() < 1) break; // Need at least 1 byte for flags
+                     int beaconFlags = buf.readUnsignedByte();
++                    if (buf.readableBytes() >= 2) { // Need 2 bytes for readTagId
+                         position.set("tagId", readTagId(buf));
++                    }
++                    if (buf.readableBytes() >= 1) {
+                         position.set("tagRssi", (int) buf.readByte());
++                    }
++                    if (buf.readableBytes() >= 1) {
+                         position.set("tag1mRssi", (int) buf.readByte());
++                    }
+                     if (BitUtil.check(beaconFlags, 7)) {
++                        if (buf.readableBytes() >= 8) { // Need 8 bytes for 2 ints
+                             position.setLatitude(buf.readIntLE() * 0.0000001);
+                             position.setLongitude(buf.readIntLE() * 0.0000001);
+                             position.setValid(true);
+                             hasLocation = true;
+                         }
+-                        if (BitUtil.check(beaconFlags, 6)) {
++                    }
++                    if (BitUtil.check(beaconFlags, 6) && buf.readableBytes() >= 1) {
+                         position.set("description", buf.readCharSequence(
+                                 endIndex - buf.readerIndex(), StandardCharsets.US_ASCII).toString());
+                     }
+                     break;
+                 case 0x2A:
++                    if (buf.readableBytes() < 11) break; // Need 1 + 6 + 1 + 8 + 8 bytes
+                     buf.readUnsignedByte(); // flags
++                    if (buf.readableBytes() >= 6) {
+                         buf.skipBytes(6); // mac
++                    }
++                    if (buf.readableBytes() >= 1) {
+                         buf.readUnsignedByte(); // rssi
++                    }
++                    if (buf.readableBytes() >= 8) {
+                         position.setLatitude(buf.readIntLE() * 0.0000001);
+                         position.setLongitude(buf.readIntLE() * 0.0000001);
+                         position.setValid(true);
+                         hasLocation = true;
++                    }
+                     break;
+                 case 0x30:
++                    if (buf.readableBytes() < 8) break; // Need 8 bytes
+                     buf.readUnsignedIntLE(); // timestamp
+                     position.set(Position.KEY_STEPS, buf.readUnsignedIntLE());
+                     break;
+                 case 0x31:
+                     int i = 1;
+-                        while (buf.readerIndex() < endIndex) {
++                    while (buf.readerIndex() < endIndex && buf.isReadable()) {
++                        if (buf.readableBytes() < 8) break; // Need 8 bytes (2 uints)
+                         position.set("activity" + i + "Time", buf.readUnsignedIntLE());
+                         position.set("activity" + i, buf.readUnsignedIntLE());
+                         i += 1;
+                     }
+                     break;
+                 case 0x37:
++                    if (buf.readableBytes() < 8) break; // Need 8 bytes
+                     buf.readUnsignedIntLE(); // timestamp
+                     long barking = buf.readUnsignedIntLE();
+                     if (BitUtil.check(barking, 31)) {
+                         position.set("barkStop", true);
+                     }
+                     position.set("barkCount", BitUtil.to(barking, 31));
+                     break;
+                 case 0x40:
++                    if (buf.readableBytes() < 5) break; // Need 5 bytes
+                     buf.readUnsignedIntLE(); // timestamp
+                     int heartRate = buf.readUnsignedByte();
+                     if (heartRate > 1) {
+                         position.set(Position.KEY_HEART_RATE, heartRate);
+                     }
+                     break;
+                 default:
+                     break;
+             }
++            if (buf.readerIndex() < endIndex) {
+                 buf.readerIndex(endIndex);
+             }
++        }
+ 
+         if (!hasLocation) {
+             getLastLocation(position, null);
+         }
+         positions.add(position);
+ 
+         if (deviceSession != null) {
+             for (Position p : positions) {
+                 p.setDeviceId(deviceSession.getDeviceId());
+             }
+-            } else {
+-                return null;
+-            }
+-
+             return positions;
+-
++        }
+     }
+ 
+     return null;
+ }
+\ No newline at end of file
