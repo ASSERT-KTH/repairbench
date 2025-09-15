@@ -238,6 +238,9 @@ const LeaderboardTable = () => {
 
   return (
     <div className="leaderboard-container">
+      <div className="retired-message" role="note">
+        This leaderboard is now retired. Last update was on June 11th 2025.
+      </div>
       <div className="leaderboard-table-wrapper">
         <div className={`leaderboard-table-container ${showExtraColumns ? 'expanded' : ''}`}>
           <table {...getTableProps()} className="leaderboard-table" role="table">
