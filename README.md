@@ -5,13 +5,13 @@ Leaderboard of frontier models for program repair.
 If you use RepairBench, please cite:
 
 ```bibtex
-@techreport{repairbench,
+@inproceedings{repairbench,
   title={RepairBench: Leaderboard of Frontier Models for Program Repair}, 
   author={André Silva and Martin Monperrus},
-  year={2024},
+  booktitle = {IEEE/ACM International Workshop on Large Language Models for Code (LLM4Code)},
+  year={2025},
   url={https://arxiv.org/abs/2409.18952}, 
-  number = {2409.18952},
-  institution = {arXiv},
+  doi = {10.1109/LLM4Code66737.2025.00006}
 }
 ```
 
